@@ -35,3 +35,6 @@ lib/
 .vscode/
 .pio/
 build/
+
+# Secret configs (WiFi credentials, API keys)
+**/SC_SecConfig.yaml
