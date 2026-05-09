@@ -1,0 +1,11 @@
+wifi:
+  ssid: "YOUR_WIFI_SSID"
+  password: "YOUR_WIFI_PASSWORD"
+apikey:
+  stt: ""
+  aiservice: ""
+  tts: ""
+hermes:
+  endpoint: "https://162-43-35-9.sslip.io/v1/chat/completions"
+  model: "hermes-agent"
+  api_key: "hfuji-ha-api-key"
