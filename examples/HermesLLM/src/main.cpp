@@ -6,16 +6,9 @@
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
 #include <Stackchan_system_config.h>
-#include <Stackchan_servo.h>
-#include <Avatar.h>
 
-using namespace m5avatar;
-
-Avatar avatar;
-StackchanSERVO servo;
 StackchanSystemConfig system_config;
 
-// Hermes config (loaded from YAML)
 String hermes_endpoint = "";
 String hermes_model    = "";
 String hermes_api_key  = "";
@@ -29,7 +22,6 @@ void load_hermes_config(fs::FS& fs) {
     String yaml = f.readString();
     f.close();
 
-    // Simple line-by-line parse for hermes section
     int hermes_pos = yaml.indexOf("hermes:");
     if (hermes_pos < 0) return;
 
@@ -51,15 +43,13 @@ void load_hermes_config(fs::FS& fs) {
 }
 
 String call_hermes(const String& user_message) {
-    if (hermes_endpoint.isEmpty()) {
-        return "Hermes not configured.";
-    }
+    if (hermes_endpoint.isEmpty()) return "Hermes not configured.";
 
     HTTPClient http;
     WiFiClientSecure secure_client;
-    // Let's Encrypt cert — skip CA pinning for prototype
     secure_client.setInsecure();
     http.begin(secure_client, hermes_endpoint);
+    http.setTimeout(30000);
 
     http.addHeader("Content-Type", "application/json");
     if (!hermes_api_key.isEmpty()) {
@@ -90,44 +80,38 @@ String call_hermes(const String& user_message) {
     http.end();
 
     JsonDocument resp;
-    DeserializationError err = deserializeJson(resp, response);
-    if (err) {
-        M5_LOGE("JSON parse error");
-        return "Parse error";
-    }
+    if (deserializeJson(resp, response)) return "Parse error";
 
     const char* content = resp["choices"][0]["message"]["content"];
     return content ? String(content) : "No content";
 }
 
+void show(const String& text) {
+    M5.Display.clear();
+    M5.Display.setCursor(0, 0);
+    M5.Display.println(text);
+    Serial.println(text);
+}
+
 void setup() {
     auto cfg = M5.config();
     M5.begin(cfg);
+    M5.Display.setTextSize(2);
+    M5.Display.setTextWrap(true);
     M5_LOGI("StackChan Hermes LLM Example");
 
     if (!SPIFFS.begin(true)) {
-        M5_LOGE("SPIFFS mount failed");
-        avatar.setSpeechText("SPIFFS ERROR");
+        show("SPIFFS ERROR");
         return;
     }
 
     system_config.loadConfig(SPIFFS, "/yaml/SC_BasicConfig.yaml");
-    system_config.loadSecretConfig(SPIFFS, "/yaml/SC_SecConfig.yaml", 2048);
     load_hermes_config(SPIFFS);
 
-    // Servo
-    servo.begin(system_config.getServoInfo(AXIS_X)->pin, system_config.getServoInfo(AXIS_X)->start_degree,
-                system_config.getServoInfo(AXIS_X)->offset,
-                system_config.getServoInfo(AXIS_Y)->pin, system_config.getServoInfo(AXIS_Y)->start_degree,
-                system_config.getServoInfo(AXIS_Y)->offset,
-                (ServoType)system_config.getServoType());
-
-    avatar.init();
-    avatar.setSpeechText("Connecting WiFi...");
-
-    // WiFi
+    show("Connecting WiFi...");
     wifi_s* wifi = system_config.getWiFiSetting();
     WiFi.begin(wifi->ssid.c_str(), wifi->password.c_str());
+
     int retry = 0;
     while (WiFi.status() != WL_CONNECTED && retry < 20) {
         delay(500);
@@ -136,28 +120,24 @@ void setup() {
 
     if (WiFi.status() == WL_CONNECTED) {
         M5_LOGI("WiFi connected: %s", WiFi.localIP().toString().c_str());
-        avatar.setSpeechText("WiFi OK! Press BtnA");
+        show("WiFi OK!\nCalling Hermes...");
+        delay(1000);
+        String reply = call_hermes("こんにちは！一言で自己紹介してください。");
+        M5_LOGI("Reply: %s", reply.c_str());
+        show(reply);
     } else {
-        M5_LOGE("WiFi failed");
-        avatar.setSpeechText("WiFi FAILED");
+        show("WiFi FAILED");
     }
 }
 
 void loop() {
     M5.update();
 
-    // BtnA: send test message to Hermes
     if (M5.BtnA.wasPressed()) {
-        avatar.setSpeechText("Thinking...");
-        avatar.setExpression(Expression::Sad);
-
-        String reply = call_hermes("こんにちは！自己紹介してください。");
-
-        M5_LOGI("Hermes reply: %s", reply.c_str());
-        // Trim to display length
-        if (reply.length() > 60) reply = reply.substring(0, 60) + "...";
-        avatar.setSpeechText(reply.c_str());
-        avatar.setExpression(Expression::Happy);
+        show("Thinking...");
+        String reply = call_hermes("こんにちは！一言で自己紹介してください。");
+        M5_LOGI("Reply: %s", reply.c_str());
+        show(reply);
     }
 
     delay(10);
