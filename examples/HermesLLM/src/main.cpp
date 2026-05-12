@@ -7,6 +7,8 @@
 #include <ArduinoJson.h>
 #include <Stackchan_system_config.h>
 #include <Stackchan_servo.h>
+#include <Avatar.h>
+using namespace m5avatar;
 bool touchedZone(int zone);
 void show(const String& text);
 static const char B64_TABLE[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -33,11 +35,76 @@ static size_t base64_encode(uint8_t* out, const uint8_t* in, size_t in_len) {
 
 StackchanSystemConfig system_config;
 
+// --- Avatar ---
+Avatar avatar;
+
 // --- Servo ---
 StackchanSERVO sc_servo;
 static bool servo_ready = false;
+static bool servo_idle_enabled = true;
 static int16_t srv_cx = 150, srv_cy = 90;
 static uint32_t servo_idle_next_ms = 0;
+
+// --- LED ---
+#define LED_NUM 12
+static m5::PY32IOExpander_Class* led_io = nullptr;
+enum LedMode { LED_OFF, LED_HEARING, LED_THINKING, LED_SPEAKING, LED_ERROR };
+static volatile LedMode led_mode = LED_OFF;
+
+static void led_all(uint8_t r, uint8_t g, uint8_t b) {
+    for (int i = 0; i < LED_NUM; i++) led_io->setLedColor(i, r, g, b);
+    led_io->refreshLeds();
+}
+
+static void led_task(void*) {
+    uint8_t anim = 0;
+    int8_t  anim_dir = 1;
+    uint8_t chase_pos = 0;
+    bool    blink_state = false;
+    while (true) {
+        if (!led_io) { vTaskDelay(pdMS_TO_TICKS(100)); continue; }
+        switch (led_mode) {
+            case LED_OFF:
+                led_all(0, 0, 0);
+                vTaskDelay(pdMS_TO_TICKS(100));
+                break;
+            case LED_HEARING:
+                if (anim_dir > 0) { if (anim < 252) anim += 4; else anim_dir = -1; }
+                else              { if (anim > 4)   anim -= 4; else anim_dir =  1; }
+                led_all(0, 0, anim);  // blue breath
+                vTaskDelay(pdMS_TO_TICKS(20));
+                break;
+            case LED_THINKING:
+                for (int i = 0; i < LED_NUM; i++) led_io->setLedColor(i, 0, 0, 0);
+                for (int i = 0; i < 3; i++) led_io->setLedColor((chase_pos + i * 4) % LED_NUM, 180, 160, 0);
+                led_io->refreshLeds();
+                chase_pos = (chase_pos + 1) % LED_NUM;
+                vTaskDelay(pdMS_TO_TICKS(55));
+                break;
+            case LED_SPEAKING:
+                if (anim_dir > 0) { if (anim < 249) anim += 6; else anim_dir = -1; }
+                else              { if (anim > 6)   anim -= 6; else anim_dir =  1; }
+                led_all(0, anim, 0);  // green breath
+                vTaskDelay(pdMS_TO_TICKS(25));
+                break;
+            case LED_ERROR:
+                blink_state = !blink_state;
+                led_all(blink_state ? 200 : 0, 0, 0);  // red blink
+                vTaskDelay(pdMS_TO_TICKS(300));
+                break;
+        }
+    }
+}
+
+void led_init() {
+    led_io = sc_servo.getIOExpander();
+    if (!led_io) { M5_LOGE("LED: no ioexpander"); return; }
+    led_io->setLedCount(LED_NUM);
+    led_all(0, 0, 0);
+    xTaskCreatePinnedToCore(led_task, "led", 2048, nullptr, 1, nullptr, PRO_CPU_NUM);
+}
+
+void led_set(LedMode mode) { led_mode = mode; }
 
 void servo_begin() {
     auto* sx = system_config.getServoInfo(AXIS_X);
@@ -55,7 +122,7 @@ void servo_begin() {
 }
 
 void servo_idle_tick() {
-    if (!servo_ready) return;
+    if (!servo_ready || !servo_idle_enabled) return;
     uint32_t now = millis();
     if (now < servo_idle_next_ms) return;
     // If we've been blocked for >5 sec (STT/Hermes/TTS), defer idle move
@@ -68,6 +135,11 @@ void servo_idle_tick() {
     int ty = srv_cy + random(-12, 1);  // nod range: center to center-12
     uint32_t move_ms = random(si->move_min, si->move_max + 1);
     sc_servo.moveXY(tx, ty, move_ms);
+    // Random gaze shift matching servo direction
+    float gv = random(-20, 21) / 100.0f;
+    float gh = random(-40, 41) / 100.0f;
+    avatar.setLeftGaze(gv, gh);
+    avatar.setRightGaze(gv, gh);
     servo_idle_next_ms = millis() + random(si->interval_min, si->interval_max + 1);
 }
 
@@ -263,10 +335,12 @@ bool call_tts(const String& text) {
             if (now >= speak_next_ms) {
                 speak_phase = !speak_phase;
                 sc_servo.moveY(speak_phase ? srv_cy - 8 : srv_cy, 500, false);  // gentle nod, non-blocking
+                avatar.setMouthOpenRatio(speak_phase ? random(30, 65) / 100.0f : 0.05f);
                 speak_next_ms = now + 900;
             }
         }
     }
+    avatar.setMouthOpenRatio(0.0f);
     if (servo_ready) sc_servo.moveXY(srv_cx, srv_cy, 500);  // return to center after speaking
 
     heap_caps_free(wav_buf);
@@ -283,6 +357,7 @@ String call_stt() {
     M5.Speaker.end();
     M5.Mic.begin();
     if (servo_ready) sc_servo.moveXY(srv_cx + 15, srv_cy - 5, 500);  // listening tilt
+    led_set(LED_HEARING);
     M5_LOGI("Recording %d sec...", MIC_RECORD_SEC);
     M5.Mic.record(rec_buf, MIC_BUF_SAMPLES, MIC_SAMPLE_RATE, false);
     bool cancelled = false;
@@ -294,6 +369,7 @@ String call_stt() {
     M5.Mic.end();
     M5.Speaker.begin();
     if (servo_ready) sc_servo.moveXY(srv_cx, srv_cy, 400);  // return to center
+    led_set(LED_OFF);
     M5_LOGI("Recording done");
     if (cancelled) { heap_caps_free(rec_buf); show("Cancelled"); return ""; }
 
@@ -339,9 +415,9 @@ String call_stt() {
 }
 
 void show(const String& text) {
-    M5.Display.clear();
-    M5.Display.setCursor(0, 0);
-    M5.Display.println(text);
+    String oneline = text;
+    oneline.replace("\n", " ");
+    avatar.setSpeechText(oneline.c_str());
     Serial.println(text);
 }
 
@@ -352,15 +428,16 @@ void setup() {
     spk_cfg.dma_buf_len = 1024;  // spk_task stack = 1280 + dma_buf_len*4 = 5376 bytes
     M5.Speaker.config(spk_cfg);
     M5.Speaker.begin();
-    M5.Display.setFont(&fonts::efontJA_16);
-    M5.Display.setTextSize(1);
-    M5.Display.setTextWrap(true);
 
-    if (!SPIFFS.begin(true)) { show("SPIFFS ERROR"); return; }
+    if (!SPIFFS.begin(true)) { M5.Display.println("SPIFFS ERROR"); return; }
 
     system_config.loadConfig(SPIFFS, "/yaml/SC_BasicConfig.yaml");
     servo_begin();
+    led_init();  // must be after servo_begin() — needs ioexpander initialized
     load_hermes_config(SPIFFS);
+
+    avatar.init();
+    avatar.setSpeechFont(&fonts::efontJA_16);
 
     show("Connecting WiFi...");
     wifi_s* wifi = system_config.getWiFiSetting();
@@ -388,36 +465,78 @@ void loop() {
 
     // 左タッチ: テスト発話
     if (touchedZone(0)) {
+        avatar.setExpression(Expression::Doubt);
+        led_set(LED_THINKING);
         show("Thinking...");
         String reply = call_hermes("こんにちは！一言で自己紹介してください。");
         if (reply.startsWith("Error:") || reply.startsWith("Parse error") || reply.startsWith("No content")) {
+            avatar.setExpression(Expression::Sad);
+            led_set(LED_ERROR);
             show(reply);
             return;
         }
-        show(reply + "\n[Speaking...]");
+        avatar.setExpression(Expression::Happy);
+        led_set(LED_SPEAKING);
+        Serial.println("Reply: " + reply);
+        show("[Speaking...]");
         if (call_tts(reply)) {
-            show(reply + "\n[Done]");
+            avatar.setExpression(Expression::Neutral);
+            led_set(LED_OFF);
+            show("");
         } else {
-            show(reply + "\n[TTS failed]");
+            avatar.setExpression(Expression::Sad);
+            led_set(LED_ERROR);
+            show("TTS failed");
+        }
+    }
+
+    // 右タッチ: アイドルサーボ停止/再開トグル
+    if (touchedZone(2)) {
+        servo_idle_enabled = !servo_idle_enabled;
+        if (!servo_idle_enabled && servo_ready) {
+            sc_servo.moveXY(srv_cx, srv_cy, 500);
+            show("Servo: OFF");
+        } else {
+            servo_idle_next_ms = millis() + 2000;
+            show("Servo: ON");
         }
     }
 
     // 中央タッチ: Push-to-Talk (STT → Hermes → TTS)
     if (touchedZone(1)) {
-        show("Recording...\n(5 sec)\nSpeak now!");
+        servo_idle_enabled = true;  // 話しかけたらサーボ再開
+        servo_idle_next_ms = millis() + 2000;
+        avatar.setExpression(Expression::Happy);
+        show("Speak now!");
         String text = call_stt();
-        if (text.isEmpty()) { show("STT failed\nor no speech"); return; }
-        show("You: " + text + "\nThinking...");
+        if (text.isEmpty()) {
+            avatar.setExpression(Expression::Sad);
+            led_set(LED_ERROR);
+            show("STT failed");
+            return;
+        }
+        avatar.setExpression(Expression::Doubt);
+        led_set(LED_THINKING);
+        show("Thinking...");
         String reply = call_hermes(text);
         if (reply.startsWith("Error:") || reply.startsWith("Parse error") || reply.startsWith("No content")) {
+            avatar.setExpression(Expression::Sad);
+            led_set(LED_ERROR);
             show(reply);
             return;
         }
-        show(reply + "\n[Speaking...]");
+        avatar.setExpression(Expression::Happy);
+        led_set(LED_SPEAKING);
+        Serial.println("Reply: " + reply);
+        show("[Speaking...]");
         if (call_tts(reply)) {
-            show(reply + "\n[Done]");
+            avatar.setExpression(Expression::Neutral);
+            led_set(LED_OFF);
+            show("");
         } else {
-            show(reply + "\n[TTS failed]");
+            avatar.setExpression(Expression::Sad);
+            led_set(LED_ERROR);
+            show("TTS failed");
         }
     }
 

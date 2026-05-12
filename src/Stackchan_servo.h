@@ -92,5 +92,6 @@ class StackchanSERVO {
         void motion(Motion motion_no);
         void turnX(uint32_t speed, bool is_cw, uint32_t millis_for_move);
         bool isMoving() { return _isMoving; }
+        m5::PY32IOExpander_Class* getIOExpander() { return _ioexpander; }
 };
 #endif // _STACKCHAN_SERVO_H_
