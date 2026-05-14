@@ -45,6 +45,10 @@ static bool servo_idle_enabled = true;
 static int16_t srv_cx = 150, srv_cy = 90;
 static uint32_t servo_idle_next_ms = 0;
 
+// --- HTTP Server ---
+WiFiServer speak_server(80);
+static bool busy = false;
+
 // --- LED ---
 #define LED_NUM 12
 static m5::PY32IOExpander_Class* led_io = nullptr;
@@ -421,6 +425,70 @@ void show(const String& text) {
     Serial.println(text);
 }
 
+void handle_speak_server() {
+    WiFiClient client = speak_server.available();
+    if (!client) return;
+
+    String req_line = client.readStringUntil('\n');
+    bool is_post_speak = req_line.startsWith("POST /speak");
+
+    int content_length = 0;
+    while (client.connected()) {
+        String line = client.readStringUntil('\n');
+        line.trim();
+        if (line.isEmpty()) break;
+        String lower = line; lower.toLowerCase();
+        if (lower.startsWith("content-length:"))
+            content_length = line.substring(line.indexOf(':') + 1).toInt();
+    }
+
+    if (!is_post_speak) {
+        client.print("HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+        client.stop();
+        return;
+    }
+
+    if (busy) {
+        client.print("HTTP/1.1 503 Service Unavailable\r\nContent-Type: application/json\r\nContent-Length: 13\r\nConnection: close\r\n\r\n{\"busy\":true}");
+        client.stop();
+        return;
+    }
+
+    String body = "";
+    uint32_t deadline = millis() + 2000;
+    while ((int)body.length() < content_length && millis() < deadline) {
+        if (client.available()) body += (char)client.read();
+    }
+
+    JsonDocument doc;
+    String speak_text = "";
+    if (!deserializeJson(doc, body)) speak_text = doc["text"] | "";
+    if (speak_text.isEmpty()) {
+        client.print("HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+        client.stop();
+        return;
+    }
+
+    client.print("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 10\r\nConnection: close\r\n\r\n{\"ok\":true}");
+    client.flush();
+    client.stop();
+
+    busy = true;
+    avatar.setExpression(Expression::Happy);
+    led_set(LED_SPEAKING);
+    show("[Speaking...]");
+    if (call_tts(speak_text)) {
+        avatar.setExpression(Expression::Neutral);
+        led_set(LED_OFF);
+        show("");
+    } else {
+        avatar.setExpression(Expression::Sad);
+        led_set(LED_ERROR);
+        show("TTS failed");
+    }
+    busy = false;
+}
+
 void setup() {
     auto cfg = M5.config();
     M5.begin(cfg);
@@ -446,8 +514,11 @@ void setup() {
     while (WiFi.status() != WL_CONNECTED && retry < 20) { delay(500); retry++; }
 
     if (WiFi.status() == WL_CONNECTED) {
+        speak_server.begin();
         M5_LOGI("WiFi: %s", WiFi.localIP().toString().c_str());
-        show("WiFi OK!\nL:Test  M:Voice\nR:Stop");
+        show("IP: " + WiFi.localIP().toString());
+        delay(3000);
+        show("L:Test  M:Voice  R:Servo");
     } else {
         show("WiFi FAILED");
     }
@@ -461,10 +532,12 @@ bool touchedZone(int zone) {
 
 void loop() {
     M5.update();
+    handle_speak_server();
     servo_idle_tick();
 
     // 左タッチ: テスト発話
-    if (touchedZone(0)) {
+    if (touchedZone(0) && !busy) {
+        busy = true;
         avatar.setExpression(Expression::Doubt);
         led_set(LED_THINKING);
         show("Thinking...");
@@ -473,6 +546,7 @@ void loop() {
             avatar.setExpression(Expression::Sad);
             led_set(LED_ERROR);
             show(reply);
+            busy = false;
             return;
         }
         avatar.setExpression(Expression::Happy);
@@ -488,6 +562,7 @@ void loop() {
             led_set(LED_ERROR);
             show("TTS failed");
         }
+        busy = false;
     }
 
     // 右タッチ: アイドルサーボ停止/再開トグル
@@ -503,7 +578,8 @@ void loop() {
     }
 
     // 中央タッチ: Push-to-Talk (STT → Hermes → TTS)
-    if (touchedZone(1)) {
+    if (touchedZone(1) && !busy) {
+        busy = true;
         servo_idle_enabled = true;  // 話しかけたらサーボ再開
         servo_idle_next_ms = millis() + 2000;
         avatar.setExpression(Expression::Happy);
@@ -513,6 +589,7 @@ void loop() {
             avatar.setExpression(Expression::Sad);
             led_set(LED_ERROR);
             show("STT failed");
+            busy = false;
             return;
         }
         avatar.setExpression(Expression::Doubt);
@@ -523,6 +600,7 @@ void loop() {
             avatar.setExpression(Expression::Sad);
             led_set(LED_ERROR);
             show(reply);
+            busy = false;
             return;
         }
         avatar.setExpression(Expression::Happy);
@@ -538,6 +616,7 @@ void loop() {
             led_set(LED_ERROR);
             show("TTS failed");
         }
+        busy = false;
     }
 
     delay(10);
