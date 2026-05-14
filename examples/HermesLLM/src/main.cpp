@@ -153,6 +153,8 @@ String hermes_api_key  = "";
 int    tts_volume          = 100;
 int    hermes_max_tokens   = 80;
 int    hermes_timeout_ms   = 60000;
+String voicevox_host    = "";  // e.g. "192.168.1.100:50021" — use local VOICEVOX if set
+int    voicevox_speaker = 1;
 
 void load_hermes_config(fs::FS& fs) {
     File f = fs.open("/yaml/SC_SecConfig.yaml", "r");
@@ -187,7 +189,18 @@ void load_hermes_config(fs::FS& fs) {
     tts_volume        = extractInt("tts_volume", tts_volume);
     hermes_max_tokens = extractInt("hermes_max_tokens", hermes_max_tokens);
     hermes_timeout_ms = extractInt("hermes_timeout_ms", hermes_timeout_ms);
+    voicevox_speaker  = extractInt("voicevox_speaker", voicevox_speaker);
     M5_LOGI("tts_volume: %d, hermes_max_tokens: %d, hermes_timeout_ms: %d", tts_volume, hermes_max_tokens, hermes_timeout_ms);
+
+    auto extractStr = [&](const char* key) -> String {
+        String search = String(key) + ": \"";
+        int pos = yaml.indexOf(search);
+        if (pos < 0) return "";
+        pos += search.length();
+        return yaml.substring(pos, yaml.indexOf("\"", pos));
+    };
+    voicevox_host = extractStr("voicevox_host");
+    if (!voicevox_host.isEmpty()) M5_LOGI("Local VOICEVOX: %s speaker=%d", voicevox_host.c_str(), voicevox_speaker);
 }
 
 String url_encode(const String& text) {
@@ -237,7 +250,79 @@ String call_hermes(const String& user_message) {
     return content ? String(content) : "No content";
 }
 
+static void play_wav(uint8_t* wav_buf, int read_len) {
+    uint32_t data_offset = 44;
+    uint32_t sample_rate = 24000;
+    if (read_len >= 44 && memcmp(wav_buf, "RIFF", 4) == 0) {
+        sample_rate = *(uint32_t*)(wav_buf + 24);
+        uint32_t pos = 12;
+        while (pos + 8 <= (uint32_t)read_len) {
+            if (memcmp(wav_buf + pos, "data", 4) == 0) { data_offset = pos + 8; break; }
+            uint32_t chunk_size = *(uint32_t*)(wav_buf + pos + 4);
+            pos += 8 + ((chunk_size + 1) & ~1u);
+        }
+    }
+    uint32_t speak_next_ms = millis() + 900;
+    bool speak_phase = false;
+    M5.Speaker.setVolume(tts_volume);
+    M5.Speaker.playRaw((int16_t*)(wav_buf + data_offset), (read_len - data_offset) / 2, sample_rate, false, 1, 0);
+    while (M5.Speaker.isPlaying()) {
+        M5.update();
+        delay(10);
+        if (touchedZone(2)) { M5.Speaker.stop(); break; }
+        if (servo_ready) {
+            uint32_t now = millis();
+            if (now >= speak_next_ms) {
+                speak_phase = !speak_phase;
+                sc_servo.moveY(speak_phase ? srv_cy - 8 : srv_cy, 500, false);
+                avatar.setMouthOpenRatio(speak_phase ? random(30, 65) / 100.0f : 0.05f);
+                speak_next_ms = now + 900;
+            }
+        }
+    }
+    avatar.setMouthOpenRatio(0.0f);
+    if (servo_ready) sc_servo.moveXY(srv_cx, srv_cy, 500);
+}
+
+bool call_tts_local(const String& text) {
+    String base = "http://" + voicevox_host;
+    String speaker_str = String(voicevox_speaker);
+
+    // Step1: audio_query (synchronous POST)
+    HTTPClient http1;
+    WiFiClient c1;
+    http1.begin(c1, base + "/audio_query?text=" + url_encode(text) + "&speaker=" + speaker_str);
+    http1.setTimeout(10000);
+    int st1 = http1.POST("");
+    if (st1 != 200) { M5_LOGE("audio_query error: %d", st1); http1.end(); return false; }
+    String query_json = http1.getString();
+    http1.end();
+    M5_LOGI("audio_query OK (%d bytes)", query_json.length());
+
+    // Step2: synthesis (synchronous POST → WAV bytes)
+    HTTPClient http2;
+    WiFiClient c2;
+    http2.begin(c2, base + "/synthesis?speaker=" + speaker_str);
+    http2.setTimeout(15000);
+    http2.addHeader("Content-Type", "application/json");
+    int st2 = http2.POST(query_json);
+    if (st2 != 200) { M5_LOGE("synthesis error: %d", st2); http2.end(); return false; }
+
+    int wav_size = http2.getSize();
+    if (wav_size <= 0) wav_size = 512 * 1024;
+    uint8_t* wav_buf = (uint8_t*)heap_caps_malloc(wav_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!wav_buf) { M5_LOGE("malloc failed"); http2.end(); return false; }
+    int read_len = http2.getStream().readBytes(wav_buf, wav_size);
+    http2.end();
+    M5_LOGI("synthesis WAV: %d bytes", read_len);
+
+    play_wav(wav_buf, read_len);
+    heap_caps_free(wav_buf);
+    return true;
+}
+
 bool call_tts(const String& text) {
+    if (!voicevox_host.isEmpty()) return call_tts_local(text);
     String api_key = system_config.getAPISetting()->tts;
     if (api_key.isEmpty()) { M5_LOGE("TTS API key not set"); return false; }
 
@@ -325,28 +410,7 @@ bool call_tts(const String& text) {
             pos += 8 + ((chunk_size + 1) & ~1u);
         }
     }
-    M5_LOGI("playRaw: offset=%u rate=%u samples=%u", data_offset, sample_rate, (read_len - data_offset) / 2);
-    uint32_t speak_next_ms = millis() + 900;
-    bool speak_phase = false;
-    M5.Speaker.setVolume(tts_volume);
-    M5.Speaker.playRaw((int16_t*)(wav_buf + data_offset), (read_len - data_offset) / 2, sample_rate, false, 1, 0);
-    while (M5.Speaker.isPlaying()) {
-        M5.update();
-        delay(10);
-        if (touchedZone(2)) { M5.Speaker.stop(); break; }
-        if (servo_ready) {
-            uint32_t now = millis();
-            if (now >= speak_next_ms) {
-                speak_phase = !speak_phase;
-                sc_servo.moveY(speak_phase ? srv_cy - 8 : srv_cy, 500, false);  // gentle nod, non-blocking
-                avatar.setMouthOpenRatio(speak_phase ? random(30, 65) / 100.0f : 0.05f);
-                speak_next_ms = now + 900;
-            }
-        }
-    }
-    avatar.setMouthOpenRatio(0.0f);
-    if (servo_ready) sc_servo.moveXY(srv_cx, srv_cy, 500);  // return to center after speaking
-
+    play_wav(wav_buf, read_len);
     heap_caps_free(wav_buf);
     return true;
 }
