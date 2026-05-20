@@ -1,4 +1,4 @@
-#include <Arduino.h>
+﻿#include <Arduino.h>
 #include <M5Unified.h>
 #include <SPIFFS.h>
 #include <WiFi.h>
@@ -607,7 +607,7 @@ String hermes_api_key  = "";
 int    tts_volume          = 100;
 int    hermes_max_tokens   = 80;
 int    hermes_timeout_ms   = 60000;
-String voicevox_host    = "";  // e.g. "192.168.1.100:50021" — use local VOICEVOX if set
+String voicevox_host    = "";  // e.g. "192.168.1.100:50021" 窶・use local VOICEVOX if set
 int    voicevox_speaker = 1;
 
 static bool ensure_wifi_connected(uint32_t timeout_ms = 15000) {
@@ -847,7 +847,7 @@ bool call_tts_local(const String& text) {
     http1.end();
     M5_LOGI("audio_query OK (%d bytes)", query_json.length());
 
-    // Step2: synthesis (synchronous POST → WAV bytes)
+    // Step2: synthesis (synchronous POST 竊・WAV bytes)
     HTTPClient http2;
     WiFiClient c2;
     http2.begin(c2, base + "/synthesis?speaker=" + speaker_str);
@@ -876,9 +876,9 @@ bool call_tts(const String& text) {
     String api_key = system_config.getAPISetting()->tts;
     if (api_key.isEmpty()) { M5_LOGE("TTS API key not set"); return false; }
 
-    // Step1: 合成リクエスト → wavDownloadUrl / audioStatusUrl を取得
-    String synth_url = "https://api.tts.quest/v3/voicevox/synthesis?text="
-                       + url_encode(text) + "&speaker=1&key=" + api_key;
+    // Step1: request synthesis and receive wavDownloadUrl / audioStatusUrl.
+    String synth_url = String("https://api.tts.quest/v3/voicevox/synthesis?text=")
+                     + url_encode(text) + "&speaker=1&key=" + api_key;
     M5_LOGI("TTS synth: %s", synth_url.c_str());
 
     HTTPClient http1;
@@ -903,7 +903,7 @@ bool call_tts(const String& text) {
     if (wav_url.isEmpty()) { M5_LOGE("No wavDownloadUrl"); return false; }
     M5_LOGI("WAV URL: %s", wav_url.c_str());
 
-    // Step1.5: audioStatusUrl をポーリングして WAV 生成完了を待つ
+    // Step1.5: poll audioStatusUrl until the WAV becomes ready.
     if (!status_url.isEmpty()) {
         M5_LOGI("Polling audio status...");
         bool audio_ready = false;
@@ -930,7 +930,7 @@ bool call_tts(const String& text) {
         if (!audio_ready) { M5_LOGE("Audio not ready after polling"); return false; }
     }
 
-    // Step2: WAVダウンロード
+    // Step2: download the WAV data.
     HTTPClient http2;
     WiFiClientSecure c2; c2.setInsecure();
     http2.setFollowRedirects(HTTPC_FORCE_FOLLOW_REDIRECTS);
@@ -940,7 +940,7 @@ bool call_tts(const String& text) {
     if (st2 != 200) { M5_LOGE("WAV download error: %d", st2); http2.end(); return false; }
 
     int wav_size = http2.getSize();
-    if (wav_size <= 0) wav_size = 512 * 1024; // 不明な場合は512KB確保
+    if (wav_size <= 0) wav_size = 512 * 1024;  // fallback if content-length is absent
     uint8_t* wav_buf = (uint8_t*)heap_caps_malloc(wav_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (!wav_buf) { M5_LOGE("malloc failed"); http2.end(); return false; }
 
@@ -948,7 +948,7 @@ bool call_tts(const String& text) {
     http2.end();
     M5_LOGI("WAV downloaded: %d bytes", read_len);
 
-    // Step3: WAV ヘッダー解析 → playRaw で再生 (spk_task スタック節約)
+    // Step3: parse and play the WAV.
     uint32_t data_offset = 44;
     uint32_t sample_rate = 24000;
     if (read_len >= 44 && memcmp(wav_buf, "RIFF", 4) == 0) {
@@ -995,14 +995,14 @@ String call_stt() {
     if (cancelled) { heap_caps_free(rec_buf); show("Cancelled"); return ""; }
     if (!ensure_wifi_connected()) { heap_caps_free(rec_buf); return ""; }
 
-    // Base64 エンコード
+    // Base64 encode the recorded PCM.
     size_t b64_len = ((MIC_BUF_BYTES + 2) / 3) * 4 + 1;
     uint8_t* b64_buf = (uint8_t*)heap_caps_malloc(b64_len, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (!b64_buf) { heap_caps_free(rec_buf); M5_LOGE("b64 malloc failed"); return ""; }
     size_t out_len = base64_encode(b64_buf, (uint8_t*)rec_buf, MIC_BUF_BYTES);
     heap_caps_free(rec_buf);
 
-    // JSON body 構築（大きいので PSRAM に確保）
+    // Build the Google STT request body in PSRAM.
     const char* prefix = "{\"config\":{\"encoding\":\"LINEAR16\",\"sampleRateHertz\":16000,\"languageCode\":\"ja-JP\"},\"audio\":{\"content\":\"";
     const char* suffix = "\"}}";
     size_t prefix_len = strlen(prefix);
@@ -1015,7 +1015,7 @@ String call_stt() {
     memcpy(body_buf + prefix_len + out_len, suffix, suffix_len + 1);
     heap_caps_free(b64_buf);
 
-    // Google STT REST API 呼び出し
+    // Call the Google STT REST API.
     String url = "https://speech.googleapis.com/v1/speech:recognize?key=" + api_key;
     HTTPClient http;
     WiFiClientSecure client; client.setInsecure();
@@ -1376,7 +1376,9 @@ static void handle_config_get(WiFiClient& client) {
               "function openTab(id){document.querySelectorAll('.tab').forEach(t=>t.classList.remove('active'));"
               "document.querySelectorAll('.tab-btn').forEach(t=>t.classList.remove('active'));"
               "document.getElementById(id).classList.add('active');"
-              "document.querySelector('[data-tab=\"'+id+'\"]').classList.add('active');}"
+              "document.querySelector('[data-tab=\"'+id+'\"]').classList.add('active');"
+              "const saveBtn=document.getElementById('save-btn');"
+              "if(saveBtn)saveBtn.style.display=(id==='tab-speak')?'none':'block';}"
               "function appendChat(role,text){const log=document.getElementById('chat-log');"
               "if(!log)return;"
               "const div=document.createElement('div');div.className='bubble '+role;div.textContent=text;"
@@ -1386,7 +1388,7 @@ static void handle_config_get(WiFiClient& client) {
               "const mode=document.querySelector('input[name=\"speak_mode\"]:checked').value;"
               "const input=document.getElementById('speak-text');"
               "const text=input.value.trim();"
-              "if(!text){setSpeakStatus('テキストを入力してください');return;}"
+              "if(!text){setSpeakStatus('繝・く繧ｹ繝医ｒ蜈･蜉帙＠縺ｦ縺上□縺輔＞');return;}"
               "const clearAfterSend=mode==='fixed';"
               "window.stackChanChat=window.stackChanChat||[];"
               "appendChat('user',text);"
@@ -1399,7 +1401,7 @@ static void handle_config_get(WiFiClient& client) {
               "if(!resp.ok||!data.ok){throw new Error(data.error||('HTTP '+resp.status));}"
               "if(data.reply){appendChat('assistant',data.reply);window.stackChanChat.push({role:'assistant',content:data.reply});}"
               "if(clearAfterSend) input.value='';"
-              "setSpeakStatus(data.spoken?'発話しました':'完了');"
+              "setSpeakStatus(data.spoken?'Spoken':'Done');"
               "}catch(err){setSpeakStatus('Error: '+err.message);}}"
               "window.addEventListener('DOMContentLoaded',()=>openTab('tab-security'));"
               "</script></head><body>"
@@ -1413,7 +1415,7 @@ static void handle_config_get(WiFiClient& client) {
               "</div>"
               "<form method=post action=/config>");
     html += F("<div id=tab-security class=\"tab active\">");
-    html += F("<div class=sec><h3>WiFi</h3><p>上から順に接続を試します。</p>");
+    html += F("<div class=sec><h3>WiFi</h3><p>Try entries from top to bottom.</p>");
     for (size_t i = 0; i < WIFI_MAX; ++i) {
         String idx = String(i + 1);
         String ssid = i < wifi_credential_count ? html_escape(wifi_credentials[i].ssid) : "";
@@ -1449,9 +1451,9 @@ static void handle_config_get(WiFiClient& client) {
               "<label><input type=radio name=speak_mode value=llm> LLM</label>"
               "</div>"
               "<div id=chat-log class=chat-log></div>"
-              "<label>Text / Prompt<textarea id=speak-text placeholder=\"話させたい文、またはLLMへの入力\"></textarea></label>"
+              "<label>Text / Prompt<textarea id=speak-text placeholder=\"Text to speak or a prompt for LLM\"></textarea></label>"
               "<div class=speak-row><button type=button class=mini-btn onclick=sendSpeak()>Send</button><span id=speak-status></span></div>"
-              "<p>LLM モードでは、この画面内の会話履歴を文脈として送ります。</p>"
+              "<p>LLM mode sends the chat history shown in this tab as context.</p>"
               "</div>");
     html += F("</div>");
     html += F("<div id=tab-bpm class=tab>");
@@ -1478,19 +1480,19 @@ static void handle_config_get(WiFiClient& client) {
     html += F("<div class=sec><h3>Button Assignments</h3>");
     html += F("<label class=check><input type=checkbox name=btn_llm_tap value=1");
     if (btn_llm_tap)       html += F(" checked");
-    html += F(">Left tap — LLM test speak</label>");
+    html += F(">Left tap 窶・LLM test speak</label>");
     html += F("<label class=check><input type=checkbox name=btn_periodic_hold value=1");
     if (btn_periodic_hold) html += F(" checked");
-    html += F(">Left hold — Periodic mode toggle</label>");
+    html += F(">Left hold 窶・Periodic mode toggle</label>");
     html += F("<label class=check><input type=checkbox name=btn_stt_tap value=1");
     if (btn_stt_tap)       html += F(" checked");
-    html += F(">Center tap — Push-to-Talk (STT)</label>");
+    html += F(">Center tap 窶・Push-to-Talk (STT)</label>");
     html += F("<label class=check><input type=checkbox name=btn_servo_tap value=1");
     if (btn_servo_tap)     html += F(" checked");
-    html += F(">Right tap — Servo idle toggle</label>");
+    html += F(">Right tap 窶・Servo idle toggle</label>");
     html += F("<label class=check><input type=checkbox name=btn_bpm_hold value=1");
     if (btn_bpm_hold)      html += F(" checked");
-    html += F(">Right hold — BPM dance mode</label>");
+    html += F(">Right hold 窶・BPM dance mode</label>");
     html += F("</div>");
     html += F("</div>");
     // --- Periodic tab ---
@@ -1521,7 +1523,7 @@ static void handle_config_get(WiFiClient& client) {
         html += "\"></label></div>";
     }
     html += F("</div>");
-    html += F("<button class=btn type=submit>Save &amp; Restart</button>"
+    html += F("<button id=save-btn class=btn type=submit>Save &amp; Restart</button>"
               "</form></body></html>");
 
     client.print("HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: ");
@@ -2195,7 +2197,7 @@ void setup() {
     load_hermes_config(SPIFFS);
     servo_idle_enabled = servo_on_boot;
     M5.Display.setBrightness(brightness_val);  // set before LED task starts
-    led_init();  // must be after servo_begin() — needs ioexpander initialized
+    led_init();  // must be after servo_begin() 窶・needs ioexpander initialized
 
     avatar.init();
     avatar.setSpeechFont(&fonts::efontJA_16);
@@ -2305,14 +2307,14 @@ void loop() {
     }
     handle_speak_server();
 
-    // 右ホールド: BPMモード
+    // Right hold: BPM mode
     if (btn_bpm_hold && !busy && time_reached(millis(), bpm_toggle_cooldown_until_ms) && zoneHoldTriggered(2)) {
         clear_error_state();
         bpm_enter_detect_mode();
         return;
     }
 
-    // 左ホールド: 定期発話モード ON/OFF トグル
+    // 蟾ｦ繝帙・繝ｫ繝・ 螳壽悄逋ｺ隧ｱ繝｢繝ｼ繝・ON/OFF 繝医げ繝ｫ
     if (btn_periodic_hold && !busy && zoneHoldTriggered(0) && time_reached(millis(), periodic_hold_cooldown_ms)) {
         periodic_mode_enabled = !periodic_mode_enabled;
         periodic_hold_cooldown_ms = millis() + 2000;
@@ -2345,7 +2347,7 @@ void loop() {
         busy = false;
     }
 
-    // 右タッチ: アイドルサーボ停止/再開トグル
+    // 蜿ｳ繧ｿ繝・メ: 繧｢繧､繝峨Ν繧ｵ繝ｼ繝懷●豁｢/蜀埼幕繝医げ繝ｫ
     if (btn_servo_tap && zoneTapTriggered(2)) {
         clear_error_state();
         show("");
@@ -2360,11 +2362,11 @@ void loop() {
         }
     }
 
-    // 中央タッチ: Push-to-Talk (STT → Hermes → TTS)
+    // 荳ｭ螟ｮ繧ｿ繝・メ: Push-to-Talk (STT 竊・Hermes 竊・TTS)
     if (btn_stt_tap && zoneTapTriggered(1) && !busy) {
         clear_error_state();
         busy = true;
-        servo_idle_enabled = true;  // 話しかけたらサーボ再開
+        servo_idle_enabled = true;  // resume idle servo when user talks
         servo_idle_next_ms = millis() + 2000;
         avatar.setExpression(Expression::Happy);
         show("Speak now!");
@@ -2397,7 +2399,7 @@ void loop() {
         busy = false;
     }
 
-    // 設定トリガー: 画面右上コーナー（x>260, y<50）タップ
+    // 險ｭ螳壹ヨ繝ｪ繧ｬ繝ｼ: 逕ｻ髱｢蜿ｳ荳翫さ繝ｼ繝翫・・・>260, y<50・峨ち繝・・
     if (!busy) {
         const auto& t = current_touch_detail;
         if (t.wasPressed() && t.x > 260 && t.y < 50) {
@@ -2417,3 +2419,4 @@ void loop() {
 
     delay(10);
 }
+
