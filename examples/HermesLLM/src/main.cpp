@@ -15,9 +15,12 @@
 #include "Si12T.h"
 #include <Avatar.h>
 using namespace m5avatar;
+struct WifiCredential;
 bool touchedZone(int zone);
 void show(const String& text);
 void handle_speak_server();
+static void load_wifi_credentials_from_yaml(const String& normalized_yaml);
+static void replace_wifi_yaml_sections(String& yaml, WifiCredential entries[], size_t entry_count);
 static void led_force_clear();
 static const char B64_TABLE[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 static size_t base64_encode(uint8_t* out, const uint8_t* in, size_t in_len) {
@@ -49,7 +52,25 @@ Avatar avatar;
 // --- Servo ---
 StackchanSERVO sc_servo;
 static bool servo_ready = false;
-static volatile bool servo_idle_enabled = true;
+static volatile bool servo_idle_enabled = false;
+static bool servo_on_boot = false;
+
+#define PERIODIC_MAX 5
+struct PeriodicEntry {
+    bool     enabled     = false;
+    bool     is_llm      = false;
+    String   message;
+    uint32_t interval_ms = 1800000UL;
+    uint32_t next_fire_ms = 0;
+};
+static PeriodicEntry periodic_entries[PERIODIC_MAX];
+static bool     periodic_mode_enabled   = false;
+static uint32_t periodic_hold_cooldown_ms = 0;
+static bool btn_llm_tap       = false;
+static bool btn_periodic_hold = true;
+static bool btn_stt_tap       = true;
+static bool btn_servo_tap     = true;
+static bool btn_bpm_hold      = true;
 static int16_t srv_cx = 150, srv_cy = 90;
 static uint32_t servo_idle_next_ms = 0;
 static uint32_t head_pat_cooldown_until_ms = 0;
@@ -63,6 +84,13 @@ static AppMode app_mode = MODE_NORMAL;
 static int setting_volume     = 80;
 static int setting_brightness = 200;
 static int brightness_val     = 200;
+static constexpr size_t WIFI_MAX = 3;
+struct WifiCredential {
+    String ssid;
+    String password;
+};
+static WifiCredential wifi_credentials[WIFI_MAX];
+static size_t wifi_credential_count = 0;
 
 static constexpr size_t BPM_RECORD_LENGTH = 256;
 static constexpr uint32_t BPM_SAMPLE_RATE = 16000;
@@ -84,6 +112,14 @@ static uint32_t bpm_next_log_ms = 0;
 static uint32_t bpm_play_next_step_ms = 0;
 static uint32_t bpm_play_hold_until_ms = 0;
 static bool bpm_play_swing_right = true;
+static uint32_t bpm_play_last_move_ms = 0;
+static bool http_beat_pending = false;
+static bool http_beat_return_pending = false;
+static int http_beat_target_x = 0;
+static int http_beat_target_y = 0;
+static uint32_t http_beat_return_at_ms = 0;
+static bool http_beat_motion_vertical = false;
+static m5::touch_detail_t current_touch_detail;
 
 class ScopedLock {
 public:
@@ -216,6 +252,12 @@ struct LedColor {
 
 static bool time_reached(uint32_t now, uint32_t target) {
     return static_cast<int32_t>(now - target) >= 0;
+}
+
+static uint16_t clamp_bpm_value(int bpm) {
+    if (bpm < 60) return 60;
+    if (bpm > 180) return 180;
+    return static_cast<uint16_t>(bpm);
 }
 
 static bool led_idle_base_allowed() {
@@ -574,26 +616,31 @@ static bool ensure_wifi_connected(uint32_t timeout_ms = 15000) {
     M5_LOGW("WiFi disconnected (status=%d), reconnecting...", WiFi.status());
     show("WiFi reconnect...");
 
-    wifi_s* wifi = system_config.getWiFiSetting();
-    uint32_t started_ms = millis();
-    bool begin_called = false;
-    while (WiFi.status() != WL_CONNECTED && (millis() - started_ms) < timeout_ms) {
-        if (!begin_called) {
-            WiFi.disconnect(false, true);
-            delay(100);
-            WiFi.begin(wifi->ssid.c_str(), wifi->password.c_str());
-            begin_called = true;
-        } else {
-            WiFi.reconnect();
+    if (wifi_credential_count == 0) {
+        wifi_s* wifi = system_config.getWiFiSetting();
+        if (wifi && !wifi->ssid.isEmpty()) {
+            wifi_credentials[0].ssid = wifi->ssid;
+            wifi_credentials[0].password = wifi->password;
+            wifi_credential_count = 1;
         }
-        delay(500);
-        M5.update();
     }
 
-    if (WiFi.status() == WL_CONNECTED) {
-        M5_LOGI("WiFi reconnected: %s", WiFi.localIP().toString().c_str());
-        show("IP: " + WiFi.localIP().toString());
-        return true;
+    for (size_t i = 0; i < wifi_credential_count; ++i) {
+        if (wifi_credentials[i].ssid.isEmpty()) continue;
+        M5_LOGI("WiFi try %d/%d: %s", (int)(i + 1), (int)wifi_credential_count, wifi_credentials[i].ssid.c_str());
+        WiFi.disconnect(false, true);
+        delay(100);
+        WiFi.begin(wifi_credentials[i].ssid.c_str(), wifi_credentials[i].password.c_str());
+        uint32_t started_ms = millis();
+        while (WiFi.status() != WL_CONNECTED && (millis() - started_ms) < timeout_ms) {
+            delay(500);
+            M5.update();
+        }
+        if (WiFi.status() == WL_CONNECTED) {
+            M5_LOGI("WiFi connected via entry %d: %s", (int)(i + 1), WiFi.localIP().toString().c_str());
+            show("IP: " + WiFi.localIP().toString());
+            return true;
+        }
     }
 
     M5_LOGE("WiFi reconnect failed (status=%d)", WiFi.status());
@@ -657,7 +704,29 @@ void load_hermes_config(fs::FS& fs) {
     };
     voicevox_host = extractStr("voicevox_host");
     if (!voicevox_host.isEmpty()) M5_LOGI("Local VOICEVOX: %s speaker=%d", voicevox_host.c_str(), voicevox_speaker);
+    load_wifi_credentials_from_yaml(normalized_yaml);
     brightness_val = extractInt("brightness", brightness_val);
+    servo_on_boot = extractInt("servo_on_boot", servo_on_boot ? 1 : 0) != 0;
+    play_bpm = clamp_bpm_value(extractInt("play_bpm", play_bpm));
+
+    periodic_mode_enabled = extractInt("periodic_enabled", 0) != 0;
+    uint32_t boot_ms = millis();
+    for (int i = 0; i < PERIODIC_MAX; i++) {
+        String pre = "p" + String(i) + "_";
+        periodic_entries[i].enabled  = extractInt((pre + "enabled").c_str(), 0) != 0;
+        String t = extractStr((pre + "type").c_str());
+        periodic_entries[i].is_llm   = (t == "llm");
+        periodic_entries[i].message  = extractStr((pre + "msg").c_str());
+        int mins = extractInt((pre + "min").c_str(), 30);
+        if (mins < 1) mins = 1;
+        periodic_entries[i].interval_ms  = (uint32_t)mins * 60000UL;
+        periodic_entries[i].next_fire_ms = boot_ms + periodic_entries[i].interval_ms;
+    }
+    btn_llm_tap       = extractInt("btn_llm_tap",       0) != 0;
+    btn_periodic_hold = extractInt("btn_periodic_hold",  1) != 0;
+    btn_stt_tap       = extractInt("btn_stt_tap",        1) != 0;
+    btn_servo_tap     = extractInt("btn_servo_tap",      1) != 0;
+    btn_bpm_hold      = extractInt("btn_bpm_hold",       1) != 0;
 }
 
 String url_encode(const String& text) {
@@ -706,6 +775,24 @@ String call_hermes(const String& user_message) {
     if (deserializeJson(resp, response)) return "Parse error";
     const char* content = resp["choices"][0]["message"]["content"];
     return content ? String(content) : "No content";
+}
+
+static String build_llm_chat_prompt(JsonVariant history, const String& user_message) {
+    String prompt = "Conversation so far:\n";
+    if (history.is<JsonArray>()) {
+        JsonArray arr = history.as<JsonArray>();
+        for (JsonVariant item : arr) {
+            String role = item["role"] | "";
+            String content = item["content"] | "";
+            if (content.isEmpty()) continue;
+            if (role == "assistant") prompt += "Assistant: ";
+            else prompt += "User: ";
+            prompt += content + "\n";
+        }
+    }
+    prompt += "Latest user message: " + user_message + "\n";
+    prompt += "Reply naturally in Japanese, briefly, while keeping the conversation context.";
+    return prompt;
 }
 
 static void play_wav(uint8_t* wav_buf, int read_len) {
@@ -949,6 +1036,63 @@ String call_stt() {
     return transcript ? String(transcript) : "";
 }
 
+static void update_yaml_int_value(String& yaml, const char* key, int value) {
+    String search = String(key) + ":";
+    int pos = yaml.indexOf(search);
+    if (pos < 0) { yaml += "\n" + search + " " + String(value); return; }
+    int start = pos + search.length();
+    while (start < (int)yaml.length() && yaml[start] == ' ') start++;
+    int end = start;
+    while (end < (int)yaml.length() && (isDigit(yaml[end]) || yaml[end] == '-')) end++;
+    yaml = yaml.substring(0, start) + String(value) + yaml.substring(end);
+}
+
+static void upsert_yaml_quoted(String& yaml, const String& key, const String& value) {
+    String search = key + ": \"";
+    String esc = value; esc.replace("\\", "\\\\"); esc.replace("\"", "\\\"");
+    int pos = yaml.indexOf(search);
+    if (pos < 0) { yaml += "\n" + key + ": \"" + esc + "\""; return; }
+    int start = pos + search.length();
+    int end = yaml.indexOf('"', start);
+    if (end < 0) return;
+    yaml = yaml.substring(0, start) + esc + yaml.substring(end);
+}
+
+static void periodic_tick() {
+    if (!periodic_mode_enabled || busy || app_mode != MODE_NORMAL) return;
+    uint32_t now = millis();
+    for (int i = 0; i < PERIODIC_MAX; i++) {
+        PeriodicEntry& e = periodic_entries[i];
+        if (!e.enabled || e.interval_ms == 0 || e.message.isEmpty()) continue;
+        if (!time_reached(now, e.next_fire_ms)) continue;
+        e.next_fire_ms = now + e.interval_ms;
+        busy = true;
+        String text;
+        if (e.is_llm) {
+            avatar.setExpression(Expression::Doubt);
+            led_set(LED_THINKING);
+            show("Thinking...");
+            text = call_hermes(e.message);
+            if (text.startsWith("Error:") || text.startsWith("Parse error") || text.startsWith("No content")) {
+                show_error_state(text);
+                busy = false;
+                return;
+            }
+        } else {
+            text = e.message;
+        }
+        avatar.setExpression(Expression::Happy);
+        led_set(LED_SPEAKING);
+        show("[Speaking...]");
+        call_tts(text);
+        avatar.setExpression(Expression::Neutral);
+        led_set(LED_OFF);
+        show("");
+        busy = false;
+        break;
+    }
+}
+
 void show(const String& text) {
     String oneline = text;
     oneline.replace("\n", " ");
@@ -956,12 +1100,536 @@ void show(const String& text) {
     Serial.println(text);
 }
 
+static void queue_http_beat(int step_index, bool accent, int bpm_hint, const String& motion) {
+    if (!servo_ready) return;
+
+    auto* sx = system_config.getServoInfo(AXIS_X);
+    auto* sy = system_config.getServoInfo(AXIS_Y);
+    int play_center_y = srv_cy - 10;
+    if (sy) {
+        play_center_y = max<int>(sy->lower_limit, min<int>(sy->upper_limit, play_center_y));
+    }
+
+    String motion_mode = motion;
+    motion_mode.toLowerCase();
+    bool vertical_motion = motion_mode == "ud";
+
+    int target_x = srv_cx;
+    int target_y = play_center_y;
+    if (vertical_motion) {
+        int nod = accent ? 18 : 12;
+        target_y = play_center_y - nod;
+        if (sy) {
+            target_y = max<int>(sy->lower_limit, min<int>(sy->upper_limit, target_y));
+        }
+    } else {
+        int swing = accent ? 18 : 12;
+        bool swing_right = (step_index % 2) == 0;
+        target_x = srv_cx + (swing_right ? swing : -swing);
+        if (sx) {
+            target_x = max<int>(sx->lower_limit, min<int>(sx->upper_limit, target_x));
+        }
+    }
+
+    if (bpm_hint >= 60 && bpm_hint <= 180) {
+        play_bpm = clamp_bpm_value(bpm_hint);
+    }
+
+    http_beat_target_x = target_x;
+    http_beat_target_y = target_y;
+    http_beat_motion_vertical = vertical_motion;
+    http_beat_pending = true;
+}
+
+static void http_beat_tick() {
+    if (!servo_ready) return;
+
+    uint32_t now = millis();
+    if (http_beat_pending) {
+        sc_servo.moveXY(http_beat_target_x, http_beat_target_y, 140);
+        avatar.setMouthOpenRatio(0.10f);
+        http_beat_pending = false;
+        http_beat_return_pending = true;
+        http_beat_return_at_ms = now + 220;
+        return;
+    }
+
+    if (http_beat_return_pending && time_reached(now, http_beat_return_at_ms)) {
+        if (http_beat_motion_vertical) {
+            sc_servo.moveXY(srv_cx, srv_cy, 120);
+        } else {
+            sc_servo.moveXY(srv_cx, http_beat_target_y, 120);
+        }
+        avatar.setMouthOpenRatio(0.0f);
+        http_beat_return_pending = false;
+    }
+}
+
+// ---- Web Config Server ----
+
+static String html_escape(const String& s) {
+    String out;
+    out.reserve(s.length() + 8);
+    for (int i = 0; i < (int)s.length(); i++) {
+        char c = s[i];
+        if      (c == '&')  out += "&amp;";
+        else if (c == '<')  out += "&lt;";
+        else if (c == '>')  out += "&gt;";
+        else if (c == '"')  out += "&quot;";
+        else                out += c;
+    }
+    return out;
+}
+
+static String json_escape(const String& s) {
+    String out;
+    out.reserve(s.length() + 8);
+    for (int i = 0; i < (int)s.length(); i++) {
+        char c = s[i];
+        if (c == '\\' || c == '"') {
+            out += '\\';
+            out += c;
+        } else if (c == '\n') {
+            out += "\\n";
+        } else if (c == '\r') {
+            out += "\\r";
+        } else if (c == '\t') {
+            out += "\\t";
+        } else {
+            out += c;
+        }
+    }
+    return out;
+}
+
+static String url_decode(const String& src) {
+    String out;
+    out.reserve(src.length());
+    for (int i = 0; i < (int)src.length(); i++) {
+        if (src[i] == '%' && i + 2 < (int)src.length()) {
+            char h[3] = {src[i+1], src[i+2], 0};
+            out += (char)strtol(h, nullptr, 16);
+            i += 2;
+        } else if (src[i] == '+') {
+            out += ' ';
+        } else {
+            out += src[i];
+        }
+    }
+    return out;
+}
+
+static String form_field(const String& body, const char* key) {
+    String search = String(key) + "=";
+    int pos = body.indexOf(search);
+    if (pos < 0) return "";
+    pos += search.length();
+    int end = body.indexOf('&', pos);
+    return url_decode(end < 0 ? body.substring(pos) : body.substring(pos, end));
+}
+
+static bool form_has_checked(const String& body, const char* key) {
+    String search = String(key) + "=";
+    return body.indexOf(search) >= 0;
+}
+
+static void update_yaml_quoted_str(String& yaml, const char* key_with_quote, const String& value) {
+    String search = String(key_with_quote);
+    int pos = yaml.indexOf(search);
+    if (pos < 0) return;
+    int start = pos + search.length();
+    int end = yaml.indexOf('"', start);
+    if (end < 0) return;
+    String esc = value; esc.replace("\\", "\\\\"); esc.replace("\"", "\\\"");
+    yaml = yaml.substring(0, start) + esc + yaml.substring(end);
+}
+
+static void update_yaml_quoted_in_section(String& yaml, const char* section, const char* key_with_quote, const String& value) {
+    int section_pos = yaml.indexOf(String(section) + ":");
+    if (section_pos < 0) return;
+    String search = String(key_with_quote);
+    int pos = yaml.indexOf(search, section_pos);
+    if (pos < 0) return;
+    int start = pos + search.length();
+    int end = yaml.indexOf('"', start);
+    if (end < 0) return;
+    String esc = value; esc.replace("\\", "\\\\"); esc.replace("\"", "\\\"");
+    yaml = yaml.substring(0, start) + esc + yaml.substring(end);
+}
+
+static void load_wifi_credentials_from_yaml(const String& normalized_yaml) {
+    wifi_credential_count = 0;
+    int list_pos = normalized_yaml.indexOf("wifi_list:");
+    if (list_pos >= 0) {
+        int scan = list_pos;
+        while (wifi_credential_count < WIFI_MAX) {
+            int ssid_pos = normalized_yaml.indexOf("  - ssid: \"", scan);
+            if (ssid_pos < 0) break;
+            int ssid_start = ssid_pos + String("  - ssid: \"").length();
+            int ssid_end = normalized_yaml.indexOf('"', ssid_start);
+            if (ssid_end < 0) break;
+            String ssid = normalized_yaml.substring(ssid_start, ssid_end);
+
+            int pass_pos = normalized_yaml.indexOf("    password: \"", ssid_end);
+            if (pass_pos < 0) break;
+            int pass_start = pass_pos + String("    password: \"").length();
+            int pass_end = normalized_yaml.indexOf('"', pass_start);
+            if (pass_end < 0) break;
+            String password = normalized_yaml.substring(pass_start, pass_end);
+
+            if (!ssid.isEmpty()) {
+                wifi_credentials[wifi_credential_count].ssid = ssid;
+                wifi_credentials[wifi_credential_count].password = password;
+                wifi_credential_count++;
+            }
+            scan = pass_end;
+        }
+    }
+
+    if (wifi_credential_count == 0) {
+        wifi_s* wifi = system_config.getWiFiSetting();
+        if (wifi && !wifi->ssid.isEmpty()) {
+            wifi_credentials[0].ssid = wifi->ssid;
+            wifi_credentials[0].password = wifi->password;
+            wifi_credential_count = 1;
+        }
+    }
+}
+
+static void replace_wifi_yaml_sections(String& yaml, WifiCredential entries[], size_t entry_count) {
+    String first_ssid = entry_count > 0 ? entries[0].ssid : "";
+    String first_pass = entry_count > 0 ? entries[0].password : "";
+    first_ssid.replace("\\", "\\\\"); first_ssid.replace("\"", "\\\"");
+    first_pass.replace("\\", "\\\\"); first_pass.replace("\"", "\\\"");
+
+    String wifi_section = "wifi:\n";
+    wifi_section += "  ssid: \"" + first_ssid + "\"\n";
+    wifi_section += "  password: \"" + first_pass + "\"\n";
+    wifi_section += "wifi_list:\n";
+    for (size_t i = 0; i < entry_count; ++i) {
+        if (entries[i].ssid.isEmpty()) continue;
+        String ssid = entries[i].ssid;
+        String pass = entries[i].password;
+        ssid.replace("\\", "\\\\"); ssid.replace("\"", "\\\"");
+        pass.replace("\\", "\\\\"); pass.replace("\"", "\\\"");
+        wifi_section += "  - ssid: \"" + ssid + "\"\n";
+        wifi_section += "    password: \"" + pass + "\"\n";
+    }
+
+    int wifi_pos = yaml.indexOf("wifi:");
+    int apikey_pos = yaml.indexOf("apikey:");
+    if (wifi_pos >= 0 && apikey_pos > wifi_pos) {
+        yaml = yaml.substring(0, wifi_pos) + wifi_section + yaml.substring(apikey_pos);
+    }
+}
+
+static void handle_config_get(WiFiClient& client) {
+    auto* api    = system_config.getAPISetting();
+    String sttk  = api      ? html_escape(api->stt)       : "";
+    String ttsk  = api      ? html_escape(api->tts)       : "";
+    if (wifi_credential_count == 0) {
+        wifi_s* wifi = system_config.getWiFiSetting();
+        if (wifi && !wifi->ssid.isEmpty()) {
+            wifi_credentials[0].ssid = wifi->ssid;
+            wifi_credentials[0].password = wifi->password;
+            wifi_credential_count = 1;
+        }
+    }
+
+    String html;
+    html.reserve(6144);
+    html  = F("<!DOCTYPE html><html><head>"
+              "<meta charset=UTF-8>"
+              "<meta name=viewport content=\"width=device-width,initial-scale=1\">"
+              "<title>StackChan Settings</title>"
+              "<style>"
+              "*{box-sizing:border-box}"
+              "body{font:14px sans-serif;max-width:560px;margin:16px auto;padding:8px}"
+              "h2{color:#333;margin-bottom:4px}"
+              "h3{color:#555;border-bottom:1px solid #ddd;padding-bottom:4px;margin:0 0 8px}"
+              "label{display:block;margin-top:8px;font-weight:bold}"
+              "input{width:100%;padding:6px;border:1px solid #ccc;border-radius:3px;margin-top:2px;font-size:13px}"
+              "input[type=number]{width:130px}"
+              "input[type=checkbox],input[type=radio]{width:auto;margin-right:6px}"
+              "input[type=checkbox]{transform:scale(1.2)}"
+              "input[type=range]{padding:0;border:none;cursor:pointer;accent-color:#4CAF50}"
+              ".range-val{display:inline-block;min-width:2em;text-align:right;font-weight:normal;color:#555}"
+              ".sec{margin:10px 0;padding:10px 12px;border:1px solid #ddd;border-radius:6px}"
+              ".tabs{display:flex;gap:8px;margin:10px 0 14px;flex-wrap:wrap}"
+              ".tab-btn{padding:10px 12px;border:1px solid #bbb;border-radius:999px;background:#f4f4f4;cursor:pointer;font-size:13px}"
+              ".tab-btn.active{background:#1f6feb;color:#fff;border-color:#1f6feb}"
+              ".tab{display:none}"
+              ".tab.active{display:block}"
+              ".check{display:flex;align-items:center;gap:8px;margin-top:12px;font-weight:bold}"
+              ".chat-log{height:280px;overflow:auto;border:1px solid #ddd;border-radius:8px;padding:10px;background:#fafafa}"
+              ".bubble{max-width:88%;padding:8px 10px;border-radius:12px;margin:8px 0;white-space:pre-wrap;word-break:break-word}"
+              ".bubble.user{margin-left:auto;background:#dbeafe}"
+              ".bubble.assistant{margin-right:auto;background:#e8f5e9}"
+              ".speak-row{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin:8px 0}"
+              "textarea{width:100%;min-height:88px;padding:8px;border:1px solid #ccc;border-radius:6px;font-size:13px}"
+              ".mini-btn{padding:10px 12px;border:1px solid #1f6feb;border-radius:8px;background:#1f6feb;color:#fff;cursor:pointer}"
+              ".btn{display:block;width:100%;padding:12px;background:#4CAF50;color:#fff;"
+              "border:none;border-radius:4px;cursor:pointer;font-size:15px;margin-top:14px}"
+              ".btn:hover{background:#45a049}"
+              "</style>"
+              "<script>"
+              "function openTab(id){document.querySelectorAll('.tab').forEach(t=>t.classList.remove('active'));"
+              "document.querySelectorAll('.tab-btn').forEach(t=>t.classList.remove('active'));"
+              "document.getElementById(id).classList.add('active');"
+              "document.querySelector('[data-tab=\"'+id+'\"]').classList.add('active');}"
+              "function appendChat(role,text){const log=document.getElementById('chat-log');"
+              "if(!log)return;"
+              "const div=document.createElement('div');div.className='bubble '+role;div.textContent=text;"
+              "log.appendChild(div);log.scrollTop=log.scrollHeight;}"
+              "function setSpeakStatus(text){const el=document.getElementById('speak-status');if(el)el.textContent=text;}"
+              "async function sendSpeak(){"
+              "const mode=document.querySelector('input[name=\"speak_mode\"]:checked').value;"
+              "const input=document.getElementById('speak-text');"
+              "const text=input.value.trim();"
+              "if(!text){setSpeakStatus('テキストを入力してください');return;}"
+              "const clearAfterSend=mode==='fixed';"
+              "window.stackChanChat=window.stackChanChat||[];"
+              "appendChat('user',text);"
+              "if(mode==='llm'){window.stackChanChat.push({role:'user',content:text});}"
+              "setSpeakStatus(mode==='llm'?'Thinking...':'Speaking...');"
+              "try{"
+              "const payload={mode:mode,text:text,history:window.stackChanChat};"
+              "const resp=await fetch('/speak',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});"
+              "const data=await resp.json();"
+              "if(!resp.ok||!data.ok){throw new Error(data.error||('HTTP '+resp.status));}"
+              "if(data.reply){appendChat('assistant',data.reply);window.stackChanChat.push({role:'assistant',content:data.reply});}"
+              "if(clearAfterSend) input.value='';"
+              "setSpeakStatus(data.spoken?'発話しました':'完了');"
+              "}catch(err){setSpeakStatus('Error: '+err.message);}}"
+              "window.addEventListener('DOMContentLoaded',()=>openTab('tab-security'));"
+              "</script></head><body>"
+              "<h2>StackChan Settings</h2>"
+              "<div class=tabs>"
+              "<button type=button class=tab-btn data-tab=tab-security onclick=\"openTab('tab-security')\">Security</button>"
+              "<button type=button class=tab-btn data-tab=tab-speak onclick=\"openTab('tab-speak')\">Speak</button>"
+              "<button type=button class=tab-btn data-tab=tab-bpm onclick=\"openTab('tab-bpm')\">BPM-Dance</button>"
+              "<button type=button class=tab-btn data-tab=tab-general onclick=\"openTab('tab-general')\">General</button>"
+              "<button type=button class=tab-btn data-tab=tab-periodic onclick=\"openTab('tab-periodic')\">Periodic</button>"
+              "</div>"
+              "<form method=post action=/config>");
+    html += F("<div id=tab-security class=\"tab active\">");
+    html += F("<div class=sec><h3>WiFi</h3><p>上から順に接続を試します。</p>");
+    for (size_t i = 0; i < WIFI_MAX; ++i) {
+        String idx = String(i + 1);
+        String ssid = i < wifi_credential_count ? html_escape(wifi_credentials[i].ssid) : "";
+        String wpass = i < wifi_credential_count ? html_escape(wifi_credentials[i].password) : "";
+        html += "<label>SSID " + idx + "<input type=text name=wifi" + idx + "_ssid value=\"";
+        html += ssid;
+        html += "\"></label>";
+        html += "<label>Password " + idx + "<input type=password name=wifi" + idx + "_pass value=\"";
+        html += wpass;
+        html += "\"></label>";
+    }
+    html += F("</div>");
+    html += F("<div class=sec><h3>API Keys</h3>"
+              "<label>STT (Google)<input type=text name=stt_key value=\""); html += sttk; html += F("\"></label>"
+              "<label>TTS (tts.quest)<input type=text name=tts_key value=\""); html += ttsk; html += F("\"></label>"
+              "</div>");
+    html += F("<div class=sec><h3>VOICEVOX (optional)</h3>"
+              "<label>Host (IP:port)<input type=text name=vv_host value=\""); html += html_escape(voicevox_host); html += F("\"></label>"
+              "<label>Speaker ID<input type=number name=vv_spk value=\""); html += String(voicevox_speaker); html += F("\"></label>"
+              "</div>");
+    html += F("<div class=sec><h3>Hermes (LLM)</h3>"
+              "<label>Endpoint<input type=text name=h_ep value=\""); html += html_escape(hermes_endpoint); html += F("\"></label>"
+              "<label>Model<input type=text name=h_model value=\""); html += html_escape(hermes_model); html += F("\"></label>"
+              "<label>API Key<input type=text name=h_key value=\""); html += html_escape(hermes_api_key); html += F("\"></label>"
+              "<label>Max Tokens<input type=number name=h_tokens value=\""); html += String(hermes_max_tokens); html += F("\"></label>"
+              "<label>Timeout (ms)<input type=number name=h_timeout value=\""); html += String(hermes_timeout_ms); html += F("\"></label>"
+              "</div>");
+    html += F("</div>");
+    html += F("<div id=tab-speak class=tab>");
+    html += F("<div class=sec><h3>Speak</h3>"
+              "<div class=speak-row>"
+              "<label><input type=radio name=speak_mode value=fixed checked> Fixed</label>"
+              "<label><input type=radio name=speak_mode value=llm> LLM</label>"
+              "</div>"
+              "<div id=chat-log class=chat-log></div>"
+              "<label>Text / Prompt<textarea id=speak-text placeholder=\"話させたい文、またはLLMへの入力\"></textarea></label>"
+              "<div class=speak-row><button type=button class=mini-btn onclick=sendSpeak()>Send</button><span id=speak-status></span></div>"
+              "<p>LLM モードでは、この画面内の会話履歴を文脈として送ります。</p>"
+              "</div>");
+    html += F("</div>");
+    html += F("<div id=tab-bpm class=tab>");
+    html += F("<div class=sec><h3>BPM-Dance</h3>"
+              "<label>Play BPM<input type=number min=60 max=180 name=play_bpm value=\""); html += String(play_bpm); html += F("\"></label>"
+              "</div>");
+    html += F("</div>");
+    html += F("<div id=tab-general class=tab>");
+    html += F("<div class=sec><h3>General</h3>"
+              "<label>TTS Volume &nbsp;<span class=range-val id=vol_lbl>");
+    html += String(tts_volume);
+    html += F("</span><input type=range min=0 max=255 name=tts_volume value=\"");
+    html += String(tts_volume);
+    html += F("\" oninput=\"document.getElementById('vol_lbl').textContent=this.value\"></label>"
+              "<label>Brightness &nbsp;<span class=range-val id=bri_lbl>");
+    html += String(brightness_val);
+    html += F("</span><input type=range min=20 max=255 name=brightness value=\"");
+    html += String(brightness_val);
+    html += F("\" oninput=\"document.getElementById('bri_lbl').textContent=this.value\"></label>"
+              "<label class=check><input type=checkbox name=servo_on_boot value=1");
+    if (servo_on_boot) html += F(" checked");
+    html += F(">Servo ON at boot</label>"
+              "</div>");
+    html += F("<div class=sec><h3>Button Assignments</h3>");
+    html += F("<label class=check><input type=checkbox name=btn_llm_tap value=1");
+    if (btn_llm_tap)       html += F(" checked");
+    html += F(">Left tap — LLM test speak</label>");
+    html += F("<label class=check><input type=checkbox name=btn_periodic_hold value=1");
+    if (btn_periodic_hold) html += F(" checked");
+    html += F(">Left hold — Periodic mode toggle</label>");
+    html += F("<label class=check><input type=checkbox name=btn_stt_tap value=1");
+    if (btn_stt_tap)       html += F(" checked");
+    html += F(">Center tap — Push-to-Talk (STT)</label>");
+    html += F("<label class=check><input type=checkbox name=btn_servo_tap value=1");
+    if (btn_servo_tap)     html += F(" checked");
+    html += F(">Right tap — Servo idle toggle</label>");
+    html += F("<label class=check><input type=checkbox name=btn_bpm_hold value=1");
+    if (btn_bpm_hold)      html += F(" checked");
+    html += F(">Right hold — BPM dance mode</label>");
+    html += F("</div>");
+    html += F("</div>");
+    // --- Periodic tab ---
+    html += F("<div id=tab-periodic class=tab>");
+    html += F("<div class=sec><h3>Periodic Speech</h3>"
+              "<label class=check><input type=checkbox name=periodic_enabled value=1");
+    if (periodic_mode_enabled) html += F(" checked");
+    html += F(">Global Enable (Left hold to toggle on device)</label></div>");
+    html.reserve(html.length() + 2048);
+    for (int i = 0; i < PERIODIC_MAX; i++) {
+        String pi = String(i);
+        html += "<div class=sec><h3>Entry " + String(i + 1) + "</h3>";
+        html += "<label class=check><input type=checkbox name=p" + pi + "_enabled value=1";
+        if (periodic_entries[i].enabled) html += " checked";
+        html += ">Enabled</label>";
+        html += "<label style=\"margin-top:8px;font-weight:bold\">Type&nbsp;&nbsp;"
+                "<input type=radio name=p" + pi + "_type value=fixed";
+        if (!periodic_entries[i].is_llm) html += " checked";
+        html += "> Fixed&nbsp;&nbsp;"
+                "<input type=radio name=p" + pi + "_type value=llm";
+        if (periodic_entries[i].is_llm) html += " checked";
+        html += "> LLM</label>";
+        html += "<label>Message / Prompt<input type=text name=p" + pi + "_msg value=\"";
+        html += html_escape(periodic_entries[i].message);
+        html += "\"></label>";
+        html += "<label>Interval (min)<input type=number min=1 max=1440 name=p" + pi + "_min value=\"";
+        html += String((int)(periodic_entries[i].interval_ms / 60000UL));
+        html += "\"></label></div>";
+    }
+    html += F("</div>");
+    html += F("<button class=btn type=submit>Save &amp; Restart</button>"
+              "</form></body></html>");
+
+    client.print("HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: ");
+    client.print(html.length());
+    client.print("\r\nConnection: close\r\n\r\n");
+    client.print(html);
+    client.flush();
+    client.stop();
+}
+
+static void handle_config_post(WiFiClient& client, int content_length) {
+    String body = "";
+    uint32_t deadline = millis() + 3000;
+    while ((int)body.length() < content_length && millis() < deadline) {
+        if (client.available()) body += (char)client.read();
+    }
+
+    String msg = F("<html><body><h2>Saved! Restarting...</h2><p>Reconnect in a few seconds.</p></body></html>");
+    client.print("HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: ");
+    client.print(msg.length());
+    client.print("\r\nConnection: close\r\n\r\n");
+    client.print(msg);
+    client.flush();
+    client.stop();
+    delay(200);
+
+    String stt_key   = form_field(body, "stt_key");
+    String tts_key   = form_field(body, "tts_key");
+    String vv_host   = form_field(body, "vv_host");
+    String vv_spk    = form_field(body, "vv_spk");
+    String h_ep      = form_field(body, "h_ep");
+    String h_model   = form_field(body, "h_model");
+    String h_key     = form_field(body, "h_key");
+    String h_tokens  = form_field(body, "h_tokens");
+    String h_timeout = form_field(body, "h_timeout");
+    String bpm_play  = form_field(body, "play_bpm");
+    String volume    = form_field(body, "tts_volume");
+    String bright    = form_field(body, "brightness");
+    bool servo_boot  = form_has_checked(body, "servo_on_boot");
+
+    File f = SPIFFS.open("/yaml/SC_SecConfig.yaml", "r");
+    if (!f) { M5_LOGE("config_post: open failed"); ESP.restart(); return; }
+    String yaml = f.readString();
+    f.close();
+
+    WifiCredential new_entries[WIFI_MAX];
+    size_t new_entry_count = 0;
+    for (size_t i = 0; i < WIFI_MAX; ++i) {
+        String idx = String(i + 1);
+        String ssid = form_field(body, ("wifi" + idx + "_ssid").c_str());
+        String pass = form_field(body, ("wifi" + idx + "_pass").c_str());
+        ssid.trim();
+        if (ssid.isEmpty()) continue;
+        new_entries[new_entry_count].ssid = ssid;
+        new_entries[new_entry_count].password = pass;
+        new_entry_count++;
+    }
+    replace_wifi_yaml_sections(yaml, new_entries, new_entry_count);
+    if (!stt_key.isEmpty())   update_yaml_quoted_in_section(yaml, "apikey",  "    stt: \"",     stt_key);
+    if (!tts_key.isEmpty())   update_yaml_quoted_in_section(yaml, "apikey",  "    tts: \"",     tts_key);
+    update_yaml_quoted_str(yaml,                                             "voicevox_host: \"", vv_host);
+    if (!h_ep.isEmpty())      update_yaml_quoted_in_section(yaml, "hermes",  "  endpoint: \"",  h_ep);
+    if (!h_model.isEmpty())   update_yaml_quoted_in_section(yaml, "hermes",  "  model: \"",     h_model);
+    if (!h_key.isEmpty())     update_yaml_quoted_in_section(yaml, "hermes",  "  api_key: \"",   h_key);
+    if (!vv_spk.isEmpty())    update_yaml_int_value(yaml, "voicevox_speaker", vv_spk.toInt());
+    if (!h_tokens.isEmpty())  update_yaml_int_value(yaml, "hermes_max_tokens", h_tokens.toInt());
+    if (!h_timeout.isEmpty()) update_yaml_int_value(yaml, "hermes_timeout_ms", h_timeout.toInt());
+    if (!bpm_play.isEmpty())  update_yaml_int_value(yaml, "play_bpm", clamp_bpm_value(bpm_play.toInt()));
+    if (!volume.isEmpty())    update_yaml_int_value(yaml, "tts_volume", constrain(volume.toInt(), 0, 255));
+    if (!bright.isEmpty())    update_yaml_int_value(yaml, "brightness", constrain(bright.toInt(), 20, 255));
+    update_yaml_int_value(yaml, "servo_on_boot", servo_boot ? 1 : 0);
+
+    update_yaml_int_value(yaml, "btn_llm_tap",       form_has_checked(body, "btn_llm_tap")       ? 1 : 0);
+    update_yaml_int_value(yaml, "btn_periodic_hold",  form_has_checked(body, "btn_periodic_hold")  ? 1 : 0);
+    update_yaml_int_value(yaml, "btn_stt_tap",        form_has_checked(body, "btn_stt_tap")        ? 1 : 0);
+    update_yaml_int_value(yaml, "btn_servo_tap",      form_has_checked(body, "btn_servo_tap")      ? 1 : 0);
+    update_yaml_int_value(yaml, "btn_bpm_hold",       form_has_checked(body, "btn_bpm_hold")       ? 1 : 0);
+
+    bool periodic_en = form_has_checked(body, "periodic_enabled");
+    update_yaml_int_value(yaml, "periodic_enabled", periodic_en ? 1 : 0);
+    for (int i = 0; i < PERIODIC_MAX; i++) {
+        String pre = "p" + String(i) + "_";
+        bool pen   = form_has_checked(body, (pre + "enabled").c_str());
+        String ptype = form_field(body, (pre + "type").c_str());
+        String pmsg  = form_field(body, (pre + "msg").c_str());
+        String pmin  = form_field(body, (pre + "min").c_str());
+        update_yaml_int_value(yaml, (pre + "enabled").c_str(), pen ? 1 : 0);
+        if (!ptype.isEmpty()) upsert_yaml_quoted(yaml, pre + "type", ptype);
+        upsert_yaml_quoted(yaml, pre + "msg", pmsg);
+        if (!pmin.isEmpty()) update_yaml_int_value(yaml, (pre + "min").c_str(), constrain(pmin.toInt(), 1, 1440));
+    }
+
+    File fw = SPIFFS.open("/yaml/SC_SecConfig.yaml", "w");
+    if (fw) { fw.print(yaml); fw.close(); M5_LOGI("Config saved, restarting"); }
+    delay(300);
+    ESP.restart();
+}
+
 void handle_speak_server() {
     WiFiClient client = speak_server.available();
     if (!client) return;
 
     String req_line = client.readStringUntil('\n');
-    bool is_post_speak = req_line.startsWith("POST /speak");
+    req_line.trim();
+    bool is_get_root    = req_line.startsWith("GET / ");
+    bool is_post_beat   = req_line.startsWith("POST /beat");
+    bool is_post_speak  = req_line.startsWith("POST /speak");
+    bool is_post_config = req_line.startsWith("POST /config");
 
     int content_length = 0;
     while (client.connected()) {
@@ -971,6 +1639,39 @@ void handle_speak_server() {
         String lower = line; lower.toLowerCase();
         if (lower.startsWith("content-length:"))
             content_length = line.substring(line.indexOf(':') + 1).toInt();
+    }
+
+    if (is_get_root)    { handle_config_get(client);            return; }
+    if (is_post_config) { handle_config_post(client, content_length); return; }
+    if (is_post_beat) {
+        String body = "";
+        uint32_t deadline = millis() + 1000;
+        while ((int)body.length() < content_length && millis() < deadline) {
+            if (client.available()) body += (char)client.read();
+        }
+
+        JsonDocument doc;
+        int step_index = 0;
+        bool accent = false;
+        int bpm_hint = 0;
+        String motion = "lr";
+        if (!deserializeJson(doc, body)) {
+            step_index = doc["step"] | 0;
+            accent = doc["accent"] | false;
+            bpm_hint = doc["bpm"] | 0;
+            motion = doc["motion"] | "lr";
+        }
+
+        if (app_mode == MODE_SETTINGS || busy) {
+            client.print("HTTP/1.1 503 Service Unavailable\r\nContent-Type: application/json\r\nContent-Length: 13\r\nConnection: close\r\n\r\n{\"busy\":true}");
+            client.stop();
+            return;
+        }
+
+        queue_http_beat(step_index, accent, bpm_hint, motion);
+        client.print("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 42\r\nConnection: close\r\n\r\n{\"ok\":true,\"queued\":true,\"mode\":\"beat\"}");
+        client.stop();
+        return;
     }
 
     if (!is_post_speak) {
@@ -992,23 +1693,47 @@ void handle_speak_server() {
     }
 
     JsonDocument doc;
+    String mode = "fixed";
     String speak_text = "";
-    if (!deserializeJson(doc, body)) speak_text = doc["text"] | "";
+    String reply_text = "";
+    if (!deserializeJson(doc, body)) {
+        mode = doc["mode"] | "fixed";
+        speak_text = doc["text"] | "";
+    }
     if (speak_text.isEmpty()) {
-        client.print("HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+        client.print("HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: 27\r\nConnection: close\r\n\r\n{\"ok\":false,\"error\":\"text\"}");
         client.stop();
         return;
     }
 
-    client.print("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 10\r\nConnection: close\r\n\r\n{\"ok\":true}");
-    client.flush();
-    client.stop();
-
     busy = true;
+    bool spoken = false;
+    bool llm_mode = mode == "llm";
+    if (llm_mode) {
+        avatar.setExpression(Expression::Doubt);
+        led_set(LED_THINKING);
+        show("Thinking...");
+        reply_text = call_hermes(build_llm_chat_prompt(doc["history"], speak_text));
+        if (reply_text.startsWith("Error:") || reply_text.startsWith("Parse error") || reply_text.startsWith("No content")) {
+            busy = false;
+            String err = "{\"ok\":false,\"error\":\"" + json_escape(reply_text) + "\"}";
+            client.print("HTTP/1.1 500 Internal Server Error\r\nContent-Type: application/json\r\nContent-Length: ");
+            client.print(err.length());
+            client.print("\r\nConnection: close\r\n\r\n");
+            client.print(err);
+            client.stop();
+            show_error_state(reply_text);
+            return;
+        }
+    } else {
+        reply_text = speak_text;
+    }
+
     avatar.setExpression(Expression::Happy);
     led_set(LED_SPEAKING);
     show("[Speaking...]");
-    if (call_tts(speak_text)) {
+    spoken = call_tts(reply_text);
+    if (spoken) {
         avatar.setExpression(Expression::Neutral);
         led_set(LED_OFF);
         show("");
@@ -1018,20 +1743,18 @@ void handle_speak_server() {
         show("TTS failed");
     }
     busy = false;
+
+    String resp = "{\"ok\":true,\"mode\":\"" + json_escape(mode) + "\",\"reply\":\"" + json_escape(reply_text) + "\",\"spoken\":";
+    resp += spoken ? "true" : "false";
+    resp += "}";
+    client.print("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: ");
+    client.print(resp.length());
+    client.print("\r\nConnection: close\r\n\r\n");
+    client.print(resp);
+    client.stop();
 }
 
 // ---- Settings UI ----
-
-static void update_yaml_int_value(String& yaml, const char* key, int value) {
-    String search = String(key) + ":";
-    int pos = yaml.indexOf(search);
-    if (pos < 0) { yaml += "\n" + search + " " + String(value); return; }
-    int start = pos + search.length();
-    while (start < (int)yaml.length() && yaml[start] == ' ') start++;
-    int end = start;
-    while (end < (int)yaml.length() && (isDigit(yaml[end]) || yaml[end] == '-')) end++;
-    yaml = yaml.substring(0, start) + String(value) + yaml.substring(end);
-}
 
 static void save_settings() {
     File f = SPIFFS.open("/yaml/SC_SecConfig.yaml", "r");
@@ -1176,6 +1899,7 @@ static void bpm_reset_state() {
     bpm_next_log_ms = 0;
     bpm_play_next_step_ms = 0;
     bpm_play_hold_until_ms = 0;
+    bpm_play_last_move_ms = 0;
     bpm_play_swing_right = true;
     for (size_t i = 0; i < (sizeof(bpm_peak_intervals) / sizeof(bpm_peak_intervals[0])); ++i) {
         bpm_peak_intervals[i] = 0;
@@ -1227,6 +1951,38 @@ static uint16_t bpm_estimate_from_intervals() {
     return bpm;
 }
 
+static bool bpm_read_audio_frame(float& avg, int16_t& peak, float& raw_level) {
+    avg = 0.0f;
+    peak = 0;
+    raw_level = 0.0f;
+
+    if (!bpm_audio_active) {
+        bpm_start_audio();
+        return false;
+    }
+    if (!M5.Mic.isEnabled()) return false;
+    if (!M5.Mic.record(bpm_buf, BPM_RECORD_LENGTH, BPM_SAMPLE_RATE, false)) return false;
+
+    int32_t sample_sum = 0;
+    for (size_t i = 0; i < BPM_RECORD_LENGTH; ++i) {
+        sample_sum += bpm_buf[i];
+    }
+    int32_t dc_offset = sample_sum / static_cast<int32_t>(BPM_RECORD_LENGTH);
+
+    uint32_t accum = 0;
+    peak = 0;
+    for (size_t i = 0; i < BPM_RECORD_LENGTH; ++i) {
+        int32_t centered = static_cast<int32_t>(bpm_buf[i]) - dc_offset;
+        int16_t amp = abs(centered);
+        accum += amp;
+        if (amp > peak) peak = amp;
+    }
+
+    avg = static_cast<float>(accum) / BPM_RECORD_LENGTH;
+    raw_level = avg * 0.85f + peak * 0.15f;
+    return true;
+}
+
 static void bpm_exit_modes() {
     bpm_stop_audio();
     bpm_reset_state();
@@ -1260,6 +2016,12 @@ static void bpm_enter_play_mode() {
     bpm_toggle_cooldown_until_ms = bpm_mode_started_ms + 800;
     if (detected_bpm >= 60 && detected_bpm <= 180) play_bpm = detected_bpm;
     if (play_bpm < 60 || play_bpm > 180) play_bpm = 120;
+    auto* sy = system_config.getServoInfo(AXIS_Y);
+    int play_center_y = srv_cy - 10;
+    if (sy) {
+        play_center_y = max<int>(sy->lower_limit, min<int>(sy->upper_limit, play_center_y));
+    }
+    sc_servo.moveY(play_center_y, 180, false);
     avatar.setExpression(Expression::Happy);
     show("Play " + String(play_bpm) + " BPM");
 }
@@ -1268,31 +2030,14 @@ static void bpm_detect_tick() {
     uint32_t now = millis();
     if (!servo_ready) return;
 
-    if (!bpm_audio_active) {
-        bpm_start_audio();
+    float avg = 0.0f;
+    float raw_level = 0.0f;
+    int16_t peak = 0;
+    if (!bpm_read_audio_frame(avg, peak, raw_level)) {
         bpm_next_log_ms = now;
         return;
     }
-    if (!M5.Mic.isEnabled()) return;
-    if (!M5.Mic.record(bpm_buf, BPM_RECORD_LENGTH, BPM_SAMPLE_RATE, false)) return;
 
-    int32_t sample_sum = 0;
-    for (size_t i = 0; i < BPM_RECORD_LENGTH; ++i) {
-        sample_sum += bpm_buf[i];
-    }
-    int32_t dc_offset = sample_sum / static_cast<int32_t>(BPM_RECORD_LENGTH);
-
-    uint32_t accum = 0;
-    int16_t peak = 0;
-    for (size_t i = 0; i < BPM_RECORD_LENGTH; ++i) {
-        int32_t centered = static_cast<int32_t>(bpm_buf[i]) - dc_offset;
-        int16_t amp = abs(centered);
-        accum += amp;
-        if (amp > peak) peak = amp;
-    }
-
-    float avg = static_cast<float>(accum) / BPM_RECORD_LENGTH;
-    float raw_level = avg * 0.85f + peak * 0.15f;
     if (bpm_calibration_frames < 24) {
         bpm_noise_floor = (bpm_calibration_frames == 0) ? raw_level : (bpm_noise_floor * 0.82f + raw_level * 0.18f);
         bpm_calibration_frames++;
@@ -1338,35 +2083,97 @@ static void bpm_detect_tick() {
 
 static void bpm_play_tick() {
     uint32_t now = millis();
-    if (bpm_audio_active) bpm_stop_audio();
     if (!servo_ready) return;
 
-    const int play_center_y = srv_cy - 10;
+    auto* sx = system_config.getServoInfo(AXIS_X);
+    int left_target = srv_cx - 12;
+    int right_target = srv_cx + 12;
+    if (sx) {
+        left_target = max<int>(sx->lower_limit, left_target);
+        right_target = min<int>(sx->upper_limit, right_target);
+    }
+
     uint16_t bpm = play_bpm;
     if (bpm < 60 || bpm > 180) bpm = 120;
     uint32_t step_interval = 60000UL / bpm;
     if (step_interval < 320) step_interval = 320;
     if (step_interval > 1200) step_interval = 1200;
 
+    float avg = 0.0f;
+    float raw_level = 0.0f;
+    int16_t peak = 0;
+    if (bpm_read_audio_frame(avg, peak, raw_level)) {
+        if (bpm_calibration_frames < 24) {
+            bpm_noise_floor = (bpm_calibration_frames == 0) ? raw_level : (bpm_noise_floor * 0.82f + raw_level * 0.18f);
+            bpm_calibration_frames++;
+            bpm_env = 0.0f;
+            bpm_avg_env = 0.0f;
+        } else {
+            if (raw_level < bpm_noise_floor + 80.0f) {
+                if (raw_level > bpm_noise_floor) bpm_noise_floor = bpm_noise_floor * 0.97f + raw_level * 0.03f;
+                else bpm_noise_floor = bpm_noise_floor * 0.90f + raw_level * 0.10f;
+            }
+
+            float active_level = raw_level - bpm_noise_floor;
+            bpm_env = bpm_env * 0.55f + active_level * 0.45f;
+            if (bpm_env < 0.0f) bpm_env = 0.0f;
+            bpm_avg_env = bpm_avg_env * 0.92f + bpm_env * 0.08f;
+
+            bool beat_candidate = peak >= 170
+                               && bpm_env > (bpm_avg_env * 1.45f + 18.0f)
+                               && (bpm_last_peak_ms == 0 || (now - bpm_last_peak_ms) >= 280);
+
+            if (beat_candidate) {
+                if (bpm_last_peak_ms != 0) {
+                    bpm_store_peak_interval(now - bpm_last_peak_ms);
+                    uint16_t estimated = bpm_estimate_from_intervals();
+                    if (estimated) {
+                        play_bpm = clamp_bpm_value((play_bpm * 3 + estimated) / 4);
+                        bpm = play_bpm;
+                        step_interval = 60000UL / bpm;
+                        if (step_interval < 320) step_interval = 320;
+                        if (step_interval > 1200) step_interval = 1200;
+                    }
+                }
+                bpm_last_peak_ms = now;
+                uint32_t phase_offset = bpm_play_next_step_ms
+                    ? static_cast<uint32_t>(abs(static_cast<int32_t>(bpm_play_next_step_ms - now)))
+                    : step_interval;
+                uint32_t max_correction = max<uint32_t>(40, step_interval / 5);
+                if (phase_offset <= step_interval / 2) {
+                    if (bpm_play_next_step_ms > now) {
+                        uint32_t correction = min<uint32_t>(phase_offset, max_correction);
+                        bpm_play_next_step_ms -= correction;
+                    } else {
+                        uint32_t correction = min<uint32_t>(now - bpm_play_next_step_ms, max_correction);
+                        bpm_play_next_step_ms += correction;
+                    }
+                }
+            }
+        }
+    }
+
     if (!bpm_play_next_step_ms) bpm_play_next_step_ms = now;
     if (time_reached(now, bpm_play_next_step_ms)) {
         bpm_play_swing_right = !bpm_play_swing_right;
-        int swing = 12;
-        uint32_t move_ms = step_interval > 120 ? (step_interval - 120) : (step_interval - 40);
-        sc_servo.moveXY(srv_cx + (bpm_play_swing_right ? swing : -swing), play_center_y, move_ms);
+        int target_x = bpm_play_swing_right ? right_target : left_target;
+        uint32_t move_ms = min<uint32_t>(220, step_interval > 120 ? (step_interval - 120) : 140);
+        sc_servo.moveX(target_x, move_ms);
         avatar.setMouthOpenRatio(0.10f);
+        bpm_play_last_move_ms = now;
         bpm_play_next_step_ms = now + step_interval;
         bpm_play_hold_until_ms = now + (step_interval * 3 / 5);
     } else if (bpm_play_hold_until_ms && time_reached(now, bpm_play_hold_until_ms)) {
-        sc_servo.moveXY(srv_cx, play_center_y, 120);
+        sc_servo.moveX(srv_cx, 120);
         avatar.setMouthOpenRatio(0.0f);
         bpm_play_hold_until_ms = 0;
     }
 
     if (time_reached(now, bpm_next_log_ms)) {
-        Serial.printf("BPMPlay ms=%lu bpm=%u step=%lu right=%u\n",
+        Serial.printf("BPMPlay ms=%lu bpm=%u step=%lu right=%u env=%.1f avgEnv=%.1f floor=%.1f calib=%u\n",
                       bpm_mode_started_ms ? (unsigned long)(now - bpm_mode_started_ms) : 0UL,
-                      bpm, (unsigned long)step_interval, bpm_play_swing_right ? 1 : 0);
+                      bpm, (unsigned long)step_interval, bpm_play_swing_right ? 1 : 0,
+                      bpm_env, bpm_avg_env, bpm_noise_floor, bpm_calibration_frames);
         bpm_next_log_ms = now + 1000;
     }
 }
@@ -1386,6 +2193,7 @@ void setup() {
     system_config.loadConfig(SPIFFS, "/yaml/SC_BasicConfig.yaml");
     servo_begin();
     load_hermes_config(SPIFFS);
+    servo_idle_enabled = servo_on_boot;
     M5.Display.setBrightness(brightness_val);  // set before LED task starts
     led_init();  // must be after servo_begin() — needs ioexpander initialized
 
@@ -1393,44 +2201,56 @@ void setup() {
     avatar.setSpeechFont(&fonts::efontJA_16);
 
     show("Connecting WiFi...");
-    wifi_s* wifi = system_config.getWiFiSetting();
     WiFi.setSleep(false);
     WiFi.setAutoReconnect(true);
-    WiFi.begin(wifi->ssid.c_str(), wifi->password.c_str());
-    int retry = 0;
-    while (WiFi.status() != WL_CONNECTED && retry < 20) { delay(500); retry++; }
-
-    if (WiFi.status() == WL_CONNECTED) {
+    if (ensure_wifi_connected(10000)) {
         speak_server.begin();
         M5_LOGI("WiFi: %s", WiFi.localIP().toString().c_str());
         show("IP: " + WiFi.localIP().toString());
         delay(3000);
-        show("M:Voice R:Servo TR:Settings");
+        show(servo_idle_enabled ? "M:Voice R:Servo ON TR:Settings" : "M:Voice R:Servo OFF TR:Settings");
     } else {
         show("WiFi FAILED");
     }
 }
 
 bool touchedZone(int zone) {
-    auto touch = M5.Touch.getDetail();
-    if (!touch.wasPressed() || touch.y < 192) return false;
+    const auto& touch = current_touch_detail;
+    if (!touch.wasClicked() || touch.y < 192) return false;
     return (touch.x / (320 / 3)) == zone;
 }
 
 bool touchHoldZone(int zone) {
-    auto touch = M5.Touch.getDetail();
+    const auto& touch = current_touch_detail;
     if (!touch.wasHold() || touch.y < 192) return false;
     return (touch.x / (320 / 3)) == zone;
 }
 
 bool touchClickZone(int zone) {
-    auto touch = M5.Touch.getDetail();
+    const auto& touch = current_touch_detail;
     if (!touch.wasClicked() || touch.y < 192) return false;
     return (touch.x / (320 / 3)) == zone;
 }
 
+static bool zoneTapTriggered(int zone) {
+    if (touchedZone(zone)) return true;
+    if (zone == 0) return M5.BtnA.wasPressed();
+    if (zone == 1) return M5.BtnB.wasPressed();
+    if (zone == 2) return M5.BtnC.wasPressed();
+    return false;
+}
+
+static bool zoneHoldTriggered(int zone) {
+    if (touchHoldZone(zone)) return true;
+    if (zone == 0) return M5.BtnA.wasHold();
+    if (zone == 1) return M5.BtnB.wasHold();
+    if (zone == 2) return M5.BtnC.wasHold();
+    return false;
+}
+
 void loop() {
     M5.update();
+    current_touch_detail = M5.Touch.getDetail();
 
     if (M5.BtnPWR.wasHold()) {
         bpm_stop_audio();
@@ -1452,7 +2272,7 @@ void loop() {
             clear_error_state();
             show(detected_bpm ? "Detecting... " + String(detected_bpm) + " BPM" : "Detecting BPM...");
         }
-        if (time_reached(millis(), bpm_toggle_cooldown_until_ms) && touchHoldZone(2)) {
+        if (time_reached(millis(), bpm_toggle_cooldown_until_ms) && zoneHoldTriggered(2)) {
             bpm_enter_play_mode();
             delay(10);
             return;
@@ -1468,7 +2288,7 @@ void loop() {
             clear_error_state();
             show("Play " + String(play_bpm) + " BPM");
         }
-        if (time_reached(millis(), bpm_toggle_cooldown_until_ms) && touchHoldZone(2)) {
+        if (time_reached(millis(), bpm_toggle_cooldown_until_ms) && zoneHoldTriggered(2)) {
             bpm_exit_modes();
             delay(10);
             return;
@@ -1484,30 +2304,22 @@ void loop() {
         show("");
     }
     handle_speak_server();
-    servo_idle_tick();
-    uint32_t now = millis();
-    if (!led_effect_active && time_reached(now, head_touch_next_poll_ms)) {
-        head_touch_next_poll_ms = now + 50;
-        if (head_pat_detected()) head_pat_reaction();
-    }
 
-    // 設定トリガー: 画面右上コーナー（x>260, y<50）タップ
-    if (!busy) {
-        auto t = M5.Touch.getDetail();
-        if (t.wasPressed() && t.x > 260 && t.y < 50) {
-            settings_enter();
-            return;
-        }
-    }
-
-    // 左タッチ: テスト発話
-    if (!busy && time_reached(millis(), bpm_toggle_cooldown_until_ms) && touchHoldZone(2)) {
+    // 右ホールド: BPMモード
+    if (btn_bpm_hold && !busy && time_reached(millis(), bpm_toggle_cooldown_until_ms) && zoneHoldTriggered(2)) {
         clear_error_state();
         bpm_enter_detect_mode();
         return;
     }
 
-    if (touchedZone(0) && !busy) {
+    // 左ホールド: 定期発話モード ON/OFF トグル
+    if (btn_periodic_hold && !busy && zoneHoldTriggered(0) && time_reached(millis(), periodic_hold_cooldown_ms)) {
+        periodic_mode_enabled = !periodic_mode_enabled;
+        periodic_hold_cooldown_ms = millis() + 2000;
+        show(periodic_mode_enabled ? "Periodic: ON" : "Periodic: OFF");
+    }
+
+    if (btn_llm_tap && zoneTapTriggered(0) && !busy) {
         clear_error_state();
         busy = true;
         avatar.setExpression(Expression::Doubt);
@@ -1534,7 +2346,7 @@ void loop() {
     }
 
     // 右タッチ: アイドルサーボ停止/再開トグル
-    if (touchedZone(2)) {
+    if (btn_servo_tap && zoneTapTriggered(2)) {
         clear_error_state();
         show("");
         servo_idle_enabled = !servo_idle_enabled;
@@ -1549,7 +2361,7 @@ void loop() {
     }
 
     // 中央タッチ: Push-to-Talk (STT → Hermes → TTS)
-    if (touchedZone(1) && !busy) {
+    if (btn_stt_tap && zoneTapTriggered(1) && !busy) {
         clear_error_state();
         busy = true;
         servo_idle_enabled = true;  // 話しかけたらサーボ再開
@@ -1583,6 +2395,24 @@ void loop() {
             show_error_state("TTS failed");
         }
         busy = false;
+    }
+
+    // 設定トリガー: 画面右上コーナー（x>260, y<50）タップ
+    if (!busy) {
+        const auto& t = current_touch_detail;
+        if (t.wasPressed() && t.x > 260 && t.y < 50) {
+            settings_enter();
+            return;
+        }
+    }
+
+    http_beat_tick();
+    periodic_tick();
+    servo_idle_tick();
+    uint32_t now = millis();
+    if (!led_effect_active && time_reached(now, head_touch_next_poll_ms)) {
+        head_touch_next_poll_ms = now + 50;
+        if (head_pat_detected()) head_pat_reaction();
     }
 
     delay(10);
