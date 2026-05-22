@@ -271,6 +271,12 @@ static volatile uint8_t led_idle_log_b = 0;
 static volatile bool led_idle_once_requested = false;
 static volatile bool led_idle_timer_reset_requested = false;
 static volatile bool led_force_clear_requested = false;
+static volatile bool led_beat_requested = false;
+static volatile uint16_t led_beat_step_index = 0;
+static volatile bool led_beat_accent = false;
+static volatile bool led_beat_vertical = false;
+
+static constexpr uint32_t LED_BEAT_DURATION_MS = 180;
 
 static void queue_led_idle_log(LedIdleLogEvent event, LedColor color = {0, 0, 0}) {
     led_idle_log_r = color.r;
@@ -300,6 +306,23 @@ static LedColor random_idle_color() {
     return palette[random(0, static_cast<long>(sizeof(palette) / sizeof(palette[0])))];
 }
 
+static LedColor beat_theme_color(uint8_t bar_index, bool vertical) {
+    static constexpr LedColor lr_palette[] = {
+        {0, 180, 120},
+        {0, 140, 200},
+        {90, 200, 90},
+        {120, 120, 220},
+    };
+    static constexpr LedColor ud_palette[] = {
+        {220, 140, 0},
+        {180, 90, 180},
+        {200, 120, 40},
+        {140, 80, 220},
+    };
+    uint8_t idx = bar_index % 4;
+    return vertical ? ud_palette[idx] : lr_palette[idx];
+}
+
 static void led_all(uint8_t r, uint8_t g, uint8_t b) {
     ScopedLock lock(io_mutex);
     for (int i = 0; i < LED_NUM; i++) led_io->setLedColor(i, r, g, b);
@@ -314,10 +337,17 @@ static void led_task(void*) {
     uint8_t chase_pos = 0;
     bool    blink_state = false;
     bool    idle_active = false;
+    bool    beat_active = false;
     uint32_t idle_next_ms = millis() + LED_IDLE_INTERVAL_MS;
     uint32_t idle_started_ms = 0;
     uint32_t idle_end_ms = 0;
+    uint32_t beat_started_ms = 0;
+    uint32_t beat_end_ms = 0;
     LedColor idle_color = {0, 0, 0};
+    LedColor beat_color = {0, 0, 0};
+    uint16_t beat_step_index = 0;
+    bool beat_accent = false;
+    bool beat_vertical = false;
     while (true) {
         if (!led_io) { vTaskDelay(pdMS_TO_TICKS(100)); continue; }
         uint32_t now = millis();
@@ -325,10 +355,12 @@ static void led_task(void*) {
         bool idle_timer_reset_requested = led_idle_timer_reset_requested;
         bool idle_once_requested = led_idle_once_requested;
         bool force_clear_requested = led_force_clear_requested;
+        bool beat_requested = led_beat_requested;
 
         if (force_clear_requested) {
             led_force_clear_requested = false;
             idle_active = false;
+            beat_active = false;
             idle_next_ms = now + LED_IDLE_INTERVAL_MS;
             idle_anim = LED_IDLE_BRIGHTNESS_MIN;
             idle_anim_dir = 1;
@@ -344,6 +376,18 @@ static void led_task(void*) {
         if (idle_timer_reset_requested) {
             led_idle_timer_reset_requested = false;
             idle_next_ms = now + LED_IDLE_INTERVAL_MS;
+        }
+
+        if (beat_requested) {
+            led_beat_requested = false;
+            beat_active = true;
+            beat_started_ms = now;
+            beat_end_ms = now + LED_BEAT_DURATION_MS;
+            beat_step_index = led_beat_step_index;
+            beat_accent = led_beat_accent;
+            beat_vertical = led_beat_vertical;
+            beat_color = beat_theme_color((beat_step_index / 4) % 4, beat_vertical);
+            idle_active = false;
         }
 
         if (!idle_base_allowed) {
@@ -378,8 +422,57 @@ static void led_task(void*) {
             led_all(0, 0, 0);
         }
 
+        if (beat_active && time_reached(now, beat_end_ms)) {
+            beat_active = false;
+            if (led_mode == LED_OFF && !idle_active) {
+                led_all(0, 0, 0);
+            }
+        }
+
         switch (led_mode) {
             case LED_OFF:
+                if (beat_active) {
+                    led_effect_active = true;
+                    uint8_t beat_in_bar = beat_step_index % 4;
+                    uint8_t brightness = beat_accent ? 220 : 150;
+                    uint8_t tail_brightness = beat_accent ? 120 : 72;
+                    uint8_t progress = (uint8_t)(((now - beat_started_ms) * LED_NUM) / max<uint32_t>(1, LED_BEAT_DURATION_MS));
+                    if (progress >= LED_NUM) progress = LED_NUM - 1;
+                    ScopedLock lock(io_mutex);
+                    for (int i = 0; i < LED_NUM; i++) led_io->setLedColor(i, 0, 0, 0);
+                    if (beat_vertical) {
+                        bool upper_first = (beat_in_bar == 0 || beat_in_bar == 2);
+                        bool both_halves = (beat_in_bar == 2);
+                        bool full_ring = (beat_in_bar == 3);
+                        for (int i = 0; i < LED_NUM; ++i) {
+                            bool upper_half = i < (LED_NUM / 2);
+                            bool on = full_ring || both_halves || (upper_first ? upper_half : !upper_half);
+                            if (!on) continue;
+                            uint8_t local = full_ring ? brightness : (upper_half == upper_first ? brightness : tail_brightness);
+                            led_io->setLedColor(i,
+                                (beat_color.r * local) / 255,
+                                (beat_color.g * local) / 255,
+                                (beat_color.b * local) / 255);
+                        }
+                    } else {
+                        bool forward = (beat_step_index % 2) == 0;
+                        uint8_t head = forward ? progress : (LED_NUM - 1 - progress);
+                        uint8_t chase_len = 3 + (beat_in_bar == 2 ? 1 : 0);
+                        for (uint8_t j = 0; j < chase_len; ++j) {
+                            int idx = forward ? (head - j) : (head + j);
+                            while (idx < 0) idx += LED_NUM;
+                            idx %= LED_NUM;
+                            uint8_t local = (j == 0) ? brightness : tail_brightness;
+                            led_io->setLedColor(idx,
+                                (beat_color.r * local) / 255,
+                                (beat_color.g * local) / 255,
+                                (beat_color.b * local) / 255);
+                        }
+                    }
+                    led_io->refreshLeds();
+                    vTaskDelay(pdMS_TO_TICKS(18));
+                    break;
+                }
                 if (!idle_active) {
                     led_effect_active = false;
                     led_all(0, 0, 0);
@@ -605,7 +698,7 @@ String hermes_endpoint = "";
 String hermes_model    = "";
 String hermes_api_key  = "";
 int    tts_volume          = 100;
-int    hermes_max_tokens   = 80;
+int    hermes_max_tokens   = 60;
 int    hermes_timeout_ms   = 60000;
 String voicevox_host    = "";  // e.g. "192.168.1.100:50021" 窶・use local VOICEVOX if set
 int    voicevox_speaker = 1;
@@ -754,6 +847,7 @@ String call_hermes(const String& user_message) {
     http.begin(client, hermes_endpoint);
     http.setTimeout(hermes_timeout_ms);
     http.addHeader("Content-Type", "application/json");
+    http.addHeader("X-Client-Source", "stackchan");
     if (!hermes_api_key.isEmpty())
         http.addHeader("Authorization", "Bearer " + hermes_api_key);
 
@@ -1139,6 +1233,10 @@ static void queue_http_beat(int step_index, bool accent, int bpm_hint, const Str
     http_beat_target_y = target_y;
     http_beat_motion_vertical = vertical_motion;
     http_beat_pending = true;
+    led_beat_step_index = step_index < 0 ? 0 : static_cast<uint16_t>(step_index);
+    led_beat_accent = accent;
+    led_beat_vertical = vertical_motion;
+    led_beat_requested = true;
 }
 
 static void http_beat_tick() {
@@ -1384,6 +1482,13 @@ static void handle_config_get(WiFiClient& client) {
               "const div=document.createElement('div');div.className='bubble '+role;div.textContent=text;"
               "log.appendChild(div);log.scrollTop=log.scrollHeight;}"
               "function setSpeakStatus(text){const el=document.getElementById('speak-status');if(el)el.textContent=text;}"
+              "function formatSpeakStatus(data){"
+              "const parts=[];"
+              "if(data.mode==='llm'&&typeof data.llm_ms==='number')parts.push('LLM '+data.llm_ms+'ms');"
+              "if(typeof data.tts_ms==='number')parts.push('TTS '+data.tts_ms+'ms');"
+              "if(typeof data.total_ms==='number')parts.push('Total '+data.total_ms+'ms');"
+              "parts.push(data.spoken?'Spoken':'Done');"
+              "return parts.join(' / ');}"
               "async function sendSpeak(){"
               "const mode=document.querySelector('input[name=\"speak_mode\"]:checked').value;"
               "const input=document.getElementById('speak-text');"
@@ -1401,7 +1506,7 @@ static void handle_config_get(WiFiClient& client) {
               "if(!resp.ok||!data.ok){throw new Error(data.error||('HTTP '+resp.status));}"
               "if(data.reply){appendChat('assistant',data.reply);window.stackChanChat.push({role:'assistant',content:data.reply});}"
               "if(clearAfterSend) input.value='';"
-              "setSpeakStatus(data.spoken?'Spoken':'Done');"
+              "setSpeakStatus(formatSpeakStatus(data));"
               "}catch(err){setSpeakStatus('Error: '+err.message);}}"
               "window.addEventListener('DOMContentLoaded',()=>openTab('tab-security'));"
               "</script></head><body>"
@@ -1708,6 +1813,10 @@ void handle_speak_server() {
         return;
     }
 
+    uint32_t request_started_ms = millis();
+    uint32_t llm_elapsed_ms = 0;
+    uint32_t tts_elapsed_ms = 0;
+
     busy = true;
     bool spoken = false;
     bool llm_mode = mode == "llm";
@@ -1715,10 +1824,16 @@ void handle_speak_server() {
         avatar.setExpression(Expression::Doubt);
         led_set(LED_THINKING);
         show("Thinking...");
+        uint32_t llm_started_ms = millis();
         reply_text = call_hermes(build_llm_chat_prompt(doc["history"], speak_text));
+        llm_elapsed_ms = millis() - llm_started_ms;
         if (reply_text.startsWith("Error:") || reply_text.startsWith("Parse error") || reply_text.startsWith("No content")) {
             busy = false;
-            String err = "{\"ok\":false,\"error\":\"" + json_escape(reply_text) + "\"}";
+            String err = "{\"ok\":false,\"error\":\"" + json_escape(reply_text) + "\",\"llm_ms\":";
+            err += String(llm_elapsed_ms);
+            err += ",\"total_ms\":";
+            err += String(millis() - request_started_ms);
+            err += "}";
             client.print("HTTP/1.1 500 Internal Server Error\r\nContent-Type: application/json\r\nContent-Length: ");
             client.print(err.length());
             client.print("\r\nConnection: close\r\n\r\n");
@@ -1734,7 +1849,9 @@ void handle_speak_server() {
     avatar.setExpression(Expression::Happy);
     led_set(LED_SPEAKING);
     show("[Speaking...]");
+    uint32_t tts_started_ms = millis();
     spoken = call_tts(reply_text);
+    tts_elapsed_ms = millis() - tts_started_ms;
     if (spoken) {
         avatar.setExpression(Expression::Neutral);
         led_set(LED_OFF);
@@ -1748,6 +1865,12 @@ void handle_speak_server() {
 
     String resp = "{\"ok\":true,\"mode\":\"" + json_escape(mode) + "\",\"reply\":\"" + json_escape(reply_text) + "\",\"spoken\":";
     resp += spoken ? "true" : "false";
+    resp += ",\"llm_ms\":";
+    resp += String(llm_elapsed_ms);
+    resp += ",\"tts_ms\":";
+    resp += String(tts_elapsed_ms);
+    resp += ",\"total_ms\":";
+    resp += String(millis() - request_started_ms);
     resp += "}";
     client.print("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: ");
     client.print(resp.length());
@@ -1773,35 +1896,28 @@ static void save_settings() {
 }
 
 static void draw_slider_row(int y, const char* label, int val) {
-    const int bar_x = 8, bar_w = 200, bar_h = 12;
-    const int bar_y = y + 22;
-    const int btn_y = y + 16, btn_h = 26;
+    const int bar_x = 8, bar_w = 304, bar_h = 14;
+    const int bar_y = y + 18;
     int filled = val * bar_w / 255;
 
     M5.Display.fillRect(0, y, 320, 48, TFT_BLACK);
-    M5.Display.setTextSize(2);
+    M5.Display.setTextSize(1);
     M5.Display.setTextColor(TFT_WHITE, TFT_BLACK);
     M5.Display.setCursor(8, y + 2);
     M5.Display.print(label);
     char buf[8];
     snprintf(buf, sizeof(buf), "%3d%%", val * 100 / 255);
     M5.Display.setTextColor(TFT_CYAN, TFT_BLACK);
-    M5.Display.setCursor(168, y + 2);
+    M5.Display.setCursor(280, y + 2);
     M5.Display.print(buf);
 
     M5.Display.fillRect(bar_x, bar_y, filled, bar_h, TFT_CYAN);
     M5.Display.fillRect(bar_x + filled, bar_y, bar_w - filled, bar_h, TFT_DARKGREY);
     M5.Display.drawRect(bar_x, bar_y, bar_w, bar_h, TFT_WHITE);
-
-    M5.Display.fillRoundRect(218, btn_y, 38, btn_h, 4, TFT_NAVY);
-    M5.Display.setTextColor(TFT_WHITE, TFT_NAVY);
-    M5.Display.setCursor(229, btn_y + 6);
-    M5.Display.print("-");
-
-    M5.Display.fillRoundRect(264, btn_y, 38, btn_h, 4, TFT_NAVY);
-    M5.Display.setTextColor(TFT_WHITE, TFT_NAVY);
-    M5.Display.setCursor(273, btn_y + 6);
-    M5.Display.print("+");
+    M5.Display.setTextSize(1);
+    M5.Display.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
+    M5.Display.setCursor(8, y + 36);
+    M5.Display.print("Swipe on the bar to adjust");
 }
 
 static void draw_settings_ui() {
@@ -1814,14 +1930,23 @@ static void draw_settings_ui() {
     M5.Display.setTextColor(TFT_WHITE, TFT_DARKGREY);
     M5.Display.setCursor(288, 10);
     M5.Display.print("X");
-    M5.Display.drawLine(0, 36, 320, 36, TFT_DARKGREY);
-    draw_slider_row(40, "Volume  ", setting_volume);
-    M5.Display.drawLine(0, 88, 320, 88, TFT_DARKGREY);
-    draw_slider_row(92, "Bright  ", setting_brightness);
-    M5.Display.drawLine(0, 140, 320, 140, TFT_DARKGREY);
     M5.Display.setTextSize(1);
     M5.Display.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
-    M5.Display.setCursor(8, 150);
+    M5.Display.setCursor(8, 28);
+    if (WiFi.status() == WL_CONNECTED) {
+        M5.Display.print("IP: ");
+        M5.Display.print(WiFi.localIP().toString());
+    } else {
+        M5.Display.print("IP: not connected");
+    }
+    M5.Display.drawLine(0, 40, 320, 40, TFT_DARKGREY);
+    draw_slider_row(48, "Volume", setting_volume);
+    M5.Display.drawLine(0, 96, 320, 96, TFT_DARKGREY);
+    draw_slider_row(104, "Brightness", setting_brightness);
+    M5.Display.drawLine(0, 152, 320, 152, TFT_DARKGREY);
+    M5.Display.setTextSize(1);
+    M5.Display.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
+    M5.Display.setCursor(8, 160);
     M5.Display.print("BPM Mode: hold right zone Detect/Play/Normal");
     M5.Display.fillRoundRect(10, 192, 135, 36, 6, TFT_DARKGREY);
     M5.Display.setTextColor(TFT_WHITE, TFT_DARKGREY);
@@ -1857,36 +1982,44 @@ static void settings_exit(bool save) {
 
 static void handle_settings_touch() {
     auto touch = M5.Touch.getDetail();
-    if (!touch.wasPressed()) return;
+    if (!(touch.wasPressed() || touch.isDragging() || touch.isPressed())) return;
     int tx = touch.x, ty = touch.y;
 
     // [X] or Cancel
-    if (tx >= 280 && ty >= 4 && ty <= 32) { settings_exit(false); return; }
-    if (tx >= 10 && tx <= 145 && ty >= 192 && ty <= 228) { settings_exit(false); return; }
-    // Save
-    if (tx >= 165 && tx <= 310 && ty >= 192 && ty <= 228) { settings_exit(true); return; }
-
-    // Volume [-][+]
-    if (ty >= 56 && ty <= 82) {
-        if (tx >= 218 && tx <= 256) {
-            setting_volume = max(0, setting_volume - 20);
-            draw_slider_row(40, "Volume  ", setting_volume);
-        } else if (tx >= 264 && tx <= 302) {
-            setting_volume = min(255, setting_volume + 20);
-            draw_slider_row(40, "Volume  ", setting_volume);
-        }
+    if (touch.wasPressed()) {
+        if (tx >= 280 && ty >= 4 && ty <= 32) { settings_exit(false); return; }
+        if (tx >= 10 && tx <= 145 && ty >= 192 && ty <= 228) { settings_exit(false); return; }
     }
-    // Brightness [-][+]
-    if (ty >= 108 && ty <= 134) {
-        if (tx >= 218 && tx <= 256) {
-            setting_brightness = max(20, setting_brightness - 20);
-            M5.Display.setBrightness(setting_brightness);
-            draw_slider_row(92, "Bright  ", setting_brightness);
-        } else if (tx >= 264 && tx <= 302) {
-            setting_brightness = min(255, setting_brightness + 20);
-            M5.Display.setBrightness(setting_brightness);
-            draw_slider_row(92, "Bright  ", setting_brightness);
+    // Save
+    if (touch.wasPressed()) {
+        if (tx >= 165 && tx <= 310 && ty >= 192 && ty <= 228) { settings_exit(true); return; }
+    }
+
+    auto apply_slider_value = [&](int touch_x, int min_val, int max_val) -> int {
+        const int bar_x = 8;
+        const int bar_w = 304;
+        int clamped_x = max(bar_x, min(bar_x + bar_w, touch_x));
+        int value = min_val + ((clamped_x - bar_x) * (max_val - min_val)) / bar_w;
+        return constrain(value, min_val, max_val);
+    };
+
+    if (ty >= 66 && ty <= 80 && tx >= 8 && tx <= 312) {
+        int next_volume = apply_slider_value(tx, 0, 255);
+        if (next_volume != setting_volume) {
+            setting_volume = next_volume;
+            draw_slider_row(48, "Volume", setting_volume);
         }
+        return;
+    }
+
+    if (ty >= 122 && ty <= 136 && tx >= 8 && tx <= 312) {
+        int next_brightness = apply_slider_value(tx, 20, 255);
+        if (next_brightness != setting_brightness) {
+            setting_brightness = next_brightness;
+            M5.Display.setBrightness(setting_brightness);
+            draw_slider_row(104, "Brightness", setting_brightness);
+        }
+        return;
     }
 }
 

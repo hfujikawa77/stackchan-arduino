@@ -38,3 +38,5 @@ build/
 
 # Secret configs (WiFi credentials, API keys)
 **/SC_SecConfig.yaml
+.claude/settings.local.json
+examples/HermesLLM/.claude/settings.local.json
