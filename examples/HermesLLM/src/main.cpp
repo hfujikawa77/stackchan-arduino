@@ -699,8 +699,8 @@ String hermes_model    = "";
 String hermes_api_key  = "";
 int    tts_volume          = 100;
 int    hermes_max_tokens   = 60;
-int    hermes_timeout_ms   = 60000;
-String voicevox_host    = "";  // e.g. "192.168.1.100:50021" 窶・use local VOICEVOX if set
+int    hermes_timeout_ms   = 180000;
+String voicevox_host    = "";  // e.g. "192.168.1.100:50021" - use local VOICEVOX if set
 int    voicevox_speaker = 1;
 
 static bool ensure_wifi_connected(uint32_t timeout_ms = 15000) {
@@ -860,7 +860,12 @@ String call_hermes(const String& user_message) {
 
     String body; serializeJson(doc, body);
     int status = http.POST(body);
-    if (status != 200) { http.end(); return "Error: HTTP " + String(status); }
+    if (status != 200) {
+        String error_text = "Error: HTTP " + String(status);
+        if (status == -11) error_text += " (read timeout)";
+        http.end();
+        return error_text;
+    }
 
     String response = http.getString();
     http.end();
