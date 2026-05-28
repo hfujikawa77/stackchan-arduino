@@ -1435,6 +1435,8 @@ static void handle_config_get(WiFiClient& client) {
     auto* api    = system_config.getAPISetting();
     String sttk  = api      ? html_escape(api->stt)       : "";
     String ttsk  = api      ? html_escape(api->tts)       : "";
+    String current_ssid = WiFi.status() == WL_CONNECTED ? html_escape(WiFi.SSID()) : "";
+    String current_ip = WiFi.status() == WL_CONNECTED ? WiFi.localIP().toString() : "not connected";
     if (wifi_credential_count == 0) {
         wifi_s* wifi = system_config.getWiFiSetting();
         if (wifi && !wifi->ssid.isEmpty()) {
@@ -1463,6 +1465,8 @@ static void handle_config_get(WiFiClient& client) {
               "input[type=range]{padding:0;border:none;cursor:pointer;accent-color:#4CAF50}"
               ".range-val{display:inline-block;min-width:2em;text-align:right;font-weight:normal;color:#555}"
               ".sec{margin:10px 0;padding:10px 12px;border:1px solid #ddd;border-radius:6px}"
+              ".net-info{margin:0 0 10px;padding:8px;border-radius:6px;background:#f6f8fa;color:#333;line-height:1.5}"
+              ".net-info b{display:inline-block;min-width:4.5em}"
               ".tabs{display:flex;gap:8px;margin:10px 0 14px;flex-wrap:wrap}"
               ".tab-btn{padding:10px 12px;border:1px solid #bbb;border-radius:999px;background:#f4f4f4;cursor:pointer;font-size:13px}"
               ".tab-btn.active{background:#1f6feb;color:#fff;border-color:#1f6feb}"
@@ -1530,7 +1534,12 @@ static void handle_config_get(WiFiClient& client) {
               "</div>"
               "<form method=post action=/config>");
     html += F("<div id=tab-security class=\"tab active\">");
-    html += F("<div class=sec><h3>WiFi</h3><p>Try entries from top to bottom.</p>");
+    html += F("<div class=sec><h3>WiFi</h3>");
+    html += F("<div class=net-info><div><b>Connected</b>");
+    html += current_ssid.isEmpty() ? F("not connected") : current_ssid;
+    html += F("</div><div><b>IP</b>");
+    html += html_escape(current_ip);
+    html += F("</div></div><p>Try entries from top to bottom.</p>");
     for (size_t i = 0; i < WIFI_MAX; ++i) {
         String idx = String(i + 1);
         String ssid = i < wifi_credential_count ? html_escape(wifi_credentials[i].ssid) : "";
@@ -1945,7 +1954,7 @@ static void draw_slider_row(int y, const char* label, int val) {
 
 static void draw_settings_ui() {
     M5.Display.fillScreen(TFT_BLACK);
-    M5.Display.setTextSize(2);
+    M5.Display.setTextSize(1);
     M5.Display.setTextColor(TFT_YELLOW, TFT_BLACK);
     M5.Display.setCursor(8, 8);
     M5.Display.print("Settings");
@@ -1953,24 +1962,39 @@ static void draw_settings_ui() {
     M5.Display.setTextColor(TFT_WHITE, TFT_DARKGREY);
     M5.Display.setCursor(288, 10);
     M5.Display.print("X");
-    M5.Display.setTextSize(1);
-    M5.Display.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
-    M5.Display.setCursor(8, 28);
+    M5.Display.fillRoundRect(6, 24, 308, 42, 5, TFT_NAVY);
+    M5.Display.drawRoundRect(6, 24, 308, 42, 5, TFT_CYAN);
     if (WiFi.status() == WL_CONNECTED) {
+        String ssid = WiFi.SSID();
+        if (ssid.length() > 24) ssid = ssid.substring(0, 23) + ".";
+        M5.Display.setTextSize(2);
+        M5.Display.setTextColor(TFT_WHITE, TFT_NAVY);
+        M5.Display.setCursor(14, 29);
+        M5.Display.print(ssid);
+        M5.Display.setTextSize(1);
+        M5.Display.setTextColor(TFT_CYAN, TFT_NAVY);
+        M5.Display.setCursor(14, 52);
         M5.Display.print("IP: ");
         M5.Display.print(WiFi.localIP().toString());
     } else {
+        M5.Display.setTextSize(2);
+        M5.Display.setTextColor(TFT_WHITE, TFT_NAVY);
+        M5.Display.setCursor(14, 30);
+        M5.Display.print("SSID: not connected");
+        M5.Display.setTextSize(1);
+        M5.Display.setTextColor(TFT_CYAN, TFT_NAVY);
+        M5.Display.setCursor(14, 52);
         M5.Display.print("IP: not connected");
     }
-    M5.Display.drawLine(0, 40, 320, 40, TFT_DARKGREY);
-    draw_slider_row(48, "Volume", setting_volume);
-    M5.Display.drawLine(0, 96, 320, 96, TFT_DARKGREY);
-    draw_slider_row(104, "Brightness", setting_brightness);
-    M5.Display.drawLine(0, 152, 320, 152, TFT_DARKGREY);
+    M5.Display.drawLine(0, 72, 320, 72, TFT_DARKGREY);
+    draw_slider_row(76, "Volume", setting_volume);
+    M5.Display.drawLine(0, 124, 320, 124, TFT_DARKGREY);
+    draw_slider_row(130, "Brightness", setting_brightness);
+    M5.Display.drawLine(0, 176, 320, 176, TFT_DARKGREY);
     M5.Display.setTextSize(1);
     M5.Display.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
-    M5.Display.setCursor(8, 160);
-    M5.Display.print("BPM Mode: hold right zone Detect/Play/Normal");
+    M5.Display.setCursor(8, 180);
+    M5.Display.print("BPM: hold right zone");
     M5.Display.fillRoundRect(10, 192, 135, 36, 6, TFT_DARKGREY);
     M5.Display.setTextColor(TFT_WHITE, TFT_DARKGREY);
     M5.Display.setCursor(34, 203);
@@ -2026,21 +2050,21 @@ static void handle_settings_touch() {
         return constrain(value, min_val, max_val);
     };
 
-    if (ty >= 66 && ty <= 80 && tx >= 8 && tx <= 312) {
+    if (ty >= 94 && ty <= 108 && tx >= 8 && tx <= 312) {
         int next_volume = apply_slider_value(tx, 0, 255);
         if (next_volume != setting_volume) {
             setting_volume = next_volume;
-            draw_slider_row(48, "Volume", setting_volume);
+            draw_slider_row(76, "Volume", setting_volume);
         }
         return;
     }
 
-    if (ty >= 122 && ty <= 136 && tx >= 8 && tx <= 312) {
+    if (ty >= 148 && ty <= 162 && tx >= 8 && tx <= 312) {
         int next_brightness = apply_slider_value(tx, 20, 255);
         if (next_brightness != setting_brightness) {
             setting_brightness = next_brightness;
             M5.Display.setBrightness(setting_brightness);
-            draw_slider_row(104, "Brightness", setting_brightness);
+            draw_slider_row(130, "Brightness", setting_brightness);
         }
         return;
     }
