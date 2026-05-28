@@ -3,6 +3,7 @@
 #include <SPIFFS.h>
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
+#include <WiFiUdp.h>
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
 #include <esp_system.h>
@@ -223,6 +224,10 @@ static HeadTouchSensor head_touch_sensor;
 
 // --- HTTP Server ---
 WiFiServer speak_server(80);
+
+// --- UDP Beat Receiver ---
+static WiFiUDP udp_beat;
+static constexpr uint16_t UDP_BEAT_PORT = 8888;
 static volatile bool busy = false;
 static uint32_t error_clear_at_ms = 0;
 
@@ -1732,6 +1737,19 @@ static void handle_config_post(WiFiClient& client, int content_length) {
     ESP.restart();
 }
 
+static void handle_udp_beat() {
+    int size = udp_beat.parsePacket();
+    if (size <= 0) return;
+    char buf[256];
+    int len = udp_beat.read(buf, sizeof(buf) - 1);
+    if (len <= 0) return;
+    buf[len] = '\0';
+    if (app_mode == MODE_SETTINGS || busy) return;
+    JsonDocument doc;
+    if (deserializeJson(doc, buf)) return;
+    queue_http_beat(doc["step"] | 0, doc["accent"] | false, doc["bpm"] | 0, doc["motion"] | "lr");
+}
+
 void handle_speak_server() {
     WiFiClient client = speak_server.available();
     if (!client) return;
@@ -2345,6 +2363,7 @@ void setup() {
     WiFi.setAutoReconnect(true);
     if (ensure_wifi_connected(10000)) {
         speak_server.begin();
+        udp_beat.begin(UDP_BEAT_PORT);
         M5_LOGI("WiFi: %s", WiFi.localIP().toString().c_str());
         show("IP: " + WiFi.localIP().toString());
         delay(3000);
@@ -2443,6 +2462,7 @@ void loop() {
         clear_error_state();
         show("");
     }
+    handle_udp_beat();
     handle_speak_server();
 
     // Right hold: BPM mode
