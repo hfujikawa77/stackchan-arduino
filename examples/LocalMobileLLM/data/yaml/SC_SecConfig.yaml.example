@@ -1,0 +1,55 @@
+# SC_SecConfig.yaml  -- LocalMobileLLM example
+# Copy to /yaml/SC_SecConfig.yaml on SPIFFS
+
+# ─── LLM (Hermes) ───────────────────────────────────────────────────────────────
+# Point hermes.endpoint at your smartphone's LM Studio / Ollama server.
+# LM Studio for iPhone: http://<iPhone-IP>:1234/v1/chat/completions
+# Ollama:               http://<device-IP>:11434/v1/chat/completions
+hermes:
+  endpoint: "http://192.168.1.100:1234/v1/chat/completions"
+  model: "gemma-3-4b-it"
+  api_key: "lm-studio"
+  max_tokens: 80
+  timeout_ms: 30000
+
+# ─── Local Mobile LLM / Companion Server ──────────────────────────────────────────
+# Companion server (server.py) handles STT (Whisper) and TTS (kokoro/edge-tts)
+# Run: python server.py --port 8080 --whisper-model small
+#
+# If local_host is empty, all services fall back to cloud (Google STT, VOICEVOX cloud)
+local_host: "192.168.1.100:8080"
+
+# stt_mode: "google"   -- Google Cloud Speech-to-Text (requires stt_api_key)
+#           "whisper"  -- local Whisper via companion server
+stt_mode: "whisper"
+
+# tts_mode: ""                -- VOICEVOX cloud (tts.quest, requires tts_api_key)
+#           "voicevox_local"  -- VOICEVOX running locally (requires voicevox_host)
+#           "openai"          -- OpenAI-compatible TTS via companion server
+tts_mode: "openai"
+
+# Voice for OpenAI TTS (kokoro voices: af_heart, af_sky, af_bella, am_adam, etc.)
+tts_voice: "af_heart"
+
+# Whisper model name sent to companion server (informational only)
+whisper_model: "whisper-1"
+
+# VAD (Voice Activity Detection) for faster recording
+vad_threshold: 300
+vad_tail_ms: 500
+
+# ─── STT (Google Cloud) - only needed when stt_mode: "google" ─────────────────
+stt_api_key: ""
+
+# ─── TTS (VOICEVOX) - only needed when tts_mode is "" or "voicevox_local" ────
+tts_api_key: ""
+voicevox_host: ""
+voicevox_speaker: 1
+tts_volume: 100
+
+# ─── WiFi ───────────────────────────────────────────────────────────────────────────
+wifi_list:
+  - ssid: "YOUR_SSID_1"
+    pass: "YOUR_PASS_1"
+  - ssid: "YOUR_SSID_2"
+    pass: "YOUR_PASS_2"

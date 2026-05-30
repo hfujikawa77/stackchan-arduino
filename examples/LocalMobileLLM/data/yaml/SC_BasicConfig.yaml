@@ -1,0 +1,36 @@
+servo: 
+  pin: 
+    # ServoPin
+    # Core1 PortA X:22,Y:21 PortC X:16,Y:17
+    # Core2 PortA X:33,Y:32 PortC X:13,Y:14
+    # CoreS3 PortA X:2, Y:1 PortB X:9, Y:8 PortC X:17, Y:18
+    # Stack-chanPCB Core1 X:5,Y:2 Core2 X:19,Y27
+    # When using SCS0009 or Dynamixel XL330, x:RX, y:TX (not used)
+    # RT Version: x:6 y:7
+    # M5StackChan :x7 y:6
+    x: 7
+    y: 6
+  offset: 
+    x: 0
+    y: 0
+  center:
+    # SG90: x:90 y:90
+    # SCS0009: x:150, y:150
+    # Dynamixel XL330: x:180, y:270
+    # RT Version X:180 Y:5
+    # M5StackChan: x:150, y:90
+    x: 150
+    y: 90
+  lower_limit:
+    x: 0
+    y: 0
+  upper_limit:
+    x: 300 
+    y: 90
+  speed: 
+    normal_mode: 
+      interval_min: 3000
+      interval_max: 6000
+      move_min: 500
+      move_max: 1500
+servo_type: "M5_SCS"
