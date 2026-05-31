@@ -193,22 +193,27 @@ static size_t record_with_vad() {
     int    sil    = 0;
 
     while (total + CHUNK <= (size_t)MIC_BUF_SAMPLES) {
-        M5.Mic.record(rec_buf + total, CHUNK, MIC_SAMPLE_RATE, true);
-
-        int64_t sum = 0;
-        for (size_t i = 0; i < CHUNK; i++) {
-            int32_t s = rec_buf[total + i];
-            sum += s * s;
+        M5.Mic.record(rec_buf + total, CHUNK, MIC_SAMPLE_RATE, false);
+        while (M5.Mic.isRecording()) {
+            M5.update();
+            if (M5.BtnA.wasClicked()) { M5.Mic.stop(); goto vad_done; }
+            delay(10);
         }
-        int rms = (int)sqrtf((float)sum / (float)CHUNK);
-        total += CHUNK;
 
-        if (rms >= vad_threshold) { active = true; sil = 0; }
-        else if (active && ++sil >= NEED_SIL) break;
+        {
+            int64_t sum = 0;
+            for (size_t i = 0; i < CHUNK; i++) {
+                int32_t s = rec_buf[total + i];
+                sum += s * s;
+            }
+            int rms = (int)sqrtf((float)sum / (float)CHUNK);
+            total += CHUNK;
 
-        M5.update();
-        if (M5.BtnA.wasClicked()) break;
+            if (rms >= vad_threshold) { active = true; sil = 0; }
+            else if (active && ++sil >= NEED_SIL) break;
+        }
     }
+    vad_done:
     return total;
 }
 
