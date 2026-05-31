@@ -23,6 +23,11 @@ void handle_speak_server();
 static void load_wifi_credentials_from_yaml(const String& normalized_yaml);
 static void replace_wifi_yaml_sections(String& yaml, WifiCredential entries[], size_t entry_count);
 static void led_force_clear();
+static void chat_add(bool is_user, const String& text);
+static void speech_scroll_start(const String& text);
+static void speech_scroll_tick();
+static void speech_scroll_run_to_end(uint8_t repeat_count = 3);
+static void speech_scroll_stop();
 static const char B64_TABLE[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 static size_t base64_encode(uint8_t* out, const uint8_t* in, size_t in_len) {
     size_t j = 0;
@@ -84,6 +89,7 @@ enum AppMode { MODE_NORMAL, MODE_SETTINGS, MODE_BPM_DETECT, MODE_BPM_PLAY };
 static AppMode app_mode = MODE_NORMAL;
 static int setting_volume     = 80;
 static int setting_brightness = 200;
+static int setting_wifi_index = 0;
 static int brightness_val     = 200;
 static constexpr size_t WIFI_MAX = 3;
 struct WifiCredential {
@@ -229,7 +235,26 @@ WiFiServer speak_server(80);
 static WiFiUDP udp_beat;
 static constexpr uint16_t UDP_BEAT_PORT = 8888;
 static volatile bool busy = false;
+static volatile bool web_tts_pending = false;
+static String web_tts_text = "";
 static uint32_t error_clear_at_ms = 0;
+
+// --- Conversation history ---
+static constexpr int CHAT_HISTORY_MAX = 8;
+struct ChatMessage {
+    bool is_user = false;
+    String text;
+};
+static ChatMessage chat_messages[CHAT_HISTORY_MAX];
+static size_t chat_message_count = 0;
+static bool avatar_ready = false;
+static bool speech_scroll_active = false;
+static String speech_scroll_text = "";
+static uint32_t speech_scroll_started_ms = 0;
+static uint32_t speech_scroll_last_ms = 0;
+static uint32_t speech_scroll_duration_ms = 0;
+static constexpr int SPEECH_SCROLL_VISIBLE_CHARS = 12;
+static constexpr uint32_t SPEECH_SCROLL_STEP_MS = 130;
 
 // --- LED ---
 #define LED_NUM 12
@@ -847,9 +872,14 @@ String call_hermes(const String& user_message) {
     if (!ensure_wifi_connected()) return "WiFi reconnect failed.";
 
     HTTPClient http;
-    WiFiClientSecure client;
-    client.setInsecure();
-    http.begin(client, hermes_endpoint);
+    WiFiClient plain_client;
+    WiFiClientSecure secure_client;
+    if (hermes_endpoint.startsWith("https://")) {
+        secure_client.setInsecure();
+        http.begin(secure_client, hermes_endpoint);
+    } else {
+        http.begin(plain_client, hermes_endpoint);
+    }
     http.setTimeout(hermes_timeout_ms);
     http.addHeader("Content-Type", "application/json");
     http.addHeader("X-Client-Source", "stackchan");
@@ -899,6 +929,129 @@ static String build_llm_chat_prompt(JsonVariant history, const String& user_mess
     return prompt;
 }
 
+static String chat_display_text(const String& text) {
+    String one_line = text;
+    one_line.replace("\r", " ");
+    one_line.replace("\n", " ");
+    one_line.trim();
+    if (one_line.length() > 240) one_line = one_line.substring(0, 239) + ".";
+    return one_line;
+}
+
+static void chat_add(bool is_user, const String& text) {
+    String display = chat_display_text(text);
+    if (display.isEmpty()) return;
+    if (chat_message_count < CHAT_HISTORY_MAX) {
+        chat_messages[chat_message_count++] = {is_user, display};
+    } else {
+        for (size_t i = 1; i < CHAT_HISTORY_MAX; ++i) chat_messages[i - 1] = chat_messages[i];
+        chat_messages[CHAT_HISTORY_MAX - 1] = {is_user, display};
+    }
+}
+
+static int utf8_next_index(const String& text, int index) {
+    if (index >= (int)text.length()) return text.length();
+    uint8_t c = (uint8_t)text[index];
+    int step = 1;
+    if ((c & 0x80) == 0x00) step = 1;
+    else if ((c & 0xE0) == 0xC0) step = 2;
+    else if ((c & 0xF0) == 0xE0) step = 3;
+    else if ((c & 0xF8) == 0xF0) step = 4;
+    return min((int)text.length(), index + step);
+}
+
+static int utf8_index_after_chars(const String& text, int start, int count) {
+    int index = start;
+    for (int i = 0; i < count && index < (int)text.length(); ++i) {
+        index = utf8_next_index(text, index);
+    }
+    return index;
+}
+
+static int utf8_char_count(const String& text) {
+    int count = 0;
+    for (int i = 0; i < (int)text.length(); i = utf8_next_index(text, i)) count++;
+    return count;
+}
+
+static String utf8_window(const String& text, int start_char, int width_chars) {
+    int start = utf8_index_after_chars(text, 0, start_char);
+    int end = utf8_index_after_chars(text, start, width_chars);
+    return text.substring(start, end);
+}
+
+static void set_avatar_speech_text_safe(const String& text) {
+    avatar.setSpeechText(text.c_str());
+}
+
+static void speech_scroll_start(const String& text) {
+    speech_scroll_text = chat_display_text(text);
+    speech_scroll_active = !speech_scroll_text.isEmpty();
+    speech_scroll_started_ms = millis();
+    speech_scroll_last_ms = 0;
+    speech_scroll_duration_ms = 0;
+    speech_scroll_tick();
+}
+
+static void speech_scroll_set_duration(uint32_t duration_ms) {
+    if (!speech_scroll_active) return;
+    speech_scroll_duration_ms = max<uint32_t>(duration_ms, 1000);
+    speech_scroll_started_ms = millis();
+    speech_scroll_last_ms = 0;
+    speech_scroll_tick();
+}
+
+static void speech_scroll_tick() {
+    if (!speech_scroll_active || speech_scroll_text.isEmpty() || app_mode != MODE_NORMAL) return;
+    uint32_t now = millis();
+    if (speech_scroll_last_ms && now - speech_scroll_last_ms < SPEECH_SCROLL_STEP_MS) return;
+    speech_scroll_last_ms = now;
+
+    int total_chars = utf8_char_count(speech_scroll_text);
+    String visible = speech_scroll_text;
+    if (total_chars > SPEECH_SCROLL_VISIBLE_CHARS) {
+        int max_start = total_chars - SPEECH_SCROLL_VISIBLE_CHARS;
+        int start_char = 0;
+        if (speech_scroll_duration_ms > 0) {
+            uint32_t elapsed_ms = now - speech_scroll_started_ms;
+            int span = max_start + 1;
+            start_char = (elapsed_ms / SPEECH_SCROLL_STEP_MS) % span;
+        }
+        visible = utf8_window(speech_scroll_text, start_char, SPEECH_SCROLL_VISIBLE_CHARS);
+    }
+    set_avatar_speech_text_safe(visible);
+}
+
+static void speech_scroll_run_to_end(uint8_t repeat_count) {
+    if (!speech_scroll_active || speech_scroll_text.isEmpty() || app_mode != MODE_NORMAL) return;
+
+    int total_chars = utf8_char_count(speech_scroll_text);
+    repeat_count = max<uint8_t>(1, repeat_count);
+
+    for (uint8_t repeat = 0; repeat < repeat_count; ++repeat) {
+        if (total_chars <= SPEECH_SCROLL_VISIBLE_CHARS) {
+            set_avatar_speech_text_safe(speech_scroll_text);
+            M5.update();
+            delay(900);
+            continue;
+        }
+
+        int max_start = total_chars - SPEECH_SCROLL_VISIBLE_CHARS;
+        for (int start_char = 0; start_char <= max_start; ++start_char) {
+            set_avatar_speech_text_safe(utf8_window(speech_scroll_text, start_char, SPEECH_SCROLL_VISIBLE_CHARS));
+            M5.update();
+            delay(SPEECH_SCROLL_STEP_MS);
+        }
+        delay(900);
+    }
+}
+
+static void speech_scroll_stop() {
+    speech_scroll_active = false;
+    speech_scroll_text = "";
+    speech_scroll_duration_ms = 0;
+}
+
 static void play_wav(uint8_t* wav_buf, int read_len) {
     uint32_t data_offset = 44;
     uint32_t sample_rate = 24000;
@@ -914,9 +1067,16 @@ static void play_wav(uint8_t* wav_buf, int read_len) {
     uint32_t speak_next_ms = millis() + 900;
     bool speak_phase = false;
     M5.Speaker.setVolume(tts_volume);
+    uint32_t audio_ms = 0;
+    if (read_len > (int)data_offset && sample_rate > 0) {
+        uint32_t sample_count = (read_len - data_offset) / 2;
+        audio_ms = (uint32_t)(((uint64_t)sample_count * 1000) / sample_rate);
+    }
+    if (audio_ms > 0) speech_scroll_set_duration(audio_ms);
     M5.Speaker.playRaw((int16_t*)(wav_buf + data_offset), (read_len - data_offset) / 2, sample_rate, false, 1, 0);
     while (M5.Speaker.isPlaying()) {
         M5.update();
+        speech_scroll_tick();
         delay(10);
         if (touchedZone(2)) { M5.Speaker.stop(); break; }
         if (servo_ready) {
@@ -1013,6 +1173,7 @@ bool call_tts(const String& text) {
         bool audio_ready = false;
         for (int attempt = 0; attempt < 40; attempt++) {
             delay(500);
+            speech_scroll_tick();
             HTTPClient hStat;
             WiFiClientSecure cStat; cStat.setInsecure();
             hStat.begin(cStat, status_url);
@@ -1188,7 +1349,11 @@ static void periodic_tick() {
         avatar.setExpression(Expression::Happy);
         led_set(LED_SPEAKING);
         show("[Speaking...]");
+        chat_add(false, text);
+        speech_scroll_start(text);
+        speech_scroll_run_to_end();
         call_tts(text);
+        speech_scroll_stop();
         avatar.setExpression(Expression::Neutral);
         led_set(LED_OFF);
         show("");
@@ -1200,7 +1365,7 @@ static void periodic_tick() {
 void show(const String& text) {
     String oneline = text;
     oneline.replace("\n", " ");
-    avatar.setSpeechText(oneline.c_str());
+    set_avatar_speech_text_safe(oneline);
     Serial.println(text);
 }
 
@@ -1501,28 +1666,35 @@ static void handle_config_get(WiFiClient& client) {
               "if(data.mode==='llm'&&typeof data.llm_ms==='number')parts.push('LLM '+data.llm_ms+'ms');"
               "if(typeof data.tts_ms==='number')parts.push('TTS '+data.tts_ms+'ms');"
               "if(typeof data.total_ms==='number')parts.push('Total '+data.total_ms+'ms');"
-              "parts.push(data.spoken?'Spoken':'Done');"
+              "parts.push(data.speaking?'Speaking...':(data.spoken?'Spoken':'Done'));"
               "return parts.join(' / ');}"
               "async function sendSpeak(){"
               "const mode=document.querySelector('input[name=\"speak_mode\"]:checked').value;"
               "const input=document.getElementById('speak-text');"
               "const text=input.value.trim();"
               "if(!text){setSpeakStatus('繝・く繧ｹ繝医ｒ蜈･蜉帙＠縺ｦ縺上□縺輔＞');return;}"
-              "const clearAfterSend=mode==='fixed';"
               "window.stackChanChat=window.stackChanChat||[];"
               "appendChat('user',text);"
               "if(mode==='llm'){window.stackChanChat.push({role:'user',content:text});}"
+              "input.value='';"
               "setSpeakStatus(mode==='llm'?'Thinking...':'Speaking...');"
               "try{"
               "const payload={mode:mode,text:text,history:window.stackChanChat};"
               "const resp=await fetch('/speak',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});"
-              "const data=await resp.json();"
+              "const raw=await resp.text();"
+              "if(!raw){throw new Error('Empty response from StackChan');}"
+              "const data=JSON.parse(raw);"
               "if(!resp.ok||!data.ok){throw new Error(data.error||('HTTP '+resp.status));}"
               "if(data.reply){appendChat('assistant',data.reply);window.stackChanChat.push({role:'assistant',content:data.reply});}"
-              "if(clearAfterSend) input.value='';"
               "setSpeakStatus(formatSpeakStatus(data));"
               "}catch(err){setSpeakStatus('Error: '+err.message);}}"
-              "window.addEventListener('DOMContentLoaded',()=>openTab('tab-security'));"
+              "window.addEventListener('DOMContentLoaded',()=>{"
+              "openTab('tab-security');"
+              "const speakText=document.getElementById('speak-text');"
+              "if(speakText){speakText.addEventListener('keydown',e=>{"
+              "if(e.key==='Enter'&&!e.shiftKey&&!e.isComposing){e.preventDefault();sendSpeak();}"
+              "});}"
+              "});"
               "</script></head><body>"
               "<h2>StackChan Settings</h2>"
               "<div class=tabs>"
@@ -1826,21 +1998,52 @@ void handle_speak_server() {
     }
 
     String body = "";
-    uint32_t deadline = millis() + 2000;
-    while ((int)body.length() < content_length && millis() < deadline) {
-        if (client.available()) body += (char)client.read();
+    body.reserve(content_length > 0 ? content_length + 1 : 256);
+    uint32_t deadline = millis() + 5000;
+    while ((content_length <= 0 || (int)body.length() < content_length) && millis() < deadline) {
+        while (client.available() && (content_length <= 0 || (int)body.length() < content_length)) {
+            body += (char)client.read();
+            deadline = millis() + 500;
+        }
+        if (content_length <= 0 && !client.connected()) break;
+        delay(1);
     }
 
     JsonDocument doc;
     String mode = "fixed";
     String speak_text = "";
     String reply_text = "";
-    if (!deserializeJson(doc, body)) {
+    DeserializationError json_error = deserializeJson(doc, body);
+    if (!json_error) {
         mode = doc["mode"] | "fixed";
         speak_text = doc["text"] | "";
+    } else {
+        String err = "{\"ok\":false,\"error\":\"json:";
+        err += json_error.c_str();
+        err += "\",\"bytes\":";
+        err += String(body.length());
+        err += ",\"content_length\":";
+        err += String(content_length);
+        err += "}";
+        client.print("HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: ");
+        client.print(err.length());
+        client.print("\r\nConnection: close\r\n\r\n");
+        client.print(err);
+        client.flush();
+        client.stop();
+        return;
     }
     if (speak_text.isEmpty()) {
-        client.print("HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: 27\r\nConnection: close\r\n\r\n{\"ok\":false,\"error\":\"text\"}");
+        String err = "{\"ok\":false,\"error\":\"text\",\"bytes\":";
+        err += String(body.length());
+        err += ",\"content_length\":";
+        err += String(content_length);
+        err += "}";
+        client.print("HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: ");
+        client.print(err.length());
+        client.print("\r\nConnection: close\r\n\r\n");
+        client.print(err);
+        client.flush();
         client.stop();
         return;
     }
@@ -1853,6 +2056,7 @@ void handle_speak_server() {
     bool spoken = false;
     bool llm_mode = mode == "llm";
     if (llm_mode) {
+        chat_add(true, speak_text);
         avatar.setExpression(Expression::Doubt);
         led_set(LED_THINKING);
         show("Thinking...");
@@ -1878,12 +2082,44 @@ void handle_speak_server() {
         reply_text = speak_text;
     }
 
+    String resp = "{\"ok\":true,\"mode\":\"" + json_escape(mode) + "\",\"reply\":\"" + json_escape(reply_text) + "\",\"spoken\":";
+    resp += "false";
+    resp += ",\"speaking\":true";
+    resp += ",\"llm_ms\":";
+    resp += String(llm_elapsed_ms);
+    resp += ",\"tts_ms\":";
+    resp += "0";
+    resp += ",\"total_ms\":";
+    resp += String(millis() - request_started_ms);
+    resp += "}";
+    client.print("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: ");
+    client.print(resp.length());
+    client.print("\r\nConnection: close\r\n\r\n");
+    client.print(resp);
+    client.flush();
+    client.stop();
+
+    web_tts_text = reply_text;
+    web_tts_pending = true;
+}
+
+static void process_web_tts_pending() {
+    if (!web_tts_pending) return;
+    String reply_text = web_tts_text;
+    web_tts_text = "";
+    web_tts_pending = false;
+
     avatar.setExpression(Expression::Happy);
     led_set(LED_SPEAKING);
     show("[Speaking...]");
+    chat_add(false, reply_text);
+    speech_scroll_start(reply_text);
+    speech_scroll_run_to_end();
     uint32_t tts_started_ms = millis();
-    spoken = call_tts(reply_text);
-    tts_elapsed_ms = millis() - tts_started_ms;
+    bool spoken = call_tts(reply_text);
+    speech_scroll_stop();
+    uint32_t tts_elapsed_ms = millis() - tts_started_ms;
+    M5_LOGI("Speak TTS done: spoken=%d tts_ms=%lu", spoken ? 1 : 0, (unsigned long)tts_elapsed_ms);
     if (spoken) {
         avatar.setExpression(Expression::Neutral);
         led_set(LED_OFF);
@@ -1894,37 +2130,79 @@ void handle_speak_server() {
         show("TTS failed");
     }
     busy = false;
-
-    String resp = "{\"ok\":true,\"mode\":\"" + json_escape(mode) + "\",\"reply\":\"" + json_escape(reply_text) + "\",\"spoken\":";
-    resp += spoken ? "true" : "false";
-    resp += ",\"llm_ms\":";
-    resp += String(llm_elapsed_ms);
-    resp += ",\"tts_ms\":";
-    resp += String(tts_elapsed_ms);
-    resp += ",\"total_ms\":";
-    resp += String(millis() - request_started_ms);
-    resp += "}";
-    client.print("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: ");
-    client.print(resp.length());
-    client.print("\r\nConnection: close\r\n\r\n");
-    client.print(resp);
-    client.stop();
 }
 
 // ---- Settings UI ----
+
+static int current_wifi_credential_index() {
+    if (wifi_credential_count == 0) return 0;
+    if (WiFi.status() == WL_CONNECTED) {
+        String current = WiFi.SSID();
+        for (size_t i = 0; i < wifi_credential_count; ++i) {
+            if (wifi_credentials[i].ssid == current) return (int)i;
+        }
+    }
+    return 0;
+}
+
+static void move_selected_wifi_to_front() {
+    if (setting_wifi_index <= 0 || (size_t)setting_wifi_index >= wifi_credential_count) return;
+    WifiCredential selected = wifi_credentials[setting_wifi_index];
+    for (int i = setting_wifi_index; i > 0; --i) {
+        wifi_credentials[i] = wifi_credentials[i - 1];
+    }
+    wifi_credentials[0] = selected;
+    setting_wifi_index = 0;
+}
 
 static void save_settings() {
     File f = SPIFFS.open("/yaml/SC_SecConfig.yaml", "r");
     if (!f) { M5_LOGE("save_settings: open failed"); return; }
     String yaml = f.readString();
     f.close();
+    move_selected_wifi_to_front();
+    replace_wifi_yaml_sections(yaml, wifi_credentials, wifi_credential_count);
     update_yaml_int_value(yaml, "tts_volume", setting_volume);
     update_yaml_int_value(yaml, "brightness", setting_brightness);
     File fw = SPIFFS.open("/yaml/SC_SecConfig.yaml", "w");
     if (!fw) { M5_LOGE("save_settings: write failed"); return; }
     fw.print(yaml);
     fw.close();
-    M5_LOGI("Settings saved: vol=%d bright=%d", setting_volume, setting_brightness);
+    M5_LOGI("Settings saved: vol=%d bright=%d wifi=%s", setting_volume, setting_brightness,
+            wifi_credential_count > 0 ? wifi_credentials[0].ssid.c_str() : "");
+}
+
+static void draw_wifi_list() {
+    M5.Display.fillRoundRect(6, 24, 308, 68, 5, TFT_NAVY);
+    M5.Display.drawRoundRect(6, 24, 308, 68, 5, TFT_CYAN);
+    M5.Display.setTextSize(1);
+    M5.Display.setTextColor(TFT_CYAN, TFT_NAVY);
+    M5.Display.setCursor(14, 29);
+    M5.Display.print("WiFi SSID");
+    M5.Display.setTextColor(TFT_LIGHTGREY, TFT_NAVY);
+    M5.Display.setCursor(178, 29);
+    M5.Display.print(WiFi.status() == WL_CONNECTED ? WiFi.localIP().toString() : "not connected");
+
+    if (wifi_credential_count == 0) {
+        M5.Display.setTextColor(TFT_WHITE, TFT_NAVY);
+        M5.Display.setCursor(14, 52);
+        M5.Display.print("No saved SSID");
+        return;
+    }
+
+    for (size_t i = 0; i < wifi_credential_count; ++i) {
+        int row_y = 42 + (int)i * 15;
+        bool selected = (int)i == setting_wifi_index;
+        uint16_t bg = selected ? TFT_DARKGREEN : TFT_NAVY;
+        uint16_t fg = selected ? TFT_WHITE : TFT_LIGHTGREY;
+        M5.Display.fillRoundRect(12, row_y, 292, 14, 3, bg);
+        M5.Display.setTextColor(fg, bg);
+        M5.Display.setCursor(18, row_y + 3);
+        M5.Display.print(selected ? "> " : "  ");
+        String ssid = wifi_credentials[i].ssid;
+        if (ssid.length() > 30) ssid = ssid.substring(0, 29) + ".";
+        M5.Display.print(ssid);
+    }
 }
 
 static void draw_slider_row(int y, const char* label, int val) {
@@ -1962,46 +2240,19 @@ static void draw_settings_ui() {
     M5.Display.setTextColor(TFT_WHITE, TFT_DARKGREY);
     M5.Display.setCursor(288, 10);
     M5.Display.print("X");
-    M5.Display.fillRoundRect(6, 24, 308, 42, 5, TFT_NAVY);
-    M5.Display.drawRoundRect(6, 24, 308, 42, 5, TFT_CYAN);
-    if (WiFi.status() == WL_CONNECTED) {
-        String ssid = WiFi.SSID();
-        if (ssid.length() > 24) ssid = ssid.substring(0, 23) + ".";
-        M5.Display.setTextSize(2);
-        M5.Display.setTextColor(TFT_WHITE, TFT_NAVY);
-        M5.Display.setCursor(14, 29);
-        M5.Display.print(ssid);
-        M5.Display.setTextSize(1);
-        M5.Display.setTextColor(TFT_CYAN, TFT_NAVY);
-        M5.Display.setCursor(14, 52);
-        M5.Display.print("IP: ");
-        M5.Display.print(WiFi.localIP().toString());
-    } else {
-        M5.Display.setTextSize(2);
-        M5.Display.setTextColor(TFT_WHITE, TFT_NAVY);
-        M5.Display.setCursor(14, 30);
-        M5.Display.print("SSID: not connected");
-        M5.Display.setTextSize(1);
-        M5.Display.setTextColor(TFT_CYAN, TFT_NAVY);
-        M5.Display.setCursor(14, 52);
-        M5.Display.print("IP: not connected");
-    }
-    M5.Display.drawLine(0, 72, 320, 72, TFT_DARKGREY);
-    draw_slider_row(76, "Volume", setting_volume);
-    M5.Display.drawLine(0, 124, 320, 124, TFT_DARKGREY);
-    draw_slider_row(130, "Brightness", setting_brightness);
-    M5.Display.drawLine(0, 176, 320, 176, TFT_DARKGREY);
-    M5.Display.setTextSize(1);
-    M5.Display.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
-    M5.Display.setCursor(8, 180);
-    M5.Display.print("BPM: hold right zone");
-    M5.Display.fillRoundRect(10, 192, 135, 36, 6, TFT_DARKGREY);
+    draw_wifi_list();
+    M5.Display.drawLine(0, 96, 320, 96, TFT_DARKGREY);
+    draw_slider_row(100, "Volume", setting_volume);
+    M5.Display.drawLine(0, 148, 320, 148, TFT_DARKGREY);
+    draw_slider_row(152, "Brightness", setting_brightness);
+    M5.Display.drawLine(0, 200, 320, 200, TFT_DARKGREY);
+    M5.Display.fillRoundRect(10, 204, 135, 30, 6, TFT_DARKGREY);
     M5.Display.setTextColor(TFT_WHITE, TFT_DARKGREY);
-    M5.Display.setCursor(34, 203);
+    M5.Display.setCursor(34, 214);
     M5.Display.print("Cancel");
-    M5.Display.fillRoundRect(165, 192, 145, 36, 6, TFT_DARKGREEN);
+    M5.Display.fillRoundRect(165, 204, 145, 30, 6, TFT_DARKGREEN);
     M5.Display.setTextColor(TFT_WHITE, TFT_DARKGREEN);
-    M5.Display.setCursor(206, 203);
+    M5.Display.setCursor(206, 214);
     M5.Display.print("Save");
 }
 
@@ -2011,6 +2262,7 @@ static void settings_enter() {
     app_mode = MODE_SETTINGS;
     setting_volume = tts_volume;
     setting_brightness = brightness_val;
+    setting_wifi_index = current_wifi_credential_index();
     avatar.suspend();
     draw_settings_ui();
 }
@@ -2021,6 +2273,10 @@ static void settings_exit(bool save) {
         brightness_val = setting_brightness;
         M5.Display.setBrightness(brightness_val);
         save_settings();
+        WiFi.disconnect(false, false);
+        if (wifi_credential_count > 0) {
+            WiFi.begin(wifi_credentials[0].ssid.c_str(), wifi_credentials[0].password.c_str());
+        }
     }
     app_mode = MODE_NORMAL;
     M5.Display.fillScreen(TFT_BLACK);
@@ -2035,11 +2291,20 @@ static void handle_settings_touch() {
     // [X] or Cancel
     if (touch.wasPressed()) {
         if (tx >= 280 && ty >= 4 && ty <= 32) { settings_exit(false); return; }
-        if (tx >= 10 && tx <= 145 && ty >= 192 && ty <= 228) { settings_exit(false); return; }
+        if (tx >= 10 && tx <= 145 && ty >= 204 && ty <= 234) { settings_exit(false); return; }
     }
     // Save
     if (touch.wasPressed()) {
-        if (tx >= 165 && tx <= 310 && ty >= 192 && ty <= 228) { settings_exit(true); return; }
+        if (tx >= 165 && tx <= 310 && ty >= 204 && ty <= 234) { settings_exit(true); return; }
+    }
+
+    if (touch.wasPressed() && tx >= 12 && tx <= 304 && ty >= 42 && ty <= 86 && wifi_credential_count > 0) {
+        int next_index = (ty - 42) / 15;
+        if (next_index >= 0 && (size_t)next_index < wifi_credential_count) {
+            setting_wifi_index = next_index;
+            draw_wifi_list();
+        }
+        return;
     }
 
     auto apply_slider_value = [&](int touch_x, int min_val, int max_val) -> int {
@@ -2050,21 +2315,21 @@ static void handle_settings_touch() {
         return constrain(value, min_val, max_val);
     };
 
-    if (ty >= 94 && ty <= 108 && tx >= 8 && tx <= 312) {
+    if (ty >= 118 && ty <= 132 && tx >= 8 && tx <= 312) {
         int next_volume = apply_slider_value(tx, 0, 255);
         if (next_volume != setting_volume) {
             setting_volume = next_volume;
-            draw_slider_row(76, "Volume", setting_volume);
+            draw_slider_row(100, "Volume", setting_volume);
         }
         return;
     }
 
-    if (ty >= 148 && ty <= 162 && tx >= 8 && tx <= 312) {
+    if (ty >= 170 && ty <= 184 && tx >= 8 && tx <= 312) {
         int next_brightness = apply_slider_value(tx, 20, 255);
         if (next_brightness != setting_brightness) {
             setting_brightness = next_brightness;
             M5.Display.setBrightness(setting_brightness);
-            draw_slider_row(130, "Brightness", setting_brightness);
+            draw_slider_row(152, "Brightness", setting_brightness);
         }
         return;
     }
@@ -2380,8 +2645,8 @@ void setup() {
     led_init();  // must be after servo_begin() 窶・needs ioexpander initialized
 
     avatar.init();
-    avatar.setSpeechFont(&fonts::efontJA_16);
-
+    avatar.setSpeechFont(&fonts::efontJA_12);
+    avatar_ready = true;
     show("Connecting WiFi...");
     WiFi.setSleep(false);
     WiFi.setAutoReconnect(true);
@@ -2488,6 +2753,7 @@ void loop() {
     }
     handle_udp_beat();
     handle_speak_server();
+    process_web_tts_pending();
 
     // Right hold: BPM mode
     if (btn_bpm_hold && !busy && time_reached(millis(), bpm_toggle_cooldown_until_ms) && zoneHoldTriggered(2)) {
@@ -2519,11 +2785,16 @@ void loop() {
         led_set(LED_SPEAKING);
         Serial.println("Reply: " + reply);
         show("[Speaking...]");
+        chat_add(false, reply);
+        speech_scroll_start(reply);
+        speech_scroll_run_to_end();
         if (call_tts(reply)) {
+            speech_scroll_stop();
             avatar.setExpression(Expression::Neutral);
             led_set(LED_OFF);
             show("");
         } else {
+            speech_scroll_stop();
             show_error_state("TTS failed");
         }
         busy = false;
@@ -2558,6 +2829,7 @@ void loop() {
             busy = false;
             return;
         }
+        chat_add(true, text);
         avatar.setExpression(Expression::Doubt);
         led_set(LED_THINKING);
         show("Thinking...");
@@ -2571,11 +2843,16 @@ void loop() {
         led_set(LED_SPEAKING);
         Serial.println("Reply: " + reply);
         show("[Speaking...]");
+        chat_add(false, reply);
+        speech_scroll_start(reply);
+        speech_scroll_run_to_end();
         if (call_tts(reply)) {
+            speech_scroll_stop();
             avatar.setExpression(Expression::Neutral);
             led_set(LED_OFF);
             show("");
         } else {
+            speech_scroll_stop();
             show_error_state("TTS failed");
         }
         busy = false;
