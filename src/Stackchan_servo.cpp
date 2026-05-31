@@ -83,15 +83,19 @@ void StackchanSERVO::attachServos() {
     // M5Stack用SCS0009 (PY32IOExpander使用)
     _ioexpander = new m5::PY32IOExpander_Class(0x6F, _i2c);
 
-    while (1) {
+    bool ioexp_ok = false;
+    for (int _retry = 0; _retry < 10; ++_retry) {
         vTaskDelay(pdMS_TO_TICKS(200));
-
-        uint32_t start_tick = millis();
-
         if (_ioexpander->begin()) {
+            ioexp_ok = true;
             break;
         }
-        M5_LOGI("init failed, retrying...");
+        M5_LOGI("init failed, retrying... (%d/10)", _retry + 1);
+    }
+    if (!ioexp_ok) {
+        M5_LOGE("PY32IOExpander init failed, skipping servo");
+        _ioexpander = nullptr;
+        return;
     }
 
 
