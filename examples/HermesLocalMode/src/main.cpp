@@ -230,6 +230,7 @@ WiFiServer speak_server(80);
 static WiFiUDP udp_beat;
 static constexpr uint16_t UDP_BEAT_PORT = 8888;
 static volatile bool busy = false;
+static bool avatar_ready = false;
 static uint32_t error_clear_at_ms = 0;
 
 // --- LED ---
@@ -713,7 +714,7 @@ int    voicevox_speaker = 1;
 static String local_host    = "";      // "192.168.x.x:port" smartphone/companion server
 static String stt_mode      = "google"; // "google" or "whisper"
 static String tts_mode_cfg  = "";      // "" | "voicevox_cloud" | "voicevox_local" | "openai"
-static String tts_voice     = "af_heart"; // voice for OpenAI TTS
+static String tts_voice     = "ja-JP-NanamiNeural"; // edge-tts voice for companion server
 static String whisper_model_name = "whisper-1";
 static int    vad_threshold = 300;     // RMS silence threshold (0–32767)
 static int    vad_tail_ms   = 500;     // ms of silence before VAD stops recording
@@ -816,7 +817,7 @@ void load_hermes_config(fs::FS& fs) {
     voicevox_host = extractStr("voicevox_host");
     if (!voicevox_host.isEmpty()) M5_LOGI("Local VOICEVOX: %s speaker=%d", voicevox_host.c_str(), voicevox_speaker);
     load_wifi_credentials_from_yaml(normalized_yaml);
-    brightness_val = extractInt("brightness", brightness_val);
+    brightness_val = constrain(extractInt("brightness", brightness_val), 20, 255);
     servo_on_boot = extractInt("servo_on_boot", servo_on_boot ? 1 : 0) != 0;
     play_bpm = clamp_bpm_value(extractInt("play_bpm", play_bpm));
 
@@ -839,47 +840,47 @@ void load_hermes_config(fs::FS& fs) {
     btn_servo_tap     = extractInt("btn_servo_tap",      1) != 0;
     btn_bpm_hold      = extractInt("btn_bpm_hold",       1) != 0;
 
-    // Local Mobile LLM settings
-    if (yaml.indexOf("local_host:") >= 0) {
-        int s = yaml.indexOf("local_host:");
-        int q1 = yaml.indexOf('"', s);
-        int q2 = yaml.indexOf('"', q1 + 1);
-        if (q1 >= 0 && q2 > q1) local_host = yaml.substring(q1 + 1, q2);
+    // Local Mobile LLM settings (use normalized_yaml to avoid matching comment lines)
+    if (normalized_yaml.indexOf("local_host:") >= 0) {
+        int s = normalized_yaml.indexOf("local_host:");
+        int q1 = normalized_yaml.indexOf('"', s);
+        int q2 = normalized_yaml.indexOf('"', q1 + 1);
+        if (q1 >= 0 && q2 > q1) local_host = normalized_yaml.substring(q1 + 1, q2);
     }
-    if (yaml.indexOf("stt_mode:") >= 0) {
-        int s = yaml.indexOf("stt_mode:");
-        int q1 = yaml.indexOf('"', s);
-        int q2 = yaml.indexOf('"', q1 + 1);
-        if (q1 >= 0 && q2 > q1) stt_mode = yaml.substring(q1 + 1, q2);
+    if (normalized_yaml.indexOf("stt_mode:") >= 0) {
+        int s = normalized_yaml.indexOf("stt_mode:");
+        int q1 = normalized_yaml.indexOf('"', s);
+        int q2 = normalized_yaml.indexOf('"', q1 + 1);
+        if (q1 >= 0 && q2 > q1) stt_mode = normalized_yaml.substring(q1 + 1, q2);
     }
-    if (yaml.indexOf("tts_mode:") >= 0) {
-        int s = yaml.indexOf("tts_mode:");
-        int q1 = yaml.indexOf('"', s);
-        int q2 = yaml.indexOf('"', q1 + 1);
-        if (q1 >= 0 && q2 > q1) tts_mode_cfg = yaml.substring(q1 + 1, q2);
+    if (normalized_yaml.indexOf("tts_mode:") >= 0) {
+        int s = normalized_yaml.indexOf("tts_mode:");
+        int q1 = normalized_yaml.indexOf('"', s);
+        int q2 = normalized_yaml.indexOf('"', q1 + 1);
+        if (q1 >= 0 && q2 > q1) tts_mode_cfg = normalized_yaml.substring(q1 + 1, q2);
     }
-    if (yaml.indexOf("tts_voice:") >= 0) {
-        int s = yaml.indexOf("tts_voice:");
-        int q1 = yaml.indexOf('"', s);
-        int q2 = yaml.indexOf('"', q1 + 1);
-        if (q1 >= 0 && q2 > q1) tts_voice = yaml.substring(q1 + 1, q2);
+    if (normalized_yaml.indexOf("tts_voice:") >= 0) {
+        int s = normalized_yaml.indexOf("tts_voice:");
+        int q1 = normalized_yaml.indexOf('"', s);
+        int q2 = normalized_yaml.indexOf('"', q1 + 1);
+        if (q1 >= 0 && q2 > q1) tts_voice = normalized_yaml.substring(q1 + 1, q2);
     }
-    if (yaml.indexOf("whisper_model:") >= 0) {
-        int s = yaml.indexOf("whisper_model:");
-        int q1 = yaml.indexOf('"', s);
-        int q2 = yaml.indexOf('"', q1 + 1);
-        if (q1 >= 0 && q2 > q1) whisper_model_name = yaml.substring(q1 + 1, q2);
+    if (normalized_yaml.indexOf("whisper_model:") >= 0) {
+        int s = normalized_yaml.indexOf("whisper_model:");
+        int q1 = normalized_yaml.indexOf('"', s);
+        int q2 = normalized_yaml.indexOf('"', q1 + 1);
+        if (q1 >= 0 && q2 > q1) whisper_model_name = normalized_yaml.substring(q1 + 1, q2);
     }
-    if (yaml.indexOf("vad_threshold:") >= 0) {
-        int s = yaml.indexOf("vad_threshold:");
-        int nl = yaml.indexOf('\n', s);
-        String val = yaml.substring(s + 14, nl); val.trim();
+    if (normalized_yaml.indexOf("vad_threshold:") >= 0) {
+        int s = normalized_yaml.indexOf("vad_threshold:");
+        int nl = normalized_yaml.indexOf('\n', s);
+        String val = normalized_yaml.substring(s + 14, nl); val.trim();
         if (val.length() > 0) vad_threshold = val.toInt();
     }
-    if (yaml.indexOf("vad_tail_ms:") >= 0) {
-        int s = yaml.indexOf("vad_tail_ms:");
-        int nl = yaml.indexOf('\n', s);
-        String val = yaml.substring(s + 12, nl); val.trim();
+    if (normalized_yaml.indexOf("vad_tail_ms:") >= 0) {
+        int s = normalized_yaml.indexOf("vad_tail_ms:");
+        int nl = normalized_yaml.indexOf('\n', s);
+        String val = normalized_yaml.substring(s + 12, nl); val.trim();
         if (val.length() > 0) vad_tail_ms = val.toInt();
     }
     M5_LOGI("local_host: %s", local_host.c_str());
@@ -906,10 +907,16 @@ String call_hermes(const String& user_message) {
     if (hermes_endpoint.isEmpty()) return "Hermes not configured.";
     if (!ensure_wifi_connected()) return "WiFi reconnect failed.";
 
+    M5_LOGI("Hermes POST: %s", hermes_endpoint.c_str());
     HTTPClient http;
-    WiFiClientSecure client;
-    client.setInsecure();
-    http.begin(client, hermes_endpoint);
+    WiFiClient plain_client;
+    WiFiClientSecure secure_client;
+    if (hermes_endpoint.startsWith("https://")) {
+        secure_client.setInsecure();
+        http.begin(secure_client, hermes_endpoint);
+    } else {
+        http.begin(plain_client, hermes_endpoint);
+    }
     http.setTimeout(hermes_timeout_ms);
     http.addHeader("Content-Type", "application/json");
     http.addHeader("X-Client-Source", "stackchan");
@@ -927,7 +934,16 @@ String call_hermes(const String& user_message) {
     int status = http.POST(body);
     if (status != 200) {
         String error_text = "Error: HTTP " + String(status);
+        if (status == -1) error_text += " (connect failed)";
         if (status == -11) error_text += " (read timeout)";
+        String response = http.getString();
+        response.trim();
+        if (!response.isEmpty()) {
+            M5_LOGE("Hermes error body: %s", response.c_str());
+            error_text += " ";
+            error_text += response;
+        }
+        M5_LOGE("Hermes error status=%d endpoint=%s", status, hermes_endpoint.c_str());
         http.end();
         return error_text;
     }
@@ -1241,6 +1257,50 @@ static bool call_tts_openai_speech(const String& text) {
     play_wav(wav_buf, rcvd);
     heap_caps_free(wav_buf);
     return true;
+}
+
+static bool tts_segment_ends_sentence(const String& segment) {
+    return segment.endsWith(".") ||
+           segment.endsWith("!") ||
+           segment.endsWith("?") ||
+           segment.endsWith("\n") ||
+           segment.endsWith("\xE3\x80\x82") || // Japanese full stop
+           segment.endsWith("\xEF\xBC\x81") || // Japanese exclamation mark
+           segment.endsWith("\xEF\xBC\x9F");   // Japanese question mark
+}
+
+static bool tts_next_byte_starts_char(const String& text, size_t index) {
+    if (index + 1 >= (size_t)text.length()) return true;
+    return (((uint8_t)text[index + 1] & 0xC0) != 0x80);
+}
+
+static bool call_tts_openai_speech_segment(String& segment, int& segment_index) {
+    segment.trim();
+    if (segment.isEmpty()) return true;
+    segment_index++;
+    M5_LOGI("OpenAI TTS segment %d bytes=%u", segment_index, (unsigned)segment.length());
+    bool ok = call_tts_openai_speech(segment);
+    segment = "";
+    if (ok) delay(50);
+    return ok;
+}
+
+static bool call_tts_openai_speech_segmented(const String& text) {
+    static constexpr size_t MAX_SEGMENT_BYTES = 180;
+    String segment;
+    segment.reserve(MAX_SEGMENT_BYTES + 16);
+    int segment_index = 0;
+
+    for (size_t i = 0; i < (size_t)text.length(); ++i) {
+        segment += text[i];
+        bool max_reached = segment.length() >= MAX_SEGMENT_BYTES && tts_next_byte_starts_char(text, i);
+        if (tts_segment_ends_sentence(segment) || max_reached) {
+            if (!call_tts_openai_speech_segment(segment, segment_index)) return false;
+        }
+    }
+
+    if (!call_tts_openai_speech_segment(segment, segment_index)) return false;
+    return segment_index > 0;
 }
 
 bool call_tts(const String& text) {
@@ -2702,7 +2762,8 @@ void setup() {
     led_init();  // must be after servo_begin() 窶・needs ioexpander initialized
 
     avatar.init();
-    avatar.setSpeechFont(&fonts::efontJA_16);
+    avatar.setSpeechFont(&fonts::efontJA_12);
+    avatar_ready = true;
 
     show("Connecting WiFi...");
     WiFi.setSleep(false);
@@ -2808,8 +2869,10 @@ void loop() {
         clear_error_state();
         show("");
     }
-    handle_udp_beat();
-    handle_speak_server();
+    if (WiFi.status() == WL_CONNECTED) {
+        handle_udp_beat();
+        handle_speak_server();
+    }
 
     // Right hold: BPM mode
     if (btn_bpm_hold && !busy && time_reached(millis(), bpm_toggle_cooldown_until_ms) && zoneHoldTriggered(2)) {
