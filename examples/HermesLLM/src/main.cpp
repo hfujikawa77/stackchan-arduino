@@ -7,6 +7,7 @@
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
 #include <esp_system.h>
+#include <mbedtls/sha1.h>
 #include <math.h>
 #include <array>
 #include <freertos/FreeRTOS.h>
@@ -81,6 +82,11 @@ static int16_t srv_cx = 150, srv_cy = 90;
 static uint32_t servo_idle_next_ms = 0;
 static uint32_t head_pat_cooldown_until_ms = 0;
 static uint32_t head_touch_next_poll_ms = 0;
+static int16_t servo_web_x = 150;
+static int16_t servo_web_y = 90;
+static WiFiClient servo_ws_client;
+static bool servo_ws_active = false;
+static uint32_t servo_ws_last_ms = 0;
 static volatile bool led_effect_active = false;
 static SemaphoreHandle_t io_mutex = nullptr;
 
@@ -141,6 +147,8 @@ private:
     bool locked_;
 };
 
+enum HeadGesture { GESTURE_NONE, GESTURE_PAT, GESTURE_DOUBLE_TAP, GESTURE_TRIPLE_TAP };
+
 class HeadTouchSensor {
 public:
     void begin() {
@@ -154,6 +162,12 @@ public:
             touched_flag[i] = false;
             touch_start_time[i] = 0;
         }
+        prev_any_touched_ = false;
+        tap_pending_ = 0;
+        tap_count_result_ = 0;
+        tap_finalized_ = false;
+        swipe_seen_in_seq_ = false;
+        last_release_ms_ = 0;
     }
 
     void update() {
@@ -184,6 +198,25 @@ public:
             }
         }
 
+        // Tap counting — must run before the early return to capture falling edges
+        bool falling = prev_any_touched_ && !any_touched;
+        if (falling) {
+            if (!swipe_seen_in_seq_) {
+                tap_pending_++;
+                last_release_ms_ = now;
+            } else {
+                swipe_seen_in_seq_ = false;
+            }
+        }
+        if (tap_pending_ > 0 && !any_touched &&
+                static_cast<int32_t>(now - last_release_ms_) >= TAP_QUIET_MS) {
+            tap_count_result_ = tap_pending_;
+            tap_finalized_ = true;
+            tap_pending_ = 0;
+            Serial.printf("Head tap count: %u\n", tap_count_result_);
+        }
+        prev_any_touched_ = any_touched;
+
         if (!any_touched) {
             in_gesture = false;
             for (int i = 0; i < 3; ++i) touched_flag[i] = false;
@@ -202,11 +235,15 @@ public:
                 t1_0 < max_swipe_interval && t2_1 < max_swipe_interval) {
                 swipe_forward = true;
                 in_gesture = true;
+                swipe_seen_in_seq_ = true;
+                tap_pending_ = 0;
                 Serial.println("Head pat swipe forward");
             } else if (t1_2 > min_swipe_interval && t0_1 > min_swipe_interval &&
                        t1_2 < max_swipe_interval && t0_1 < max_swipe_interval) {
                 swipe_backward = true;
                 in_gesture = true;
+                swipe_seen_in_seq_ = true;
+                tap_pending_ = 0;
                 Serial.println("Head pat swipe backward");
             }
         }
@@ -214,6 +251,8 @@ public:
 
     bool was_swiped_forward() const { return swipe_forward; }
     bool was_swiped_backward() const { return swipe_backward; }
+    bool tap_ready() const { return tap_finalized_; }
+    uint8_t consume_tap_count() { tap_finalized_ = false; return tap_count_result_; }
 
 private:
     Si12T sensor = Si12T(SI12T_Type_High, SI12T_Sensitivity_Level_4);
@@ -224,6 +263,13 @@ private:
     bool in_gesture = false;
     bool swipe_forward = false;
     bool swipe_backward = false;
+    bool prev_any_touched_ = false;
+    uint8_t tap_pending_ = 0;
+    uint8_t tap_count_result_ = 0;
+    bool tap_finalized_ = false;
+    bool swipe_seen_in_seq_ = false;
+    uint32_t last_release_ms_ = 0;
+    static constexpr uint32_t TAP_QUIET_MS = 400;
 };
 
 static HeadTouchSensor head_touch_sensor;
@@ -267,7 +313,7 @@ static constexpr uint32_t LED_IDLE_DURATION_MS = 20000;
 static constexpr uint8_t LED_IDLE_BRIGHTNESS_MIN = 6;
 static constexpr uint8_t LED_IDLE_BRIGHTNESS_MAX = 72;
 static constexpr uint32_t HEAD_PAT_REACTION_MS = 1800;
-static constexpr uint32_t HEAD_PAT_COOLDOWN_MS = 4000;
+static constexpr uint32_t HEAD_PAT_COOLDOWN_MS = 2000;
 
 enum LedIdleLogEvent : uint8_t {
     LED_IDLE_LOG_NONE = 0,
@@ -632,12 +678,19 @@ void led_idle_log_tick() {
     }
 }
 
-static bool head_pat_detected() {
+static HeadGesture head_pat_detected() {
     head_touch_sensor.update();
-    return head_touch_sensor.was_swiped_forward() || head_touch_sensor.was_swiped_backward();
+    if (head_touch_sensor.was_swiped_forward() || head_touch_sensor.was_swiped_backward())
+        return GESTURE_PAT;
+    if (head_touch_sensor.tap_ready()) {
+        uint8_t n = head_touch_sensor.consume_tap_count();
+        if (n == 2) return GESTURE_DOUBLE_TAP;
+        if (n >= 3) return GESTURE_TRIPLE_TAP;
+    }
+    return GESTURE_NONE;
 }
 
-static void head_pat_reaction() {
+static void head_pat_reaction(HeadGesture gesture) {
     if (busy) {
         Serial.println("Head pat ignored: busy");
         return;
@@ -653,29 +706,63 @@ static void head_pat_reaction() {
     }
 
     head_pat_cooldown_until_ms = now + HEAD_PAT_COOLDOWN_MS;
-    Serial.println("Head pat reaction start");
     busy = true;
     led_set(LED_HAPPY);
     avatar.setExpression(Expression::Happy);
     avatar.setLeftGaze(-0.18f, 0.10f);
     avatar.setRightGaze(-0.18f, 0.10f);
-    show("Pat pat");
 
     uint32_t reaction_started_ms = millis();
-    uint32_t next_motion_ms = reaction_started_ms;
-    bool motion_phase = false;
-    while (!time_reached(millis(), reaction_started_ms + HEAD_PAT_REACTION_MS)) {
-        M5.update();
-        handle_speak_server();
-        led_idle_log_tick();
 
-        uint32_t loop_now = millis();
-        if (servo_ready && servo_idle_enabled && time_reached(loop_now, next_motion_ms)) {
-            motion_phase = !motion_phase;
-            sc_servo.moveXY(srv_cx + (motion_phase ? 12 : -12), srv_cy - 8, 220);
-            next_motion_ms = loop_now + 320;
+    if (gesture == GESTURE_PAT) {
+        Serial.println("Head pat reaction: pat (left-right)");
+        show("Pat pat");
+        uint32_t next_motion_ms = reaction_started_ms;
+        bool motion_phase = false;
+        while (!time_reached(millis(), reaction_started_ms + HEAD_PAT_REACTION_MS)) {
+            M5.update();
+            handle_speak_server();
+            led_idle_log_tick();
+            uint32_t loop_now = millis();
+            if (servo_ready && servo_idle_enabled && time_reached(loop_now, next_motion_ms)) {
+                motion_phase = !motion_phase;
+                sc_servo.moveXY(srv_cx + (motion_phase ? 12 : -12), srv_cy - 8, 220);
+                next_motion_ms = loop_now + 320;
+            }
+            delay(10);
         }
-        delay(10);
+    } else if (gesture == GESTURE_DOUBLE_TAP) {
+        // 2 taps: vertical nod
+        Serial.println("Head pat reaction: double tap (vertical nod)");
+        show("Yes yes");
+        uint32_t next_motion_ms = reaction_started_ms;
+        bool nod_down = false;
+        while (!time_reached(millis(), reaction_started_ms + 2000)) {
+            M5.update();
+            handle_speak_server();
+            led_idle_log_tick();
+            uint32_t loop_now = millis();
+            if (servo_ready && servo_idle_enabled && time_reached(loop_now, next_motion_ms)) {
+                nod_down = !nod_down;
+                sc_servo.moveXY(srv_cx, nod_down ? srv_cy - 18 : srv_cy, 260);
+                next_motion_ms = loop_now + 280;
+            }
+            delay(10);
+        }
+    } else {
+        // 3+ taps: full X-axis spin (lower_limit → upper_limit → center)
+        Serial.println("Head pat reaction: triple tap (full spin)");
+        show("Yay!");
+        if (servo_ready && servo_idle_enabled) {
+            auto* sx = system_config.getServoInfo(AXIS_X);
+            int x_min = sx ? sx->lower_limit : 0;
+            int x_max = sx ? sx->upper_limit : 300;
+            sc_servo.moveXY(x_min, srv_cy - 5, 300);
+            sc_servo.moveXY(x_max, srv_cy - 5, 1200);
+            sc_servo.moveXY(srv_cx, srv_cy,     400);
+        } else {
+            delay(2000);
+        }
     }
 
     if (servo_ready) sc_servo.moveXY(srv_cx, srv_cy, 350);
@@ -696,10 +783,125 @@ void servo_begin() {
                    (ServoType)system_config.getServoType());
     srv_cx = sx->start_degree;
     srv_cy = sy->start_degree;
+    servo_web_x = srv_cx;
+    servo_web_y = srv_cy;
     servo_ready = true;
     auto* si = system_config.getServoInterval(AvatarMode::NORMAL);
     servo_idle_next_ms = millis() + si->interval_min;
     M5_LOGI("Servo ready cx=%d cy=%d type=%d", srv_cx, srv_cy, system_config.getServoType());
+}
+
+static int clamp_servo_axis(int axis, int value) {
+    auto* info = system_config.getServoInfo(axis == AXIS_X ? AXIS_X : AXIS_Y);
+    if (!info) return value;
+    return constrain(value, info->lower_limit, info->upper_limit);
+}
+
+static void servo_web_move(int x, int y, int move_ms) {
+    if (!servo_ready) return;
+    servo_idle_enabled = false;
+    servo_web_x = clamp_servo_axis(AXIS_X, x);
+    servo_web_y = clamp_servo_axis(AXIS_Y, y);
+    sc_servo.moveXY(servo_web_x, servo_web_y, constrain(move_ms, 20, 1000));
+}
+
+static void servo_web_center(int move_ms = 300) {
+    servo_web_move(srv_cx, srv_cy, move_ms);
+}
+
+static String websocket_accept_key(const String& key) {
+    static const char WS_GUID[] = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+    String src = key + WS_GUID;
+    uint8_t sha[20];
+    uint8_t b64[32];
+    mbedtls_sha1_ret(reinterpret_cast<const unsigned char*>(src.c_str()), src.length(), sha);
+    size_t n = base64_encode(b64, sha, sizeof(sha));
+    b64[n] = '\0';
+    return String(reinterpret_cast<char*>(b64));
+}
+
+static void servo_ws_stop() {
+    if (servo_ws_client) servo_ws_client.stop();
+    servo_ws_active = false;
+}
+
+static void servo_ws_apply_text(const String& msg) {
+    if (!servo_ready || busy) return;
+    int first = msg.indexOf(',');
+    if (first < 0) return;
+    String head = msg.substring(0, first);
+    int move_ms = 90;
+    if (head == "c") {
+        int ms = msg.substring(first + 1).toInt();
+        servo_web_center(ms > 0 ? ms : 180);
+        return;
+    }
+    int second = msg.indexOf(',', first + 1);
+    if (second < 0) return;
+    int yaw = constrain(head.toInt(), -45, 45);
+    int roll = constrain(msg.substring(first + 1, second).toInt(), -35, 35);
+    int ms = msg.substring(second + 1).toInt();
+    if (ms > 0) move_ms = ms;
+    servo_web_move(srv_cx + yaw, srv_cy - roll, move_ms);
+}
+
+static bool servo_ws_read_exact(uint8_t* out, size_t len, uint32_t timeout_ms = 20) {
+    size_t pos = 0;
+    uint32_t deadline = millis() + timeout_ms;
+    while (pos < len && millis() < deadline) {
+        while (pos < len && servo_ws_client.available()) {
+            out[pos++] = static_cast<uint8_t>(servo_ws_client.read());
+            deadline = millis() + timeout_ms;
+        }
+        if (pos < len) delay(1);
+    }
+    return pos == len;
+}
+
+static void servo_ws_tick() {
+    if (!servo_ws_active) return;
+    if (!servo_ws_client.connected()) {
+        servo_ws_stop();
+        return;
+    }
+    String latest_text = "";
+    while (servo_ws_client.available() >= 2) {
+        uint8_t hdr[2];
+        if (!servo_ws_read_exact(hdr, 2)) return;
+        uint8_t opcode = hdr[0] & 0x0F;
+        bool masked = (hdr[1] & 0x80) != 0;
+        uint64_t len = hdr[1] & 0x7F;
+        if (len == 126) {
+            uint8_t ext[2];
+            if (!servo_ws_read_exact(ext, 2)) return;
+            len = ((uint16_t)ext[0] << 8) | ext[1];
+        } else if (len == 127) {
+            servo_ws_stop();
+            return;
+        }
+        if (!masked || len > 96) {
+            servo_ws_stop();
+            return;
+        }
+        uint8_t mask[4];
+        if (!servo_ws_read_exact(mask, 4)) return;
+        char payload[97];
+        if (!servo_ws_read_exact(reinterpret_cast<uint8_t*>(payload), len)) return;
+        for (uint64_t i = 0; i < len; ++i) payload[i] ^= mask[i & 3];
+        payload[len] = '\0';
+        if (opcode == 0x8) {
+            servo_ws_stop();
+            return;
+        }
+        if (opcode == 0x1) {
+            servo_ws_last_ms = millis();
+            latest_text = String(payload);
+        }
+    }
+    if (latest_text.length()) servo_ws_apply_text(latest_text);
+    if (servo_ws_last_ms && time_reached(millis(), servo_ws_last_ms + 30000)) {
+        servo_ws_stop();
+    }
 }
 
 void servo_idle_tick() {
@@ -1612,7 +1814,7 @@ static void handle_config_get(WiFiClient& client) {
     }
 
     String html;
-    html.reserve(6144);
+    html.reserve(11000);
     html  = F("<!DOCTYPE html><html><head>"
               "<meta charset=UTF-8>"
               "<meta name=viewport content=\"width=device-width,initial-scale=1\">"
@@ -1645,6 +1847,17 @@ static void handle_config_get(WiFiClient& client) {
               ".speak-row{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin:8px 0}"
               "textarea{width:100%;min-height:88px;padding:8px;border:1px solid #ccc;border-radius:6px;font-size:13px}"
               ".mini-btn{padding:10px 12px;border:1px solid #1f6feb;border-radius:8px;background:#1f6feb;color:#fff;cursor:pointer}"
+              ".servo-grid{display:grid;grid-template-columns:1fr;gap:12px}"
+              ".jog-pad{position:relative;width:min(78vw,320px);aspect-ratio:1;margin:8px auto;border-radius:8px;"
+              "background:linear-gradient(135deg,#f8fbff,#dbeafe);"
+              "border:1px solid #93c5fd;touch-action:none;user-select:none}"
+              ".jog-axis{position:absolute;background:rgba(30,64,175,.22)}"
+              ".jog-axis.h{left:8%;right:8%;top:50%;height:1px}"
+              ".jog-axis.v{top:8%;bottom:8%;left:50%;width:1px}"
+              ".jog-dot{position:absolute;width:34px;height:34px;margin:-17px 0 0 -17px;border-radius:50%;"
+              "background:#1f6feb;border:3px solid #fff;box-shadow:0 2px 8px rgba(0,0,0,.28);left:50%;top:50%}"
+              ".servo-readout{display:grid;grid-template-columns:1fr 1fr;gap:8px;color:#333}"
+              ".servo-readout div{background:#f6f8fa;border:1px solid #ddd;border-radius:6px;padding:8px}"
               ".btn{display:block;width:100%;padding:12px;background:#4CAF50;color:#fff;"
               "border:none;border-radius:4px;cursor:pointer;font-size:15px;margin-top:14px}"
               ".btn:hover{background:#45a049}"
@@ -1655,7 +1868,7 @@ static void handle_config_get(WiFiClient& client) {
               "document.getElementById(id).classList.add('active');"
               "document.querySelector('[data-tab=\"'+id+'\"]').classList.add('active');"
               "const saveBtn=document.getElementById('save-btn');"
-              "if(saveBtn)saveBtn.style.display=(id==='tab-speak')?'none':'block';}"
+              "if(saveBtn)saveBtn.style.display=(id==='tab-speak'||id==='tab-servo')?'none':'block';}"
               "function appendChat(role,text){const log=document.getElementById('chat-log');"
               "if(!log)return;"
               "const div=document.createElement('div');div.className='bubble '+role;div.textContent=text;"
@@ -1688,8 +1901,54 @@ static void handle_config_get(WiFiClient& client) {
               "if(data.reply){appendChat('assistant',data.reply);window.stackChanChat.push({role:'assistant',content:data.reply});}"
               "setSpeakStatus(formatSpeakStatus(data));"
               "}catch(err){setSpeakStatus('Error: '+err.message);}}"
+              "let servoWs=null,servoWsReady=false;"
+              "function setServoStatus(text){const el=document.getElementById('servo-status');if(el)el.textContent=text;}"
+              "function connectServoWs(){"
+              "if(servoWsReady||servoWs)return;"
+              "const proto=location.protocol==='https:'?'wss':'ws';"
+              "servoWs=new WebSocket(proto+'://'+location.host+'/servo-ws');"
+              "servoWs.onopen=()=>{servoWsReady=true;setServoStatus('WebSocket');};"
+              "servoWs.onclose=()=>{servoWsReady=false;servoWs=null;setServoStatus('HTTP fallback');};"
+              "servoWs.onerror=()=>{servoWsReady=false;};"
+              "}"
+              "async function sendServo(x,y,center){"
+              "const ms=Number(document.getElementById('servo-ms').value)||40;"
+              "if(servoWsReady&&servoWs){"
+              "if(servoWs.bufferedAmount>64)return {ok:false,skipped:true};"
+              "servoWs.send(center?('c,'+ms):(x+','+y+','+ms));"
+              "document.getElementById('servo-yaw').textContent=center?0:x;"
+              "document.getElementById('servo-roll').textContent=center?0:y;"
+              "return {ok:true,x:center?0:x,y:center?0:y};"
+              "}"
+              "const payload=center?{center:true,ms:ms}:{x:x,y:y,ms:ms};"
+              "const resp=await fetch('/servo',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});"
+              "const data=await resp.json();"
+              "if(!resp.ok||!data.ok){throw new Error(data.error||('HTTP '+resp.status));}"
+              "document.getElementById('servo-yaw').textContent=data.x;"
+              "document.getElementById('servo-roll').textContent=data.y;"
+              "return data;}"
+              "function setJogDot(nx,ny){const dot=document.getElementById('jog-dot');if(dot){dot.style.left=(50+nx*46)+'%';dot.style.top=(50+ny*46)+'%';}}"
+              "function initServoPad(){"
+              "const pad=document.getElementById('jog-pad');if(!pad)return;"
+              "connectServoWs();"
+              "let active=false,last=0,lastYaw=null,lastRoll=null;"
+              "const update=e=>{if(!active)return;const r=pad.getBoundingClientRect();"
+              "const nx=Math.max(-1,Math.min(1,((e.clientX-r.left)/r.width-.5)*2));"
+              "const ny=Math.max(-1,Math.min(1,((e.clientY-r.top)/r.height-.5)*2));"
+              "setJogDot(nx,ny);"
+              "const yaw=Math.round(nx*30);const roll=Math.round(-ny*22);"
+              "document.getElementById('servo-yaw').textContent=yaw;"
+              "document.getElementById('servo-roll').textContent=roll;"
+              "const now=Date.now();if(now-last<20||yaw===lastYaw&&roll===lastRoll)return;last=now;lastYaw=yaw;lastRoll=roll;"
+              "sendServo(yaw,roll,false).catch(err=>setServoStatus('Error: '+err.message));};"
+              "pad.addEventListener('pointerdown',e=>{active=true;pad.setPointerCapture(e.pointerId);update(e);});"
+              "pad.addEventListener('pointermove',update);"
+              "pad.addEventListener('pointerup',()=>{active=false;lastYaw=null;lastRoll=null;});"
+              "pad.addEventListener('pointercancel',()=>{active=false;lastYaw=null;lastRoll=null;});"
+              "}"
               "window.addEventListener('DOMContentLoaded',()=>{"
               "openTab('tab-security');"
+              "initServoPad();"
               "const speakText=document.getElementById('speak-text');"
               "if(speakText){speakText.addEventListener('keydown',e=>{"
               "if(e.key==='Enter'&&!e.shiftKey&&!e.isComposing){e.preventDefault();sendSpeak();}"
@@ -1700,6 +1959,7 @@ static void handle_config_get(WiFiClient& client) {
               "<div class=tabs>"
               "<button type=button class=tab-btn data-tab=tab-security onclick=\"openTab('tab-security')\">Security</button>"
               "<button type=button class=tab-btn data-tab=tab-speak onclick=\"openTab('tab-speak')\">Speak</button>"
+              "<button type=button class=tab-btn data-tab=tab-servo onclick=\"openTab('tab-servo')\">Servo</button>"
               "<button type=button class=tab-btn data-tab=tab-bpm onclick=\"openTab('tab-bpm')\">BPM-Dance</button>"
               "<button type=button class=tab-btn data-tab=tab-general onclick=\"openTab('tab-general')\">General</button>"
               "<button type=button class=tab-btn data-tab=tab-periodic onclick=\"openTab('tab-periodic')\">Periodic</button>"
@@ -1751,6 +2011,23 @@ static void handle_config_get(WiFiClient& client) {
               "<div class=speak-row><button type=button class=mini-btn onclick=sendSpeak()>Send</button><span id=speak-status></span></div>"
               "<p>LLM mode sends the chat history shown in this tab as context.</p>"
               "</div>");
+    html += F("</div>");
+    html += F("<div id=tab-servo class=tab>");
+    html += F("<div class=sec><h3>Servo Jog</h3>"
+              "<div class=servo-grid>"
+              "<div id=jog-pad class=jog-pad>"
+              "<div class=\"jog-axis h\"></div><div class=\"jog-axis v\"></div><div id=jog-dot class=jog-dot></div>"
+              "</div>"
+              "<div class=servo-readout>"
+              "<div>Yaw <b><span id=servo-yaw>0</span></b></div>"
+              "<div>Roll <b><span id=servo-roll>0</span></b></div>"
+              "</div>"
+              "<label>Move ms<input id=servo-ms type=number min=20 max=1000 value=40></label>"
+              "<div class=speak-row>"
+              "<button type=button class=mini-btn onclick=\"sendServo(0,0,true).then(()=>{setJogDot(0,0);document.getElementById('servo-status').textContent='Centered';}).catch(err=>document.getElementById('servo-status').textContent='Error: '+err.message)\">Center</button>"
+              "<span id=servo-status></span>"
+              "</div>"
+              "</div></div>");
     html += F("</div>");
     html += F("<div id=tab-bpm class=tab>");
     html += F("<div class=sec><h3>BPM-Dance</h3>"
@@ -1932,17 +2209,22 @@ static void handle_udp_beat() {
 }
 
 void handle_speak_server() {
+    servo_ws_tick();
+
     WiFiClient client = speak_server.available();
     if (!client) return;
 
     String req_line = client.readStringUntil('\n');
     req_line.trim();
     bool is_get_root    = req_line.startsWith("GET / ");
+    bool is_get_servo_ws = req_line.startsWith("GET /servo-ws");
     bool is_post_beat   = req_line.startsWith("POST /beat");
+    bool is_post_servo  = req_line.startsWith("POST /servo");
     bool is_post_speak  = req_line.startsWith("POST /speak");
     bool is_post_config = req_line.startsWith("POST /config");
 
     int content_length = 0;
+    String ws_key = "";
     while (client.connected()) {
         String line = client.readStringUntil('\n');
         line.trim();
@@ -1950,10 +2232,97 @@ void handle_speak_server() {
         String lower = line; lower.toLowerCase();
         if (lower.startsWith("content-length:"))
             content_length = line.substring(line.indexOf(':') + 1).toInt();
+        if (lower.startsWith("sec-websocket-key:"))
+            ws_key = line.substring(line.indexOf(':') + 1);
     }
+    ws_key.trim();
 
     if (is_get_root)    { handle_config_get(client);            return; }
+    if (is_get_servo_ws) {
+        if (ws_key.isEmpty()) {
+            client.print("HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+            client.stop();
+            return;
+        }
+        servo_ws_stop();
+        String accept = websocket_accept_key(ws_key);
+        client.print("HTTP/1.1 101 Switching Protocols\r\n");
+        client.print("Upgrade: websocket\r\n");
+        client.print("Connection: Upgrade\r\n");
+        client.print("Sec-WebSocket-Accept: ");
+        client.print(accept);
+        client.print("\r\n\r\n");
+        servo_ws_client = client;
+        servo_ws_active = true;
+        servo_ws_last_ms = millis();
+        return;
+    }
     if (is_post_config) { handle_config_post(client, content_length); return; }
+    if (is_post_servo) {
+        String body = "";
+        body.reserve(content_length > 0 ? content_length + 1 : 128);
+        uint32_t deadline = millis() + 1000;
+        while ((int)body.length() < content_length && millis() < deadline) {
+            while (client.available() && (int)body.length() < content_length) {
+                body += (char)client.read();
+                deadline = millis() + 200;
+            }
+            delay(1);
+        }
+
+        if (!servo_ready) {
+            String err = "{\"ok\":false,\"error\":\"servo\"}";
+            client.print("HTTP/1.1 503 Service Unavailable\r\nContent-Type: application/json\r\nContent-Length: ");
+            client.print(err.length());
+            client.print("\r\nConnection: close\r\n\r\n");
+            client.print(err);
+            client.stop();
+            return;
+        }
+        if (busy) {
+            client.print("HTTP/1.1 503 Service Unavailable\r\nContent-Type: application/json\r\nContent-Length: 13\r\nConnection: close\r\n\r\n{\"busy\":true}");
+            client.stop();
+            return;
+        }
+
+        JsonDocument doc;
+        DeserializationError json_error = deserializeJson(doc, body);
+        if (json_error) {
+            String err = "{\"ok\":false,\"error\":\"json\"}";
+            client.print("HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: ");
+            client.print(err.length());
+            client.print("\r\nConnection: close\r\n\r\n");
+            client.print(err);
+            client.stop();
+            return;
+        }
+
+        int move_ms = doc["ms"] | 180;
+        bool center = doc["center"] | false;
+        if (center) {
+            servo_web_center(move_ms);
+        } else {
+            int yaw = constrain((int)(doc["x"] | 0), -45, 45);
+            int roll = constrain((int)(doc["y"] | 0), -35, 35);
+            servo_web_move(srv_cx + yaw, srv_cy - roll, move_ms);
+        }
+
+        String res = "{\"ok\":true,\"x\":";
+        res += String(servo_web_x - srv_cx);
+        res += ",\"y\":";
+        res += String(srv_cy - servo_web_y);
+        res += ",\"target_x\":";
+        res += String(servo_web_x);
+        res += ",\"target_y\":";
+        res += String(servo_web_y);
+        res += "}";
+        client.print("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: ");
+        client.print(res.length());
+        client.print("\r\nConnection: close\r\n\r\n");
+        client.print(res);
+        client.stop();
+        return;
+    }
     if (is_post_beat) {
         String body = "";
         uint32_t deadline = millis() + 1000;
@@ -2873,7 +3242,7 @@ void loop() {
     uint32_t now = millis();
     if (!led_effect_active && time_reached(now, head_touch_next_poll_ms)) {
         head_touch_next_poll_ms = now + 50;
-        if (head_pat_detected()) head_pat_reaction();
+        { HeadGesture g = head_pat_detected(); if (g != GESTURE_NONE) head_pat_reaction(g); }
     }
 
     delay(10);
