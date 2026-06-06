@@ -8,6 +8,10 @@ static long convertSCS0009Pos(int16_t degree) {
   return map(degree, 0, 300, 1023, 0);
 }
 
+static long convertSCS0009PosFloat(float degree) {
+  return constrain(lroundf(1023.0f - (degree * 1023.0f / 300.0f)), 0L, 1023L);
+}
+
 static long convertDYNIXELXL330(int16_t degree) {
   M5_LOGI("Degree: %d\n", degree);
   
@@ -365,6 +369,23 @@ void StackchanSERVO::moveXY(int x, int y, uint32_t millis_for_move) {
   _last_degree_x = x;
   _last_degree_y = y;
   //M5_LOGI("SCS: %d, %d", _last_degree_x, _last_degree_y);
+}
+
+void StackchanSERVO::moveXYContinuous(float x, float y, uint32_t millis_for_move) {
+  if (_servo_type == ServoType::SCS || _servo_type == ServoType::M5_SCS) {
+    if (!isSCSReady(_sc)) {
+      return;
+    }
+    _isMoving = true;
+    _sc.WritePos(AXIS_X + 1, convertSCS0009PosFloat(x + _init_param.servo[AXIS_X].offset), millis_for_move);
+    _sc.WritePos(AXIS_Y + 1, convertSCS0009PosFloat(y + _init_param.servo[AXIS_Y].offset), millis_for_move);
+    _isMoving = false;
+    _last_degree_x = (int)lroundf(x);
+    _last_degree_y = (int)lroundf(y);
+    return;
+  }
+
+  moveXY((int)lroundf(x), (int)lroundf(y), millis_for_move);
 }
 
 void StackchanSERVO::moveXY(servo_param_s servo_param_x, servo_param_s servo_param_y) {

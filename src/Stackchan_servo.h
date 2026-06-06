@@ -86,6 +86,7 @@ class StackchanSERVO {
         void moveX(int x, uint32_t millis_for_move = 0);
         void moveY(int y, uint32_t millis_for_move = 0, bool wait_for_completion = true);
         void moveXY(int x, int y, uint32_t millis_for_move);
+        void moveXYContinuous(float x, float y, uint32_t millis_for_move);
         void moveX(servo_param_s servo_param_x);
         void moveY(servo_param_s servo_param_y);
         void moveXY(servo_param_s servo_param_x, servo_param_s servo_param_y);

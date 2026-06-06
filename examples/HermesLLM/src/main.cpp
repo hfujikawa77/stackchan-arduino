@@ -15,12 +15,18 @@
 #include <Stackchan_system_config.h>
 #include <Stackchan_servo.h>
 #include "Si12T.h"
+#include "MavlinkReceiver.h"
+#include "FlightStateMonitor.h"
+#include "StackChanSpeech.h"
 #include <Avatar.h>
 using namespace m5avatar;
 struct WifiCredential;
 bool touchedZone(int zone);
 void show(const String& text);
 void handle_speak_server();
+static bool speak_mavlink_notification(const String& text);
+static void mavlink_notification_tick();
+static void mavlink_receive_tick(bool allow_speech);
 static void load_wifi_credentials_from_yaml(const String& normalized_yaml);
 static void replace_wifi_yaml_sections(String& yaml, WifiCredential entries[], size_t entry_count);
 static void led_force_clear();
@@ -29,6 +35,9 @@ static void speech_scroll_start(const String& text);
 static void speech_scroll_tick();
 static void speech_scroll_run_to_end(uint8_t repeat_count = 3);
 static void speech_scroll_stop();
+static bool play_wav_file(const char* path);
+static bool call_tts_cache_wav(const String& text, const char* cache_path);
+static String mavlink_notification_audio_path(const String& text);
 static const char B64_TABLE[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 static size_t base64_encode(uint8_t* out, const uint8_t* in, size_t in_len) {
     size_t j = 0;
@@ -96,7 +105,38 @@ static AppMode app_mode = MODE_NORMAL;
 static int setting_volume     = 80;
 static int setting_brightness = 200;
 static int setting_wifi_index = 0;
+static bool setting_attitude_servo_enabled = false;
+static bool setting_rc_follow_enabled = false;
+static bool setting_attitude_yaw_source_roll = false;
+static int setting_attitude_scale = 50;
+static uint8_t setting_page = 0;
 static int brightness_val     = 200;
+static bool mavlink_attitude_servo_enabled = false;
+static bool mavlink_rc_follow_enabled = false;
+static bool mavlink_attitude_yaw_source_roll = false;
+static int mavlink_attitude_scale = 50;
+static uint32_t mavlink_attitude_next_servo_ms = 0;
+static bool mavlink_attitude_filter_ready = false;
+static bool mavlink_attitude_target_ready = false;
+static bool mavlink_attitude_latest_ready = false;
+static float mavlink_attitude_latest_yaw = 0.0f;
+static float mavlink_attitude_latest_roll = 0.0f;
+static float mavlink_attitude_latest_pitch = 0.0f;
+static float mavlink_attitude_zero_yaw_source = 0.0f;
+static float mavlink_attitude_zero_pitch = 0.0f;
+static float mavlink_attitude_target_x = 0.0f;
+static float mavlink_attitude_target_y = 0.0f;
+static float mavlink_attitude_filtered_x = 0.0f;
+static float mavlink_attitude_filtered_y = 0.0f;
+static float mavlink_attitude_last_x = 0.0f;
+static float mavlink_attitude_last_y = 0.0f;
+static uint32_t mavlink_attitude_servo_commands = 0;
+static uint32_t mavlink_attitude_servo_commands_last = 0;
+static uint32_t mavlink_attitude_servo_skips = 0;
+static uint32_t mavlink_attitude_servo_skips_last = 0;
+static uint32_t mavlink_attitude_servo_next_log_ms = 0;
+static uint32_t normal_touch_guard_until_ms = 0;
+static bool normal_touch_guard_wait_release = false;
 static constexpr size_t WIFI_MAX = 3;
 struct WifiCredential {
     String ssid;
@@ -284,6 +324,13 @@ static volatile bool busy = false;
 static volatile bool web_tts_pending = false;
 static String web_tts_text = "";
 static uint32_t error_clear_at_ms = 0;
+static MavlinkReceiver mavlink_receiver;
+static FlightStateMonitor flight_state_monitor;
+static StackChanSpeech stackchan_speech;
+static String mavlink_pending_notification = "";
+static bool rc_ch5_greeting_active = false;
+static bool rc_ch6_school_greeting_active = false;
+static int8_t rc_ch9_posture_state = -1;
 
 // --- Conversation history ---
 static constexpr int CHAT_HISTORY_MAX = 8;
@@ -797,6 +844,143 @@ static int clamp_servo_axis(int axis, int value) {
     return constrain(value, info->lower_limit, info->upper_limit);
 }
 
+static float clamp_servo_axis_float(int axis, float value) {
+    auto* info = system_config.getServoInfo(axis == AXIS_X ? AXIS_X : AXIS_Y);
+    if (!info) return value;
+    return constrain(value, (float)info->lower_limit, (float)info->upper_limit);
+}
+
+static float attitude_rad_to_servo_deg(float radians) {
+    const float degrees = radians * 180.0f / PI;
+    return degrees * (float)mavlink_attitude_scale / 100.0f;
+}
+
+static void servo_attitude_set_target(const MavlinkAttitude& attitude) {
+    float yaw = attitude_rad_to_servo_deg(attitude.yaw);
+    float roll = attitude_rad_to_servo_deg(attitude.roll);
+    float yaw_source = mavlink_attitude_yaw_source_roll ? roll : yaw;
+    float pitch = attitude_rad_to_servo_deg(attitude.pitch);
+    mavlink_attitude_latest_yaw = yaw;
+    mavlink_attitude_latest_roll = roll;
+    mavlink_attitude_latest_pitch = pitch;
+    mavlink_attitude_latest_ready = true;
+
+    if (!servo_ready || !mavlink_attitude_servo_enabled || busy || app_mode != MODE_NORMAL) {
+        if (!mavlink_rc_follow_enabled) {
+            mavlink_attitude_filter_ready = false;
+            mavlink_attitude_target_ready = false;
+        }
+        return;
+    }
+
+    const float yaw_delta = yaw_source - mavlink_attitude_zero_yaw_source;
+    const float pitch_delta = pitch - mavlink_attitude_zero_pitch;
+    float target_x = mavlink_attitude_yaw_source_roll ? srv_cx + yaw_delta : srv_cx - yaw_delta;
+    float target_y = srv_cy - pitch_delta;
+
+    mavlink_attitude_target_x = clamp_servo_axis_float(AXIS_X, target_x);
+    mavlink_attitude_target_y = clamp_servo_axis_float(AXIS_Y, target_y);
+    mavlink_attitude_target_ready = true;
+}
+
+static float rc_channel_to_servo_axis(uint16_t raw, int axis) {
+    auto* info = system_config.getServoInfo(axis == AXIS_X ? AXIS_X : AXIS_Y);
+    if (!info) return axis == AXIS_X ? srv_cx : srv_cy;
+
+    const float center = axis == AXIS_X ? srv_cx : srv_cy;
+    const float value = constrain((float)raw, 1000.0f, 2000.0f);
+    if (value >= 1500.0f) {
+        return center + (value - 1500.0f) * ((float)info->upper_limit - center) / 500.0f;
+    }
+    return center - (1500.0f - value) * (center - (float)info->lower_limit) / 500.0f;
+}
+
+static void servo_rc_follow_set_target(const MavlinkRcChannels& rc_channels) {
+    if (!servo_ready || !mavlink_rc_follow_enabled || busy || app_mode != MODE_NORMAL
+        || rc_channels.ch1_raw == UINT16_MAX || rc_channels.ch2_raw == UINT16_MAX) {
+        return;
+    }
+
+    mavlink_attitude_target_x = clamp_servo_axis_float(AXIS_X, rc_channel_to_servo_axis(rc_channels.ch1_raw, AXIS_X));
+    mavlink_attitude_target_y = clamp_servo_axis_float(AXIS_Y, rc_channel_to_servo_axis(rc_channels.ch2_raw, AXIS_Y));
+    mavlink_attitude_target_ready = true;
+}
+
+static void servo_attitude_reset_front() {
+    if (mavlink_attitude_latest_ready) {
+        mavlink_attitude_zero_yaw_source = setting_attitude_yaw_source_roll
+                                         ? mavlink_attitude_latest_roll
+                                         : mavlink_attitude_latest_yaw;
+        mavlink_attitude_zero_pitch = mavlink_attitude_latest_pitch;
+    } else {
+        mavlink_attitude_zero_yaw_source = 0.0f;
+        mavlink_attitude_zero_pitch = 0.0f;
+    }
+
+    mavlink_attitude_target_x = srv_cx;
+    mavlink_attitude_target_y = srv_cy;
+    mavlink_attitude_filtered_x = srv_cx;
+    mavlink_attitude_filtered_y = srv_cy;
+    mavlink_attitude_last_x = srv_cx;
+    mavlink_attitude_last_y = srv_cy;
+    mavlink_attitude_filter_ready = true;
+    mavlink_attitude_target_ready = true;
+    mavlink_attitude_next_servo_ms = millis();
+    if (servo_ready) {
+        sc_servo.moveXYContinuous((float)srv_cx, (float)srv_cy, 180);
+    }
+}
+
+static void servo_attitude_tick() {
+    const uint32_t now = millis();
+    if (!servo_ready || (!mavlink_attitude_servo_enabled && !mavlink_rc_follow_enabled)
+        || busy || app_mode != MODE_NORMAL || !mavlink_attitude_target_ready) {
+        mavlink_attitude_filter_ready = false;
+        return;
+    }
+    if (!time_reached(now, mavlink_attitude_next_servo_ms)) return;
+
+    if (!mavlink_attitude_filter_ready) {
+        mavlink_attitude_filtered_x = srv_cx;
+        mavlink_attitude_filtered_y = srv_cy;
+        mavlink_attitude_last_x = srv_cx;
+        mavlink_attitude_last_y = srv_cy;
+        mavlink_attitude_filter_ready = true;
+    } else {
+        constexpr float alpha = 0.32f;
+        mavlink_attitude_filtered_x += (mavlink_attitude_target_x - mavlink_attitude_filtered_x) * alpha;
+        mavlink_attitude_filtered_y += (mavlink_attitude_target_y - mavlink_attitude_filtered_y) * alpha;
+    }
+
+    const float smooth_x = clamp_servo_axis_float(AXIS_X, mavlink_attitude_filtered_x);
+    const float smooth_y = clamp_servo_axis_float(AXIS_Y, mavlink_attitude_filtered_y);
+    if (fabsf(smooth_x - mavlink_attitude_last_x) < 0.05f && fabsf(smooth_y - mavlink_attitude_last_y) < 0.05f) {
+        mavlink_attitude_servo_skips++;
+        mavlink_attitude_next_servo_ms = now + 10;
+        return;
+    }
+
+    servo_idle_enabled = false;
+    sc_servo.moveXYContinuous(smooth_x, smooth_y, 60);
+    mavlink_attitude_last_x = smooth_x;
+    mavlink_attitude_last_y = smooth_y;
+    mavlink_attitude_servo_commands++;
+    mavlink_attitude_next_servo_ms = millis() + 10;
+
+    if (mavlink_attitude_servo_next_log_ms == 0 || time_reached(now, mavlink_attitude_servo_next_log_ms)) {
+        Serial.printf("[MAVLink] servo target=(%.2f,%.2f) filtered=(%.2f,%.2f) cmd_delta=%lu skip_delta=%lu\n",
+                      mavlink_attitude_target_x,
+                      mavlink_attitude_target_y,
+                      smooth_x,
+                      smooth_y,
+                      static_cast<unsigned long>(mavlink_attitude_servo_commands - mavlink_attitude_servo_commands_last),
+                      static_cast<unsigned long>(mavlink_attitude_servo_skips - mavlink_attitude_servo_skips_last));
+        mavlink_attitude_servo_commands_last = mavlink_attitude_servo_commands;
+        mavlink_attitude_servo_skips_last = mavlink_attitude_servo_skips;
+        mavlink_attitude_servo_next_log_ms = now + 2000;
+    }
+}
+
 static void servo_web_move(int x, int y, int move_ms) {
     if (!servo_ready) return;
     servo_idle_enabled = false;
@@ -958,6 +1142,7 @@ static bool ensure_wifi_connected(uint32_t timeout_ms = 15000) {
         WiFi.begin(wifi_credentials[i].ssid.c_str(), wifi_credentials[i].password.c_str());
         uint32_t started_ms = millis();
         while (WiFi.status() != WL_CONNECTED && (millis() - started_ms) < timeout_ms) {
+            mavlink_receive_tick(false);
             delay(500);
             M5.update();
         }
@@ -1032,6 +1217,11 @@ void load_hermes_config(fs::FS& fs) {
     load_wifi_credentials_from_yaml(normalized_yaml);
     brightness_val = extractInt("brightness", brightness_val);
     servo_on_boot = extractInt("servo_on_boot", servo_on_boot ? 1 : 0) != 0;
+    mavlink_attitude_servo_enabled = extractInt("mavlink_attitude_servo", mavlink_attitude_servo_enabled ? 1 : 0) != 0;
+    mavlink_rc_follow_enabled = extractInt("mavlink_rc_follow", mavlink_rc_follow_enabled ? 1 : 0) != 0;
+    if (mavlink_rc_follow_enabled) mavlink_attitude_servo_enabled = false;
+    mavlink_attitude_yaw_source_roll = extractInt("mavlink_yaw_source_roll", mavlink_attitude_yaw_source_roll ? 1 : 0) != 0;
+    mavlink_attitude_scale = constrain(extractInt("mavlink_attitude_scale", mavlink_attitude_scale), 0, 100);
     play_bpm = clamp_bpm_value(extractInt("play_bpm", play_bpm));
 
     periodic_mode_enabled = extractInt("periodic_enabled", 0) != 0;
@@ -1266,8 +1456,10 @@ static void play_wav(uint8_t* wav_buf, int read_len) {
             pos += 8 + ((chunk_size + 1) & ~1u);
         }
     }
-    uint32_t speak_next_ms = millis() + 900;
+    uint32_t speak_next_ms = millis() + 700;
     bool speak_phase = false;
+    uint8_t speak_motion_step = 0;
+    int speak_horizontal_direction = 1;
     M5.Speaker.setVolume(tts_volume);
     uint32_t audio_ms = 0;
     if (read_len > (int)data_offset && sample_rate > 0) {
@@ -1284,15 +1476,165 @@ static void play_wav(uint8_t* wav_buf, int read_len) {
         if (servo_ready) {
             uint32_t now = millis();
             if (now >= speak_next_ms) {
-                speak_phase = !speak_phase;
-                sc_servo.moveY(speak_phase ? srv_cy - 8 : srv_cy, 500, false);
+                const uint8_t motion_phase = speak_motion_step % 7;
+                if (motion_phase == 5) {
+                    speak_horizontal_direction = random(0, 2) == 0 ? -1 : 1;
+                    const int target_x = clamp_servo_axis(AXIS_X, srv_cx + speak_horizontal_direction * 22);
+                    const int target_y = clamp_servo_axis(AXIS_Y, srv_cy - 4);
+                    sc_servo.moveXYContinuous((float)target_x, (float)target_y, 450);
+                } else if (motion_phase == 6) {
+                    sc_servo.moveXYContinuous((float)srv_cx, (float)srv_cy, 450);
+                } else {
+                    speak_phase = !speak_phase;
+                    const int target_y = clamp_servo_axis(AXIS_Y, speak_phase ? srv_cy - 16 : srv_cy + 4);
+                    sc_servo.moveY(target_y, 500, false);
+                }
                 avatar.setMouthOpenRatio(speak_phase ? random(30, 65) / 100.0f : 0.05f);
-                speak_next_ms = now + 900;
+                speak_motion_step++;
+                speak_next_ms = now + 700;
             }
         }
     }
     avatar.setMouthOpenRatio(0.0f);
     if (servo_ready) sc_servo.moveXY(srv_cx, srv_cy, 500);
+}
+
+static bool play_wav_file(const char* path) {
+    File file = SPIFFS.open(path, "r");
+    if (!file) {
+        return false;
+    }
+
+    const size_t file_size = file.size();
+    if (file_size < 44) {
+        M5_LOGE("WAV file too small: %s", path);
+        file.close();
+        return false;
+    }
+
+    uint8_t* wav_buf = (uint8_t*)heap_caps_malloc(file_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!wav_buf) {
+        M5_LOGE("WAV malloc failed: %s (%u bytes)", path, (unsigned)file_size);
+        file.close();
+        return false;
+    }
+
+    const size_t read_len = file.read(wav_buf, file_size);
+    file.close();
+    if (read_len != file_size) {
+        M5_LOGE("WAV read failed: %s (%u/%u bytes)", path, (unsigned)read_len, (unsigned)file_size);
+        heap_caps_free(wav_buf);
+        return false;
+    }
+
+    M5_LOGI("Play cached WAV: %s (%u bytes)", path, (unsigned)file_size);
+    play_wav(wav_buf, (int)read_len);
+    heap_caps_free(wav_buf);
+    return true;
+}
+
+static bool save_and_play_wav(uint8_t* wav_buf, int read_len, const char* cache_path) {
+    if (cache_path && cache_path[0]) {
+        File out = SPIFFS.open(cache_path, "w");
+        if (out) {
+            const size_t written = out.write(wav_buf, read_len);
+            out.close();
+            if (written == (size_t)read_len) {
+                M5_LOGI("Cached WAV: %s (%d bytes)", cache_path, read_len);
+            } else {
+                M5_LOGE("Cache WAV write incomplete: %s (%u/%d)", cache_path, (unsigned)written, read_len);
+            }
+        } else {
+            M5_LOGE("Cache WAV open failed: %s", cache_path);
+        }
+    }
+
+    play_wav(wav_buf, read_len);
+    return true;
+}
+
+static bool call_tts_cache_wav(const String& text, const char* cache_path) {
+    bpm_stop_audio();
+    if (!ensure_wifi_connected()) return false;
+
+    if (!voicevox_host.isEmpty()) {
+        String base = "http://" + voicevox_host;
+        String speaker_str = String(voicevox_speaker);
+
+        HTTPClient http1;
+        WiFiClient c1;
+        http1.begin(c1, base + "/audio_query?text=" + url_encode(text) + "&speaker=" + speaker_str);
+        http1.setTimeout(10000);
+        int st1 = http1.POST("");
+        if (st1 != 200) { M5_LOGE("audio_query error: %d", st1); http1.end(); return false; }
+        String query_json = http1.getString();
+        http1.end();
+
+        HTTPClient http2;
+        WiFiClient c2;
+        http2.begin(c2, base + "/synthesis?speaker=" + speaker_str);
+        http2.setTimeout(15000);
+        http2.addHeader("Content-Type", "application/json");
+        int st2 = http2.POST(query_json);
+        if (st2 != 200) { M5_LOGE("synthesis error: %d", st2); http2.end(); return false; }
+
+        int wav_size = http2.getSize();
+        if (wav_size <= 0) wav_size = 512 * 1024;
+        uint8_t* wav_buf = (uint8_t*)heap_caps_malloc(wav_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (!wav_buf) { M5_LOGE("malloc failed"); http2.end(); return false; }
+        int read_len = http2.getStream().readBytes(wav_buf, wav_size);
+        http2.end();
+
+        bool ok = read_len > 44 && save_and_play_wav(wav_buf, read_len, cache_path);
+        heap_caps_free(wav_buf);
+        return ok;
+    }
+
+    String api_key = system_config.getAPISetting()->tts;
+    if (api_key.isEmpty()) { M5_LOGE("TTS API key not set"); return false; }
+
+    String synth_url = String("https://api.tts.quest/v3/voicevox/synthesis?text=")
+                     + url_encode(text) + "&speaker=1&key=" + api_key;
+    HTTPClient http1;
+    WiFiClientSecure c1; c1.setInsecure();
+    http1.begin(c1, synth_url);
+    http1.setTimeout(15000);
+    int st1 = http1.GET();
+    if (st1 != 200) { M5_LOGE("TTS synth error: %d", st1); http1.end(); return false; }
+
+    String json_resp = http1.getString();
+    http1.end();
+
+    JsonDocument jdoc;
+    if (deserializeJson(jdoc, json_resp)) { M5_LOGE("TTS JSON parse error"); return false; }
+    if (!jdoc["success"].as<bool>()) {
+        M5_LOGE("TTS API success=false: %s", jdoc["errorMessage"].as<const char*>());
+        return false;
+    }
+
+    String wav_url = jdoc["wavDownloadUrl"].as<String>();
+    if (wav_url.isEmpty()) return false;
+    for (int i = 0; i < 10; ++i) {
+        HTTPClient http2;
+        WiFiClientSecure c2; c2.setInsecure();
+        http2.begin(c2, wav_url);
+        http2.setTimeout(15000);
+        int st2 = http2.GET();
+        if (st2 == 200) {
+            int wav_size = http2.getSize();
+            if (wav_size <= 0) wav_size = 512 * 1024;
+            uint8_t* wav_buf = (uint8_t*)heap_caps_malloc(wav_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+            if (!wav_buf) { M5_LOGE("malloc failed"); http2.end(); return false; }
+            int read_len = http2.getStream().readBytes(wav_buf, wav_size);
+            http2.end();
+            bool ok = read_len > 44 && save_and_play_wav(wav_buf, read_len, cache_path);
+            heap_caps_free(wav_buf);
+            return ok;
+        }
+        http2.end();
+        delay(1000);
+    }
+    return false;
 }
 
 bool call_tts_local(const String& text) {
@@ -2533,6 +2875,10 @@ static void save_settings() {
     replace_wifi_yaml_sections(yaml, wifi_credentials, wifi_credential_count);
     update_yaml_int_value(yaml, "tts_volume", setting_volume);
     update_yaml_int_value(yaml, "brightness", setting_brightness);
+    update_yaml_int_value(yaml, "mavlink_attitude_servo", setting_attitude_servo_enabled ? 1 : 0);
+    update_yaml_int_value(yaml, "mavlink_rc_follow", setting_rc_follow_enabled ? 1 : 0);
+    update_yaml_int_value(yaml, "mavlink_yaw_source_roll", setting_attitude_yaw_source_roll ? 1 : 0);
+    update_yaml_int_value(yaml, "mavlink_attitude_scale", setting_attitude_scale);
     File fw = SPIFFS.open("/yaml/SC_SecConfig.yaml", "w");
     if (!fw) { M5_LOGE("save_settings: write failed"); return; }
     fw.print(yaml);
@@ -2542,8 +2888,8 @@ static void save_settings() {
 }
 
 static void draw_wifi_list() {
-    M5.Display.fillRoundRect(6, 24, 308, 68, 5, TFT_NAVY);
-    M5.Display.drawRoundRect(6, 24, 308, 68, 5, TFT_CYAN);
+    M5.Display.fillRoundRect(6, 24, 308, 56, 5, TFT_NAVY);
+    M5.Display.drawRoundRect(6, 24, 308, 56, 5, TFT_CYAN);
     M5.Display.setTextSize(1);
     M5.Display.setTextColor(TFT_CYAN, TFT_NAVY);
     M5.Display.setCursor(14, 29);
@@ -2560,13 +2906,13 @@ static void draw_wifi_list() {
     }
 
     for (size_t i = 0; i < wifi_credential_count; ++i) {
-        int row_y = 42 + (int)i * 15;
+        int row_y = 41 + (int)i * 12;
         bool selected = (int)i == setting_wifi_index;
         uint16_t bg = selected ? TFT_DARKGREEN : TFT_NAVY;
         uint16_t fg = selected ? TFT_WHITE : TFT_LIGHTGREY;
-        M5.Display.fillRoundRect(12, row_y, 292, 14, 3, bg);
+        M5.Display.fillRoundRect(12, row_y, 292, 12, 3, bg);
         M5.Display.setTextColor(fg, bg);
-        M5.Display.setCursor(18, row_y + 3);
+        M5.Display.setCursor(18, row_y + 2);
         M5.Display.print(selected ? "> " : "  ");
         String ssid = wifi_credentials[i].ssid;
         if (ssid.length() > 30) ssid = ssid.substring(0, 29) + ".";
@@ -2576,10 +2922,10 @@ static void draw_wifi_list() {
 
 static void draw_slider_row(int y, const char* label, int val) {
     const int bar_x = 8, bar_w = 304, bar_h = 14;
-    const int bar_y = y + 18;
+    const int bar_y = y + 16;
     int filled = val * bar_w / 255;
 
-    M5.Display.fillRect(0, y, 320, 48, TFT_BLACK);
+    M5.Display.fillRect(0, y, 320, 40, TFT_BLACK);
     M5.Display.setTextSize(1);
     M5.Display.setTextColor(TFT_WHITE, TFT_BLACK);
     M5.Display.setCursor(8, y + 2);
@@ -2595,8 +2941,41 @@ static void draw_slider_row(int y, const char* label, int val) {
     M5.Display.drawRect(bar_x, bar_y, bar_w, bar_h, TFT_WHITE);
     M5.Display.setTextSize(1);
     M5.Display.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
-    M5.Display.setCursor(8, y + 36);
-    M5.Display.print("Swipe on the bar to adjust");
+}
+
+static void draw_attitude_settings_row() {
+    M5.Display.fillRect(0, 84, 320, 114, TFT_BLACK);
+    M5.Display.setTextSize(1);
+    M5.Display.setTextColor(TFT_WHITE, TFT_BLACK);
+    M5.Display.setCursor(8, 86);
+    M5.Display.print("Servo follow mode");
+
+    M5.Display.fillRoundRect(8, 103, 144, 24, 4, setting_attitude_servo_enabled ? TFT_DARKGREEN : TFT_DARKGREY);
+    M5.Display.setTextColor(TFT_WHITE, setting_attitude_servo_enabled ? TFT_DARKGREEN : TFT_DARKGREY);
+    M5.Display.setCursor(48, 111);
+    M5.Display.print(setting_attitude_servo_enabled ? "IMU ON" : "IMU OFF");
+
+    M5.Display.fillRoundRect(160, 103, 152, 24, 4, setting_rc_follow_enabled ? TFT_DARKGREEN : TFT_DARKGREY);
+    M5.Display.setTextColor(TFT_WHITE, setting_rc_follow_enabled ? TFT_DARKGREEN : TFT_DARKGREY);
+    M5.Display.setCursor(206, 111);
+    M5.Display.print(setting_rc_follow_enabled ? "RC ON" : "RC OFF");
+
+    M5.Display.fillRoundRect(8, 133, 144, 24, 4, TFT_NAVY);
+    M5.Display.setTextColor(TFT_WHITE, TFT_NAVY);
+    M5.Display.setCursor(25, 141);
+    M5.Display.print(setting_attitude_yaw_source_roll ? "Yaw: FC Roll" : "Yaw: FC Yaw");
+
+    M5.Display.fillRoundRect(160, 133, 152, 24, 4, TFT_DARKGREY);
+    M5.Display.setTextColor(TFT_WHITE, TFT_DARKGREY);
+    M5.Display.setCursor(202, 141);
+    M5.Display.print("Scale ");
+    M5.Display.print(setting_attitude_scale);
+    M5.Display.print("%");
+
+    M5.Display.fillRoundRect(8, 163, 304, 28, 4, TFT_MAROON);
+    M5.Display.setTextColor(TFT_WHITE, TFT_MAROON);
+    M5.Display.setCursor(120, 173);
+    M5.Display.print("Reset Front");
 }
 
 static void draw_settings_ui() {
@@ -2605,15 +2984,30 @@ static void draw_settings_ui() {
     M5.Display.setTextColor(TFT_YELLOW, TFT_BLACK);
     M5.Display.setCursor(8, 8);
     M5.Display.print("Settings");
+    M5.Display.fillRoundRect(90, 4, 54, 22, 4, setting_page == 0 ? TFT_NAVY : TFT_DARKGREY);
+    M5.Display.setTextColor(TFT_WHITE, setting_page == 0 ? TFT_NAVY : TFT_DARKGREY);
+    M5.Display.setCursor(108, 11);
+    M5.Display.print("Main");
+    M5.Display.fillRoundRect(150, 4, 86, 22, 4, setting_page == 1 ? TFT_NAVY : TFT_DARKGREY);
+    M5.Display.setTextColor(TFT_WHITE, setting_page == 1 ? TFT_NAVY : TFT_DARKGREY);
+    M5.Display.setCursor(166, 11);
+    M5.Display.print("Flight");
     M5.Display.fillRoundRect(280, 4, 36, 28, 4, TFT_DARKGREY);
     M5.Display.setTextColor(TFT_WHITE, TFT_DARKGREY);
     M5.Display.setCursor(288, 10);
     M5.Display.print("X");
-    draw_wifi_list();
-    M5.Display.drawLine(0, 96, 320, 96, TFT_DARKGREY);
-    draw_slider_row(100, "Volume", setting_volume);
-    M5.Display.drawLine(0, 148, 320, 148, TFT_DARKGREY);
-    draw_slider_row(152, "Brightness", setting_brightness);
+    if (setting_page == 0) {
+        draw_wifi_list();
+        M5.Display.drawLine(0, 82, 320, 82, TFT_DARKGREY);
+        draw_slider_row(84, "Volume", setting_volume);
+        M5.Display.drawLine(0, 124, 320, 124, TFT_DARKGREY);
+        draw_slider_row(126, "Brightness", setting_brightness);
+    } else {
+        M5.Display.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
+        M5.Display.setCursor(8, 42);
+        M5.Display.print("Select IMU or RC follow mode.");
+        draw_attitude_settings_row();
+    }
     M5.Display.drawLine(0, 200, 320, 200, TFT_DARKGREY);
     M5.Display.fillRoundRect(10, 204, 135, 30, 6, TFT_DARKGREY);
     M5.Display.setTextColor(TFT_WHITE, TFT_DARKGREY);
@@ -2632,6 +3026,11 @@ static void settings_enter() {
     setting_volume = tts_volume;
     setting_brightness = brightness_val;
     setting_wifi_index = current_wifi_credential_index();
+    setting_attitude_servo_enabled = mavlink_attitude_servo_enabled;
+    setting_rc_follow_enabled = mavlink_rc_follow_enabled;
+    setting_attitude_yaw_source_roll = mavlink_attitude_yaw_source_roll;
+    setting_attitude_scale = mavlink_attitude_scale;
+    setting_page = 0;
     avatar.suspend();
     draw_settings_ui();
 }
@@ -2640,6 +3039,13 @@ static void settings_exit(bool save) {
     if (save) {
         tts_volume = setting_volume;
         brightness_val = setting_brightness;
+        mavlink_attitude_servo_enabled = setting_attitude_servo_enabled;
+        mavlink_rc_follow_enabled = setting_rc_follow_enabled;
+        if (mavlink_rc_follow_enabled) mavlink_attitude_servo_enabled = false;
+        mavlink_attitude_filter_ready = false;
+        mavlink_attitude_target_ready = false;
+        mavlink_attitude_yaw_source_roll = setting_attitude_yaw_source_roll;
+        mavlink_attitude_scale = setting_attitude_scale;
         M5.Display.setBrightness(brightness_val);
         save_settings();
         WiFi.disconnect(false, false);
@@ -2648,6 +3054,8 @@ static void settings_exit(bool save) {
         }
     }
     app_mode = MODE_NORMAL;
+    normal_touch_guard_until_ms = millis() + 350;
+    normal_touch_guard_wait_release = true;
     M5.Display.fillScreen(TFT_BLACK);
     avatar.resume();
 }
@@ -2661,14 +3069,58 @@ static void handle_settings_touch() {
     if (touch.wasPressed()) {
         if (tx >= 280 && ty >= 4 && ty <= 32) { settings_exit(false); return; }
         if (tx >= 10 && tx <= 145 && ty >= 204 && ty <= 234) { settings_exit(false); return; }
+        if (tx >= 90 && tx <= 144 && ty >= 4 && ty <= 26) {
+            setting_page = 0;
+            draw_settings_ui();
+            return;
+        }
+        if (tx >= 150 && tx <= 236 && ty >= 4 && ty <= 26) {
+            setting_page = 1;
+            draw_settings_ui();
+            return;
+        }
     }
     // Save
     if (touch.wasPressed()) {
         if (tx >= 165 && tx <= 310 && ty >= 204 && ty <= 234) { settings_exit(true); return; }
     }
 
-    if (touch.wasPressed() && tx >= 12 && tx <= 304 && ty >= 42 && ty <= 86 && wifi_credential_count > 0) {
-        int next_index = (ty - 42) / 15;
+    if (setting_page == 1) {
+        if (touch.wasPressed() && tx >= 8 && tx <= 152 && ty >= 103 && ty <= 127) {
+            setting_attitude_servo_enabled = !setting_attitude_servo_enabled;
+            if (setting_attitude_servo_enabled) setting_rc_follow_enabled = false;
+            draw_attitude_settings_row();
+            return;
+        }
+        if (touch.wasPressed() && tx >= 160 && tx <= 312 && ty >= 103 && ty <= 127) {
+            setting_rc_follow_enabled = !setting_rc_follow_enabled;
+            if (setting_rc_follow_enabled) setting_attitude_servo_enabled = false;
+            draw_attitude_settings_row();
+            return;
+        }
+        if (touch.wasPressed() && tx >= 8 && tx <= 152 && ty >= 133 && ty <= 157) {
+            setting_attitude_yaw_source_roll = !setting_attitude_yaw_source_roll;
+            draw_attitude_settings_row();
+            return;
+        }
+        if (touch.wasPressed() && tx >= 160 && tx <= 312 && ty >= 133 && ty <= 157) {
+            setting_attitude_scale += 25;
+            if (setting_attitude_scale > 100) setting_attitude_scale = 0;
+            draw_attitude_settings_row();
+            return;
+        }
+        if (touch.wasPressed() && tx >= 8 && tx <= 312 && ty >= 163 && ty <= 191) {
+            mavlink_attitude_yaw_source_roll = setting_attitude_yaw_source_roll;
+            mavlink_attitude_scale = setting_attitude_scale;
+            servo_attitude_reset_front();
+            draw_attitude_settings_row();
+            return;
+        }
+        return;
+    }
+
+    if (touch.wasPressed() && tx >= 12 && tx <= 304 && ty >= 41 && ty <= 77 && wifi_credential_count > 0) {
+        int next_index = (ty - 41) / 12;
         if (next_index >= 0 && (size_t)next_index < wifi_credential_count) {
             setting_wifi_index = next_index;
             draw_wifi_list();
@@ -2684,21 +3136,21 @@ static void handle_settings_touch() {
         return constrain(value, min_val, max_val);
     };
 
-    if (ty >= 118 && ty <= 132 && tx >= 8 && tx <= 312) {
+    if (ty >= 100 && ty <= 114 && tx >= 8 && tx <= 312) {
         int next_volume = apply_slider_value(tx, 0, 255);
         if (next_volume != setting_volume) {
             setting_volume = next_volume;
-            draw_slider_row(100, "Volume", setting_volume);
+            draw_slider_row(84, "Volume", setting_volume);
         }
         return;
     }
 
-    if (ty >= 170 && ty <= 184 && tx >= 8 && tx <= 312) {
+    if (ty >= 142 && ty <= 156 && tx >= 8 && tx <= 312) {
         int next_brightness = apply_slider_value(tx, 20, 255);
         if (next_brightness != setting_brightness) {
             setting_brightness = next_brightness;
             M5.Display.setBrightness(setting_brightness);
-            draw_slider_row(152, "Brightness", setting_brightness);
+            draw_slider_row(126, "Brightness", setting_brightness);
         }
         return;
     }
@@ -2994,6 +3446,165 @@ static void bpm_play_tick() {
     }
 }
 
+static bool speak_mavlink_notification(const String& text) {
+    if (busy) return false;
+
+    busy = true;
+    clear_error_state();
+    avatar.setExpression(Expression::Happy);
+    led_set(LED_SPEAKING);
+    show("[MAVLink] " + text);
+    chat_add(false, text);
+    speech_scroll_start(text);
+
+    const String audio_path = mavlink_notification_audio_path(text);
+    bool ok = false;
+    if (!audio_path.isEmpty() && SPIFFS.exists(audio_path)) {
+        ok = play_wav_file(audio_path.c_str());
+    }
+    if (!ok) {
+        ok = !audio_path.isEmpty()
+             ? call_tts_cache_wav(text, audio_path.c_str())
+             : call_tts(text);
+    }
+    speech_scroll_stop();
+    avatar.setExpression(Expression::Neutral);
+    led_set(LED_OFF);
+    show("");
+    busy = false;
+    return ok;
+}
+
+static String mavlink_notification_audio_path(const String& text) {
+    if (text == "アームしました") return "/audio/mav_arm.wav";
+    if (text == "ディスアームしました") return "/audio/mav_disarm.wav";
+    if (text.indexOf("アーム中です") >= 0) return "/audio/mav_armed.wav";
+    if (text.indexOf("ディスアーム中です") >= 0) return "/audio/mav_disarmed.wav";
+
+    if (text.indexOf("マニュアルモードです") >= 0) return "/audio/mav_mode_manual.wav";
+    if (text.indexOf("アクロモードです") >= 0) return "/audio/mav_mode_acro.wav";
+    if (text.indexOf("ステアリングモードです") >= 0) return "/audio/mav_mode_steering.wav";
+    if (text.indexOf("ホールドモードです") >= 0) return "/audio/mav_mode_hold.wav";
+    if (text.indexOf("ロイターモードです") >= 0) return "/audio/mav_mode_loiter.wav";
+    if (text.indexOf("フォローモードです") >= 0) return "/audio/mav_mode_follow.wav";
+    if (text.indexOf("シンプルモードです") >= 0) return "/audio/mav_mode_simple.wav";
+    if (text.indexOf("ドックモードです") >= 0) return "/audio/mav_mode_dock.wav";
+    if (text.indexOf("サークルモードです") >= 0) return "/audio/mav_mode_circle.wav";
+    if (text.indexOf("オートモードです") >= 0) return "/audio/mav_mode_auto.wav";
+    if (text.indexOf("スマート アールティーエルモードです") >= 0) return "/audio/mav_mode_smart_rtl.wav";
+    if (text.indexOf("アールティーエルモードです") >= 0) return "/audio/mav_mode_rtl.wav";
+    if (text.indexOf("ガイデッドモードです") >= 0) return "/audio/mav_mode_guided.wav";
+    if (text.indexOf("イニシャライズ中モードです") >= 0) return "/audio/mav_mode_initialising.wav";
+    if (text.indexOf("オートチューンモードです") >= 0) return "/audio/mav_mode_autotune.wav";
+    if (text.indexOf("ランドモードです") >= 0) return "/audio/mav_mode_land.wav";
+    if (text == "挨拶モードです") return "/audio/mav_mode_greeting.wav";
+    if (text == "高姿勢モードです") return "/audio/mav_posture_high.wav";
+    if (text == "低姿勢モードです") return "/audio/mav_posture_low.wav";
+    return "";
+}
+
+static void mavlink_notification_tick() {
+    mavlink_receive_tick(true);
+}
+
+static bool rc_ch5_greeting_update(const MavlinkRcChannels& rc_channels, String& notification) {
+    notification = "";
+    if (!rc_channels.received || rc_channels.ch5_raw == UINT16_MAX) return false;
+
+    const bool next_active = rc_channels.ch5_raw > 2000;
+    if (next_active == rc_ch5_greeting_active) return false;
+
+    rc_ch5_greeting_active = next_active;
+    if (next_active) {
+        notification = "挨拶モードです";
+        Serial.printf("[MAVLink] RC Ch5=%u greeting notification: %s\n",
+                      rc_channels.ch5_raw,
+                      notification.c_str());
+    }
+    return !notification.isEmpty();
+}
+
+static bool rc_ch6_school_greeting_update(const MavlinkRcChannels& rc_channels, String& notification) {
+    notification = "";
+    if (!rc_channels.received || rc_channels.ch6_raw == UINT16_MAX) return false;
+
+    const bool next_active = rc_channels.ch6_raw > 2000;
+    if (next_active == rc_ch6_school_greeting_active) return false;
+
+    rc_ch6_school_greeting_active = next_active;
+    if (next_active) {
+        notification = "ドローンエンジニア養成塾21期のみなさん、入塾おめでとうございます。これから、ArduPilotの学習を頑張っていきましょう。";
+        Serial.printf("[MAVLink] RC Ch6=%u school greeting notification\n", rc_channels.ch6_raw);
+    }
+    return !notification.isEmpty();
+}
+
+static bool rc_ch9_posture_update(const MavlinkRcChannels& rc_channels, String& notification) {
+    notification = "";
+    if (!rc_channels.received || rc_channels.ch9_raw == UINT16_MAX) return false;
+
+    int8_t next_state = 0;
+    if (rc_channels.ch9_raw > 2000) {
+        next_state = 1;
+    } else if (rc_channels.ch9_raw < 1000) {
+        next_state = 2;
+    }
+
+    if (next_state == rc_ch9_posture_state) return false;
+
+    rc_ch9_posture_state = next_state;
+    if (next_state == 1) {
+        notification = "高姿勢モードです";
+    } else if (next_state == 2) {
+        notification = "低姿勢モードです";
+    }
+
+    if (!notification.isEmpty()) {
+        Serial.printf("[MAVLink] RC Ch9=%u posture notification: %s\n",
+                      rc_channels.ch9_raw,
+                      notification.c_str());
+    }
+    return !notification.isEmpty();
+}
+
+static void mavlink_receive_tick(bool allow_speech) {
+    MavlinkHeartbeat heartbeat;
+    MavlinkAttitude attitude;
+    MavlinkRcChannels rc_channels;
+    mavlink_receiver.poll(&heartbeat, &attitude, &rc_channels);
+
+    if (heartbeat.received) {
+        String notification;
+        if (flight_state_monitor.update(heartbeat, notification)) {
+            Serial.println("[MAVLink] notification: " + notification);
+            mavlink_pending_notification = notification;
+        }
+    }
+    if (rc_channels.received) {
+        String notification;
+        servo_rc_follow_set_target(rc_channels);
+        if (rc_ch5_greeting_update(rc_channels, notification)) {
+            mavlink_pending_notification = notification;
+        }
+        if (rc_ch6_school_greeting_update(rc_channels, notification)) {
+            mavlink_pending_notification = notification;
+        }
+        if (rc_ch9_posture_update(rc_channels, notification)) {
+            mavlink_pending_notification = notification;
+        }
+    }
+    if (attitude.received) {
+        servo_attitude_set_target(attitude);
+    }
+    servo_attitude_tick();
+
+    if (allow_speech && !mavlink_pending_notification.isEmpty() && !busy) {
+        const String notification = mavlink_pending_notification;
+        mavlink_pending_notification = "";
+        stackchan_speech.speak(notification);
+    }
+}
+
 void setup() {
     auto cfg = M5.config();
     M5.begin(cfg);
@@ -3009,6 +3620,8 @@ void setup() {
     system_config.loadConfig(SPIFFS, "/yaml/SC_BasicConfig.yaml");
     servo_begin();
     load_hermes_config(SPIFFS);
+    stackchan_speech.begin(speak_mavlink_notification);
+    mavlink_receiver.begin(115200, 1, 2);
     servo_idle_enabled = servo_on_boot;
     M5.Display.setBrightness(brightness_val);  // set before LED task starts
     led_init();  // must be after servo_begin() 窶・needs ioexpander initialized
@@ -3033,18 +3646,30 @@ void setup() {
 
 bool touchedZone(int zone) {
     const auto& touch = current_touch_detail;
+    if (normal_touch_guard_wait_release) {
+        if (touch.isPressed() || !time_reached(millis(), normal_touch_guard_until_ms)) return false;
+        normal_touch_guard_wait_release = false;
+    }
     if (!touch.wasClicked() || touch.y < 192) return false;
     return (touch.x / (320 / 3)) == zone;
 }
 
 bool touchHoldZone(int zone) {
     const auto& touch = current_touch_detail;
+    if (normal_touch_guard_wait_release) {
+        if (touch.isPressed() || !time_reached(millis(), normal_touch_guard_until_ms)) return false;
+        normal_touch_guard_wait_release = false;
+    }
     if (!touch.wasHold() || touch.y < 192) return false;
     return (touch.x / (320 / 3)) == zone;
 }
 
 bool touchClickZone(int zone) {
     const auto& touch = current_touch_detail;
+    if (normal_touch_guard_wait_release) {
+        if (touch.isPressed() || !time_reached(millis(), normal_touch_guard_until_ms)) return false;
+        normal_touch_guard_wait_release = false;
+    }
     if (!touch.wasClicked() || touch.y < 192) return false;
     return (touch.x / (320 / 3)) == zone;
 }
@@ -3068,6 +3693,7 @@ static bool zoneHoldTriggered(int zone) {
 void loop() {
     M5.update();
     current_touch_detail = M5.Touch.getDetail();
+    mavlink_notification_tick();
 
     if (M5.BtnPWR.wasHold()) {
         bpm_stop_audio();
