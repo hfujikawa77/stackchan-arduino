@@ -2,6 +2,7 @@
 #include <M5Unified.h>
 #include <SPIFFS.h>
 #include <WiFi.h>
+#include <esp_now.h>
 #include <WiFiClientSecure.h>
 #include <WiFiUdp.h>
 #include <HTTPClient.h>
@@ -137,6 +138,18 @@ static uint32_t mavlink_attitude_servo_skips_last = 0;
 static uint32_t mavlink_attitude_servo_next_log_ms = 0;
 static uint32_t normal_touch_guard_until_ms = 0;
 static bool normal_touch_guard_wait_release = false;
+
+// ── Head tracking via ESP-NOW ─────────────────────────────────────────────────
+typedef struct { float pan; float tilt; } HeadTrackPacket;
+static volatile bool  head_track_recv_ready  = false;
+static volatile float head_track_recv_x      = 0.0f;
+static volatile float head_track_recv_y      = 0.0f;
+static float          head_track_filtered_x  = 0.0f;
+static float          head_track_filtered_y  = 0.0f;
+static float          head_track_last_x      = 0.0f;
+static float          head_track_last_y      = 0.0f;
+static bool           head_track_filter_ready = false;
+static uint32_t       head_track_next_servo_ms = 0;
 static constexpr size_t WIFI_MAX = 3;
 struct WifiCredential {
     String ssid;
@@ -979,6 +992,51 @@ static void servo_attitude_tick() {
         mavlink_attitude_servo_skips_last = mavlink_attitude_servo_skips;
         mavlink_attitude_servo_next_log_ms = now + 2000;
     }
+}
+
+// Called from ESP-NOW receive ISR — keep minimal, no heap allocation.
+static void on_head_track_recv(const uint8_t* mac, const uint8_t* data, int len) {
+    if (len != sizeof(HeadTrackPacket)) return;
+    HeadTrackPacket pkt;
+    memcpy(&pkt, data, sizeof(pkt));
+    head_track_recv_x     = pkt.pan;
+    head_track_recv_y     = pkt.tilt;
+    head_track_recv_ready = true;
+}
+
+static void head_track_tick() {
+    if (!servo_ready || !head_track_recv_ready || busy || app_mode != MODE_NORMAL) {
+        head_track_filter_ready = false;
+        return;
+    }
+    const uint32_t now = millis();
+    if (!time_reached(now, head_track_next_servo_ms)) return;
+
+    if (!head_track_filter_ready) {
+        head_track_filtered_x  = srv_cx;
+        head_track_filtered_y  = srv_cy;
+        head_track_last_x      = srv_cx;
+        head_track_last_y      = srv_cy;
+        head_track_filter_ready = true;
+    } else {
+        constexpr float alpha = 0.40f;
+        head_track_filtered_x += (head_track_recv_x - head_track_filtered_x) * alpha;
+        head_track_filtered_y += (head_track_recv_y - head_track_filtered_y) * alpha;
+    }
+
+    const float sx = clamp_servo_axis_float(AXIS_X, head_track_filtered_x);
+    const float sy = clamp_servo_axis_float(AXIS_Y, head_track_filtered_y);
+
+    if (fabsf(sx - head_track_last_x) < 0.1f && fabsf(sy - head_track_last_y) < 0.1f) {
+        head_track_next_servo_ms = now + 20;
+        return;
+    }
+
+    servo_idle_enabled = false;
+    sc_servo.moveXYContinuous(sx, sy, 40);
+    head_track_last_x = sx;
+    head_track_last_y = sy;
+    head_track_next_servo_ms = now + 20;
 }
 
 static void servo_web_move(int x, int y, int move_ms) {
@@ -3642,6 +3700,15 @@ void setup() {
     } else {
         show("WiFi FAILED");
     }
+
+    // ESP-NOW head tracking receiver (works alongside WiFi on same channel)
+    if (esp_now_init() == ESP_OK) {
+        esp_now_register_recv_cb(on_head_track_recv);
+        M5_LOGI("ESP-NOW MAC: %s", WiFi.macAddress().c_str());
+        Serial.printf("ESP-NOW MAC: %s\n", WiFi.macAddress().c_str());
+    } else {
+        M5_LOGE("ESP-NOW init failed");
+    }
 }
 
 bool touchedZone(int zone) {
@@ -3864,6 +3931,7 @@ void loop() {
 
     http_beat_tick();
     periodic_tick();
+    head_track_tick();
     servo_idle_tick();
     uint32_t now = millis();
     if (!led_effect_active && time_reached(now, head_touch_next_poll_ms)) {
