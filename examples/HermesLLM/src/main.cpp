@@ -755,8 +755,8 @@ static void head_pat_reaction(HeadGesture gesture) {
         Serial.println("Head pat ignored: busy");
         return;
     }
-    if (!servo_idle_enabled) {
-        Serial.println("Head pat ignored: servo off");
+    if (!servo_ready) {
+        Serial.println("Head pat ignored: servo not ready");
         return;
     }
     uint32_t now = millis();
@@ -784,7 +784,7 @@ static void head_pat_reaction(HeadGesture gesture) {
             handle_speak_server();
             led_idle_log_tick();
             uint32_t loop_now = millis();
-            if (servo_ready && servo_idle_enabled && time_reached(loop_now, next_motion_ms)) {
+            if (servo_ready && time_reached(loop_now, next_motion_ms)) {
                 motion_phase = !motion_phase;
                 sc_servo.moveXY(srv_cx + (motion_phase ? 12 : -12), srv_cy - 8, 220);
                 next_motion_ms = loop_now + 320;
@@ -802,7 +802,7 @@ static void head_pat_reaction(HeadGesture gesture) {
             handle_speak_server();
             led_idle_log_tick();
             uint32_t loop_now = millis();
-            if (servo_ready && servo_idle_enabled && time_reached(loop_now, next_motion_ms)) {
+            if (servo_ready && time_reached(loop_now, next_motion_ms)) {
                 nod_down = !nod_down;
                 sc_servo.moveXY(srv_cx, nod_down ? srv_cy - 18 : srv_cy, 260);
                 next_motion_ms = loop_now + 280;
@@ -813,7 +813,7 @@ static void head_pat_reaction(HeadGesture gesture) {
         // 3+ taps: full X-axis spin (lower_limit → upper_limit → center)
         Serial.println("Head pat reaction: triple tap (full spin)");
         show("Yay!");
-        if (servo_ready && servo_idle_enabled) {
+        if (servo_ready) {
             auto* sx = system_config.getServoInfo(AXIS_X);
             int x_min = sx ? sx->lower_limit : 0;
             int x_max = sx ? sx->upper_limit : 300;
@@ -1013,30 +1013,33 @@ static void head_track_tick() {
     if (!time_reached(now, head_track_next_servo_ms)) return;
 
     if (!head_track_filter_ready) {
-        head_track_filtered_x  = srv_cx;
-        head_track_filtered_y  = srv_cy;
-        head_track_last_x      = srv_cx;
-        head_track_last_y      = srv_cy;
+        head_track_filtered_x = head_track_recv_x;
+        head_track_filtered_y = head_track_recv_y;
+        head_track_last_x     = clamp_servo_axis_float(AXIS_X, srv_cx + (head_track_recv_x - 90.0f));
+        head_track_last_y     = clamp_servo_axis_float(AXIS_Y, srv_cy - (head_track_recv_y - 90.0f));
         head_track_filter_ready = true;
     } else {
-        constexpr float alpha = 0.40f;
+        constexpr float alpha = 0.32f;
         head_track_filtered_x += (head_track_recv_x - head_track_filtered_x) * alpha;
         head_track_filtered_y += (head_track_recv_y - head_track_filtered_y) * alpha;
     }
 
-    const float sx = clamp_servo_axis_float(AXIS_X, head_track_filtered_x);
-    const float sy = clamp_servo_axis_float(AXIS_Y, head_track_filtered_y);
+    // Packet angles are 90-centered (HeadTracker convention); remap onto this
+    // unit's own servo centers (e.g. SCS X center=150). Tilt sign flipped here
+    // so HeadTracker's TILT_GAIN stays untouched.
+    const float sx = clamp_servo_axis_float(AXIS_X, srv_cx + (head_track_filtered_x - 90.0f));
+    const float sy = clamp_servo_axis_float(AXIS_Y, srv_cy - (head_track_filtered_y - 90.0f));
 
-    if (fabsf(sx - head_track_last_x) < 0.1f && fabsf(sy - head_track_last_y) < 0.1f) {
-        head_track_next_servo_ms = now + 20;
+    if (fabsf(sx - head_track_last_x) < 0.05f && fabsf(sy - head_track_last_y) < 0.05f) {
+        head_track_next_servo_ms = now + 10;
         return;
     }
 
     servo_idle_enabled = false;
-    sc_servo.moveXYContinuous(sx, sy, 40);
+    sc_servo.moveXYContinuous(sx, sy, 60);
     head_track_last_x = sx;
     head_track_last_y = sy;
-    head_track_next_servo_ms = now + 20;
+    head_track_next_servo_ms = now + 10;
 }
 
 static void servo_web_move(int x, int y, int move_ms) {
@@ -3060,6 +3063,13 @@ static void draw_settings_ui() {
         draw_slider_row(84, "Volume", setting_volume);
         M5.Display.drawLine(0, 124, 320, 124, TFT_DARKGREY);
         draw_slider_row(126, "Brightness", setting_brightness);
+        M5.Display.drawLine(0, 168, 320, 168, TFT_DARKGREY);
+        M5.Display.setTextSize(1);
+        M5.Display.setTextColor(TFT_DARKGREY, TFT_BLACK);
+        M5.Display.setCursor(8, 176);
+        M5.Display.print("ESP-NOW MAC: ");
+        M5.Display.setTextColor(TFT_CYAN, TFT_BLACK);
+        M5.Display.print(WiFi.macAddress().c_str());
     } else {
         M5.Display.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
         M5.Display.setCursor(8, 42);

@@ -38,5 +38,4 @@ public:
 
 private:
     bool started_ = false;
-    int8_t rx_pin_ = 18;
 };
