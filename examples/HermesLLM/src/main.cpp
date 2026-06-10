@@ -141,9 +141,16 @@ static bool normal_touch_guard_wait_release = false;
 
 // ── Head tracking via ESP-NOW ─────────────────────────────────────────────────
 typedef struct { float pan; float tilt; } HeadTrackPacket;
-static volatile bool  head_track_recv_ready  = false;
-static volatile float head_track_recv_x      = 0.0f;
-static volatile float head_track_recv_y      = 0.0f;
+
+// Shared between WiFi task (callback) and main loop — protected by portMUX spinlock.
+// portMUX emits MEMW barriers on ESP32, guaranteeing cache-coherent visibility
+// between Core 0 (WiFi task) and Core 1 (Arduino loop).
+static portMUX_TYPE   head_track_mux          = portMUX_INITIALIZER_UNLOCKED;
+static bool           head_track_recv_ready   = false;
+static float          head_track_recv_x       = 0.0f;
+static float          head_track_recv_y       = 0.0f;
+static uint32_t       head_track_last_recv_ms = 0;  // millis of most recent packet
+// Main-loop-only state (no locking needed):
 static float          head_track_filtered_x  = 0.0f;
 static float          head_track_filtered_y  = 0.0f;
 static float          head_track_last_x      = 0.0f;
@@ -994,34 +1001,60 @@ static void servo_attitude_tick() {
     }
 }
 
-// Called from ESP-NOW receive ISR — keep minimal, no heap allocation.
+// Called from ESP-NOW WiFi task (Core 0). portMUX spinlock makes writes
+// atomically visible to Core 1 (Arduino loop) with full cache coherency.
 static void on_head_track_recv(const uint8_t* mac, const uint8_t* data, int len) {
     if (len != sizeof(HeadTrackPacket)) return;
     HeadTrackPacket pkt;
     memcpy(&pkt, data, sizeof(pkt));
+    portENTER_CRITICAL_ISR(&head_track_mux);
     head_track_recv_x     = pkt.pan;
     head_track_recv_y     = pkt.tilt;
     head_track_recv_ready = true;
+    portEXIT_CRITICAL_ISR(&head_track_mux);
 }
 
 static void head_track_tick() {
-    if (!servo_ready || !head_track_recv_ready || busy || app_mode != MODE_NORMAL) {
-        head_track_filter_ready = false;
+    const uint32_t now = millis();
+
+    // Snapshot and consume the latest received packet under the spinlock.
+    float rx, ry;
+    bool ready;
+    portENTER_CRITICAL(&head_track_mux);
+    ready = head_track_recv_ready;
+    rx    = head_track_recv_x;
+    ry    = head_track_recv_y;
+    if (ready) {
+        head_track_recv_ready   = false;
+        head_track_last_recv_ms = now;
+    }
+    portEXIT_CRITICAL(&head_track_mux);
+
+    // If no packet for 500 ms, re-enable idle animation and reset filter.
+    if (head_track_last_recv_ms != 0 && (now - head_track_last_recv_ms) > 500) {
+        if (!servo_idle_enabled) {
+            servo_idle_enabled    = true;
+            head_track_filter_ready = false;
+        }
         return;
     }
-    const uint32_t now = millis();
+
+    if (!servo_ready || !ready || busy || app_mode != MODE_NORMAL) {
+        if (!ready) head_track_filter_ready = false;
+        return;
+    }
     if (!time_reached(now, head_track_next_servo_ms)) return;
 
     if (!head_track_filter_ready) {
-        head_track_filtered_x = head_track_recv_x;
-        head_track_filtered_y = head_track_recv_y;
-        head_track_last_x     = clamp_servo_axis_float(AXIS_X, srv_cx + (head_track_recv_x - 90.0f));
-        head_track_last_y     = clamp_servo_axis_float(AXIS_Y, srv_cy - (head_track_recv_y - 90.0f));
+        head_track_filtered_x = rx;
+        head_track_filtered_y = ry;
+        head_track_last_x     = clamp_servo_axis_float(AXIS_X, srv_cx + (rx - 90.0f));
+        head_track_last_y     = clamp_servo_axis_float(AXIS_Y, srv_cy - (ry - 90.0f));
         head_track_filter_ready = true;
     } else {
         constexpr float alpha = 0.32f;
-        head_track_filtered_x += (head_track_recv_x - head_track_filtered_x) * alpha;
-        head_track_filtered_y += (head_track_recv_y - head_track_filtered_y) * alpha;
+        head_track_filtered_x += (rx - head_track_filtered_x) * alpha;
+        head_track_filtered_y += (ry - head_track_filtered_y) * alpha;
     }
 
     // Packet angles are 90-centered (HeadTracker convention); remap onto this
