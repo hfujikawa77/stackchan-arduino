@@ -1,0 +1,280 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Stack-chan Dance Player</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body { font-family: system-ui, sans-serif; margin: 0; background: #0f172a; color: #e2e8f0; }
+  .wrap { max-width: 560px; margin: 0 auto; padding: 16px; }
+  h1 { font-size: 1.2rem; margin: 8px 0 16px; }
+  .card { background: #1e293b; border: 1px solid #334155; border-radius: 10px; padding: 14px; margin-bottom: 14px; }
+  label { display: block; font-size: .8rem; color: #94a3b8; margin: 8px 0 4px; }
+  input[type=text], input[type=file] { width: 100%; padding: 8px; border-radius: 6px;
+    border: 1px solid #475569; background: #0f172a; color: #e2e8f0; }
+  input[type=range] { width: 100%; }
+  .row { display: flex; gap: 10px; }
+  .row > * { flex: 1; }
+  button { padding: 12px; border: 0; border-radius: 8px; font-size: 1rem; font-weight: 600;
+    cursor: pointer; color: #fff; }
+  .btn-play { background: #16a34a; }
+  .btn-stop { background: #b91c1c; }
+  .btn-ghost { background: #475569; }
+  button:disabled { opacity: .45; cursor: not-allowed; }
+  .stat { display: flex; justify-content: space-between; font-variant-numeric: tabular-nums;
+    font-size: .9rem; padding: 4px 0; border-bottom: 1px solid #283548; }
+  .stat:last-child { border-bottom: 0; }
+  .beat-dot { width: 56px; height: 56px; border-radius: 50%; background: #334155; margin: 6px auto;
+    transition: background .04s, transform .04s; }
+  .beat-dot.hit { background: #38bdf8; transform: scale(1.25); }
+  .beat-dot.accent { background: #f472b6; }
+  .seek { width: 100%; }
+  .hint { font-size: .75rem; color: #64748b; line-height: 1.5; }
+  .ok { color: #4ade80; } .ng { color: #f87171; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>🕺 Stack-chan Dance Player</h1>
+
+  <div class="card">
+    <label>スタックチャンの IP アドレス</label>
+    <input type="text" id="ip" placeholder="192.168.x.x" autocomplete="off">
+    <div class="row" style="margin-top:8px">
+      <button class="btn-ghost" id="btnTest">接続テスト (1ビート送信)</button>
+    </div>
+    <div class="stat"><span>接続状態</span><span id="connState">—</span></div>
+  </div>
+
+  <div class="card">
+    <label>音源ファイル (mp3 / wav / m4a)</label>
+    <input type="file" id="audioFile" accept="audio/*">
+    <label>ビートマップ JSON</label>
+    <input type="file" id="mapFile" accept="application/json,.json">
+    <div class="stat"><span>曲名 / BPM</span><span id="mapInfo">—</span></div>
+  </div>
+
+  <div class="card">
+    <div class="beat-dot" id="beatDot"></div>
+    <input class="seek" type="range" id="seek" min="0" max="1000" value="0">
+    <div class="stat"><span>再生位置</span><span id="posLabel">0.0 / 0.0 s</span></div>
+    <div class="stat"><span>送信ビート数</span><span id="beatCount">0</span></div>
+    <div class="row" style="margin-top:10px">
+      <button class="btn-play" id="btnPlay" disabled>再生</button>
+      <button class="btn-stop" id="btnStop" disabled>停止</button>
+    </div>
+  </div>
+
+  <div class="card">
+    <label>遅延補償 LEAD: <span id="leadLabel">120</span> ms
+      （可聴ビートより何ミリ秒早く送るか。サーボの動き出しに合わせる）</label>
+    <input type="range" id="lead" min="0" max="400" step="10" value="120">
+    <p class="hint">
+      ・スタックチャン側は「アイドル自動モーションを OFF」にしておくとビートが綺麗に出ます（Rゾーンタップ）。<br>
+      ・サーボの山がビートより遅れる→LEADを増やす。早すぎる→LEADを減らす。<br>
+      ・このページはローカルファイル(file://)のまま動きます。送信は no-cors のため応答は確認できませんが届きます。
+    </p>
+  </div>
+</div>
+
+<script>
+"use strict";
+
+const $ = (id) => document.getElementById(id);
+const LS = window.localStorage;
+
+// ---- persisted IP / LEAD ----
+$("ip").value = LS.getItem("sc_ip") || "";
+$("lead").value = LS.getItem("sc_lead") || "120";
+$("leadLabel").textContent = $("lead").value;
+$("ip").addEventListener("change", () => LS.setItem("sc_ip", $("ip").value.trim()));
+$("lead").addEventListener("input", () => {
+  $("leadLabel").textContent = $("lead").value;
+  LS.setItem("sc_lead", $("lead").value);
+});
+
+// ---- audio + beatmap state ----
+let audioCtx = null;
+let audioBuffer = null;
+let beatmap = null;          // { bpm, beats: [{t, accent, motion}] }
+let source = null;
+let playing = false;
+let t0 = 0;                  // audioCtx time corresponding to songPos 0
+let startOffset = 0;         // song position (s) at which playback started
+let beatIndex = 0;
+let sentCount = 0;
+let schedTimer = null;
+let rafId = 0;
+
+function ensureCtx() {
+  if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+  return audioCtx;
+}
+
+// ---- send one beat to Stack-chan (fire-and-forget, no-cors simple request) ----
+function sendBeat(step, accent, motion, bpm) {
+  const ip = $("ip").value.trim();
+  if (!ip) return;
+  const body = JSON.stringify({ step, accent, motion, bpm });
+  fetch(`http://${ip}/beat`, {
+    method: "POST",
+    mode: "no-cors",
+    headers: { "Content-Type": "text/plain" }, // simple request => no CORS preflight
+    body,
+    keepalive: true,
+  }).then(() => setConn(true)).catch(() => setConn(false));
+}
+
+function setConn(ok) {
+  const el = $("connState");
+  el.textContent = ok ? "送信OK" : "送信失敗";
+  el.className = ok ? "ok" : "ng";
+}
+
+// ---- visual beat indicator ----
+function flashDot(accent) {
+  const dot = $("beatDot");
+  dot.classList.add("hit");
+  dot.classList.toggle("accent", accent);
+  setTimeout(() => dot.classList.remove("hit"), 90);
+}
+
+// ---- lookahead scheduler (A Tale of Two Clocks) ----
+function songPos() {
+  return audioCtx.currentTime - t0 + startOffset;
+}
+
+function scheduler() {
+  if (!playing || !beatmap) return;
+  const lead = parseInt($("lead").value, 10) / 1000;
+  const pos = songPos();
+  const beats = beatmap.beats;
+  while (beatIndex < beats.length && (beats[beatIndex].t - lead) <= pos) {
+    const b = beats[beatIndex];
+    sendBeat(beatIndex, b.accent, b.motion || "lr", beatmap.bpm || 0);
+    flashDot(b.accent);
+    sentCount++;
+    beatIndex++;
+  }
+  $("beatCount").textContent = sentCount;
+  if (pos >= audioBuffer.duration) stop(true);  // song finished → recenter
+}
+
+function uiTick() {
+  if (playing) {
+    const pos = songPos();
+    $("posLabel").textContent = `${pos.toFixed(1)} / ${audioBuffer.duration.toFixed(1)} s`;
+    $("seek").value = Math.round((pos / audioBuffer.duration) * 1000);
+  }
+  rafId = requestAnimationFrame(uiTick);
+}
+
+// ---- transport ----
+function play(fromOffset) {
+  if (!audioBuffer || !beatmap) return;
+  ensureCtx();
+  audioCtx.resume();
+  startOffset = (fromOffset != null) ? fromOffset : startOffset;
+
+  source = audioCtx.createBufferSource();
+  source.buffer = audioBuffer;
+  source.connect(audioCtx.destination);
+  t0 = audioCtx.currentTime + 0.10;     // small lead-in so scheduling is stable
+  source.start(t0, startOffset);
+
+  // skip beats already behind the start offset
+  beatIndex = beatmap.beats.findIndex((b) => b.t >= startOffset);
+  if (beatIndex < 0) beatIndex = beatmap.beats.length;
+
+  playing = true;
+  $("btnPlay").textContent = "一時停止";
+  $("btnStop").disabled = false;
+  schedTimer = setInterval(scheduler, 25);
+}
+
+function pause() {
+  if (!playing) return;
+  const pos = songPos();
+  cleanupPlayback();
+  startOffset = Math.min(pos, audioBuffer.duration);
+  $("btnPlay").textContent = "再生";
+}
+
+function stop(recenter) {
+  cleanupPlayback();
+  startOffset = 0;
+  beatIndex = 0;
+  $("seek").value = 0;
+  $("posLabel").textContent = `0.0 / ${audioBuffer ? audioBuffer.duration.toFixed(1) : "0.0"} s`;
+  $("btnPlay").textContent = "再生";
+  $("btnStop").disabled = true;
+  if (recenter !== false) centerServo();
+}
+
+function cleanupPlayback() {
+  playing = false;
+  if (schedTimer) { clearInterval(schedTimer); schedTimer = null; }
+  if (source) { try { source.onended = null; source.stop(); } catch (e) {} source = null; }
+}
+
+function centerServo() {
+  const ip = $("ip").value.trim();
+  if (!ip) return;
+  // Use the /servo endpoint's center command to return to the front pose.
+  fetch(`http://${ip}/servo`, {
+    method: "POST", mode: "no-cors",
+    headers: { "Content-Type": "text/plain" },
+    body: JSON.stringify({ center: true, ms: 300 }),
+  }).catch(() => {});
+}
+
+// ---- file loading ----
+$("audioFile").addEventListener("change", async (e) => {
+  const file = e.target.files[0];
+  if (!file) return;
+  ensureCtx();
+  const buf = await file.arrayBuffer();
+  audioBuffer = await audioCtx.decodeAudioData(buf);
+  maybeEnablePlay();
+  $("posLabel").textContent = `0.0 / ${audioBuffer.duration.toFixed(1)} s`;
+});
+
+$("mapFile").addEventListener("change", async (e) => {
+  const file = e.target.files[0];
+  if (!file) return;
+  try {
+    beatmap = JSON.parse(await file.text());
+    $("mapInfo").textContent = `${beatmap.title || "?"} / ${beatmap.bpm || "?"} BPM / ${beatmap.beats.length} beats`;
+  } catch (err) {
+    $("mapInfo").textContent = "JSON 読み込み失敗";
+    beatmap = null;
+  }
+  maybeEnablePlay();
+});
+
+function maybeEnablePlay() {
+  $("btnPlay").disabled = !(audioBuffer && beatmap);
+}
+
+// ---- controls ----
+$("btnPlay").addEventListener("click", () => { playing ? pause() : play(); });
+$("btnStop").addEventListener("click", () => stop(true));
+$("btnTest").addEventListener("click", () => {
+  sendBeat(0, true, "lr", beatmap ? beatmap.bpm : 120);
+  flashDot(true);
+});
+$("seek").addEventListener("change", (e) => {
+  if (!audioBuffer) return;
+  const pos = (e.target.value / 1000) * audioBuffer.duration;
+  const wasPlaying = playing;
+  cleanupPlayback();
+  startOffset = pos;
+  if (wasPlaying) play(pos); else $("posLabel").textContent = `${pos.toFixed(1)} / ${audioBuffer.duration.toFixed(1)} s`;
+});
+
+uiTick();
+</script>
+</body>
+</html>

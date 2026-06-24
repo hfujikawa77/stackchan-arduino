@@ -36,6 +36,15 @@ lib/
 .pio/
 build/
 
+# Python
+__pycache__/
+*.pyc
+
+# Audio sources for dance tool (do not commit copyrighted media)
+tools/beatmap/*.mp3
+tools/beatmap/*.wav
+tools/beatmap/*.m4a
+
 # Secret configs (WiFi credentials, API keys)
 **/SC_SecConfig.yaml
 .claude/settings.local.json
