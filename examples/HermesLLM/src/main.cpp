@@ -1930,13 +1930,13 @@ static void queue_http_beat(int step_index, bool accent, int bpm_hint, const Str
     int target_x = srv_cx;
     int target_y = play_center_y;
     if (vertical_motion) {
-        int nod = accent ? 18 : 12;
+        int nod = accent ? 26 : 7;   // accent: deep nod, off-beat: small bob
         target_y = play_center_y - nod;
         if (sy) {
             target_y = max<int>(sy->lower_limit, min<int>(sy->upper_limit, target_y));
         }
     } else {
-        int swing = accent ? 18 : 12;
+        int swing = accent ? 32 : 8;  // accent: big swing, off-beat: small swing
         bool swing_right = (step_index % 2) == 0;
         target_x = srv_cx + (swing_right ? swing : -swing);
         if (sx) {
