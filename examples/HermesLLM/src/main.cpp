@@ -2550,6 +2550,37 @@ static void handle_udp_beat() {
     queue_http_beat(doc["step"] | 0, doc["accent"] | false, doc["bpm"] | 0, doc["motion"] | "lr");
 }
 
+// Beat commands over USB serial (Web Serial), jitter-free alternative to /beat.
+// Line protocol (one command per line):
+//   B <step> <accent 0|1> <motion lr|ud> <bpm>   e.g. "B 12 1 lr 117"
+//   C                                            center servo to front
+static void serial_beat_tick() {
+    static char line[96];
+    static uint8_t pos = 0;
+    while (Serial.available()) {
+        char c = (char)Serial.read();
+        if (c == '\n' || c == '\r') {
+            if (pos == 0) continue;
+            line[pos] = '\0';
+            pos = 0;
+            if (app_mode == MODE_SETTINGS || busy) continue;
+            if (line[0] == 'B') {
+                int step = 0, accent = 0, bpm = 0;
+                char motion[4] = "lr";
+                if (sscanf(line, "B %d %d %3s %d", &step, &accent, motion, &bpm) >= 3) {
+                    queue_http_beat(step, accent != 0, bpm, String(motion));
+                }
+            } else if (line[0] == 'C') {
+                if (servo_ready) servo_web_center(300);
+            }
+        } else if (pos < sizeof(line) - 1) {
+            line[pos++] = c;
+        } else {
+            pos = 0;  // overflow: drop the line
+        }
+    }
+}
+
 void handle_speak_server() {
     servo_ws_tick();
 
@@ -3747,6 +3778,7 @@ void loop() {
         show("");
     }
     handle_udp_beat();
+    serial_beat_tick();
     handle_speak_server();
     process_web_tts_pending();
 

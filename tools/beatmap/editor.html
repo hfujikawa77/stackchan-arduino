@@ -43,6 +43,8 @@
       <label class="fld">音源 (mp3/wav/m4a)<input type="file" id="audioFile" accept="audio/*"></label>
       <label class="fld">ビートマップ JSON<input type="file" id="mapFile" accept="application/json,.json"></label>
       <button id="btnPlay" disabled>▶ 再生 (Space)</button>
+      <button id="btnUndo" disabled title="Ctrl+Z">↶ Undo</button>
+      <button id="btnRedo" disabled title="Ctrl+Y / Ctrl+Shift+Z">↷ Redo</button>
       <button id="btnExport" disabled>⬇ JSON保存</button>
       <button id="btnSaveFs" disabled title="Chrome等: 上書き保存">💾 上書き保存</button>
       <span class="stat" id="mapInfo">マップ未読み込み</span>
@@ -69,14 +71,22 @@
   <div class="card">
     <div class="row">
       <b style="font-size:.85rem">実機プレビュー</b>
-      <label class="fld" style="flex-direction:row; align-items:center; gap:6px">IP
-        <input type="text" id="ip" placeholder="192.168.x.x" autocomplete="off"></label>
+      <label class="fld" style="flex-direction:row; align-items:center; gap:6px">送信先
+        <select id="transport" style="padding:6px;border-radius:6px;border:1px solid #475569;background:#0f172a;color:#e2e8f0">
+          <option value="wifi">WiFi (HTTP)</option>
+          <option value="usb">USB (Serial)</option>
+        </select></label>
+      <span id="wifiFields">
+        <label class="fld" style="flex-direction:row; align-items:center; gap:6px; display:inline-flex">IP
+          <input type="text" id="ip" placeholder="192.168.x.x" autocomplete="off"></label>
+      </span>
+      <button id="btnSerial" style="display:none">USB接続</button>
       <button id="btnPreview">▶ 実機送信: OFF</button>
       <button id="btnTest">接続テスト</button>
       <label class="fld" style="flex-direction:row; align-items:center; gap:6px">LEAD(ms)
         <input type="number" id="lead" value="120" min="0" max="400" step="10" style="width:70px"></label>
       <span class="stat" id="conn">—</span>
-      <span class="legend">編集（クリックやキー入力）はそのまま実機の動きに反映されます。スタックチャン側はアイドルOFF推奨。</span>
+      <span class="legend">編集（クリック/キー入力）は実機に即反映。アイドルOFF推奨。USBはWiFiのジッタを避けたい時に（Chrome系PC）。</span>
     </div>
   </div>
 
@@ -87,10 +97,12 @@
     <kbd>X</kbd> 近くの境界を削除 ・
     <kbd>L</kbd>/<kbd>U</kbd> 現在セクションを 横/縦 に ・
     <kbd>A</kbd> 直近の拍のアクセントをトグル ・
+    <kbd>R</kbd> 直近の拍を休符に（送らない＝動かない）トグル ・
     <kbd>←</kbd>/<kbd>→</kbd> 1拍シーク ・
     <kbd>Shift</kbd>+<kbd>←</kbd>/<kbd>→</kbd> 現在の境界を1拍ずらす ・
     <kbd>[</kbd>/<kbd>]</kbd> ループ始点/終点 ・
-    <kbd>\</kbd> ループ on/off<br>
+    <kbd>\</kbd> ループ on/off ・
+    <kbd>Ctrl</kbd>+<kbd>Z</kbd> 取り消し / <kbd>Ctrl</kbd>+<kbd>Y</kbd> やり直し<br>
     <span class="legend">クリック: 詳細表示で拍の近く→アクセントをトグル、それ以外→シーク。上の全体バー→シーク。再生中のキー入力は「タップ補正」ぶん手前の拍に合わせます。</span>
   </div>
 </div>
@@ -114,10 +126,21 @@ let fileHandle = null;
 
 // ── live preview to Stack-chan ──────────────────────────────────────────────
 let previewOn = false, sendIndex = 0, prevPos = -1, resync = true;
+let serialPort = null, serialWriter = null;
+const enc = new TextEncoder();
 $("ip").value = LS.getItem("bm_ip") || "";
 $("lead").value = LS.getItem("bm_lead") || "120";
+$("transport").value = LS.getItem("bm_transport") || "wifi";
 $("ip").addEventListener("change", () => LS.setItem("bm_ip", $("ip").value.trim()));
 $("lead").addEventListener("change", () => LS.setItem("bm_lead", $("lead").value));
+function transport() { return $("transport").value; }
+function applyTransportUI() {
+  const usb = transport() === "usb";
+  $("wifiFields").style.display = usb ? "none" : "";
+  $("btnSerial").style.display = usb ? "" : "none";
+  LS.setItem("bm_transport", transport());
+}
+$("transport").addEventListener("change", applyTransportUI);
 
 const C_LR = "#1d4ed8", C_UD = "#be185d", C_ACC = "#fbbf24";
 const opposite = (m) => (m === "lr" ? "ud" : "lr");
@@ -175,20 +198,43 @@ function firstBeatAtOrAfter(t) {
   while (lo < hi) { const mid = (lo + hi) >> 1; if (b[mid].t < t) lo = mid + 1; else hi = mid; }
   return lo;
 }
-function postBeat(payload) {
+function sendSerial(str) {
+  if (!serialWriter) { setConn(false); return; }
+  serialWriter.write(enc.encode(str)).then(() => setConn(true)).catch(() => setConn(false));
+}
+function httpPost(path, payload) {
   const ip = $("ip").value.trim(); if (!ip) return;
-  fetch(`http://${ip}/beat`, { method: "POST", mode: "no-cors",
+  fetch(`http://${ip}${path}`, { method: "POST", mode: "no-cors",
     headers: { "Content-Type": "text/plain" }, body: JSON.stringify(payload), keepalive: true })
     .then(() => setConn(true)).catch(() => setConn(false));
 }
 function sendBeat(i) {
-  const b = map.beats[i];
-  postBeat({ step: i, accent: b.accent, motion: b.motion || "lr", bpm: map.bpm || 0 });
+  const b = map.beats[i], motion = b.motion || "lr";
+  if (transport() === "usb") sendSerial(`B ${i} ${b.accent ? 1 : 0} ${motion} ${map.bpm || 0}\n`);
+  else httpPost("/beat", { step: i, accent: b.accent, motion, bpm: map.bpm || 0 });
+}
+function sendTestBeat() {
+  if (transport() === "usb") sendSerial(`B 0 1 lr ${map ? map.bpm : 120}\n`);
+  else httpPost("/beat", { step: 0, accent: true, motion: "lr", bpm: map ? map.bpm : 120 });
 }
 function centerServo() {
-  const ip = $("ip").value.trim(); if (!ip) return;
-  fetch(`http://${ip}/servo`, { method: "POST", mode: "no-cors",
-    headers: { "Content-Type": "text/plain" }, body: JSON.stringify({ center: true, ms: 300 }) }).catch(() => {});
+  if (transport() === "usb") sendSerial("C\n");
+  else httpPost("/servo", { center: true, ms: 300 });
+}
+async function toggleSerial() {
+  if (serialPort) {  // disconnect
+    try { if (serialWriter) { serialWriter.releaseLock(); serialWriter = null; } await serialPort.close(); } catch (e) {}
+    serialPort = null; $("btnSerial").textContent = "USB接続"; setConn(false);
+    return;
+  }
+  if (!("serial" in navigator)) { $("conn").textContent = "Web Serial非対応(Chrome系PCで)"; $("conn").style.color = "#f87171"; return; }
+  try {
+    serialPort = await navigator.serial.requestPort();
+    await serialPort.open({ baudRate: 115200 });
+    serialWriter = serialPort.writable.getWriter();
+    $("btnSerial").textContent = "USB: 接続済み";
+    setConn(true);
+  } catch (e) { serialPort = null; setConn(false); }
 }
 function previewTick() {
   if (!previewOn || !playing || !map) return;
@@ -196,7 +242,8 @@ function previewTick() {
   const lead = (parseInt($("lead").value, 10) || 0) / 1000;
   if (resync || pos < prevPos - 0.05) { sendIndex = firstBeatAtOrAfter(pos); resync = false; }
   while (sendIndex < map.beats.length && (map.beats[sendIndex].t - lead) <= pos) {
-    sendBeat(sendIndex); sendIndex++;
+    if (!map.beats[sendIndex].rest) sendBeat(sendIndex);  // rest = send nothing
+    sendIndex++;
   }
   prevPos = pos;
 }
@@ -268,6 +315,39 @@ function toggleAccentNear(t) {
   const i = nearestBeatIndex(t);
   if (i >= 0) { map.beats[i].accent = !map.beats[i].accent; selectedBeat = i; }
 }
+function toggleRestNear(t) {
+  const i = nearestBeatIndex(t);
+  if (i < 0) return;
+  if (map.beats[i].rest) delete map.beats[i].rest; else map.beats[i].rest = true;
+  selectedBeat = i;
+}
+
+// ── undo / redo (snapshot-based; only real changes are recorded) ────────────
+let undoStack = [], redoStack = [];
+function snapshot() { return JSON.stringify({ beats: map.beats, sections }); }
+function restore(s) {
+  const o = JSON.parse(s);
+  map.beats = o.beats; sections = o.sections;
+  if (selectedBeat >= map.beats.length) selectedBeat = -1;
+}
+function updateUndoUI() {
+  $("btnUndo").disabled = undoStack.length === 0;
+  $("btnRedo").disabled = redoStack.length === 0;
+}
+function resetHistory() { undoStack = []; redoStack = []; updateUndoUI(); }
+function mutate(fn) {
+  if (!map) return;
+  const before = snapshot();
+  fn();
+  if (snapshot() !== before) {
+    undoStack.push(before);
+    if (undoStack.length > 100) undoStack.shift();
+    redoStack = [];
+    updateUndoUI();
+  }
+}
+function undo() { if (!undoStack.length) return; redoStack.push(snapshot()); restore(undoStack.pop()); updateUndoUI(); }
+function redo() { if (!redoStack.length) return; undoStack.push(snapshot()); restore(redoStack.pop()); updateUndoUI(); }
 
 // ── rendering ──────────────────────────────────────────────────────────────
 function fit(canvas) {
@@ -343,10 +423,18 @@ function drawDetail() {
     const bt = map.beats[i];
     if (bt.t < left || bt.t > left + VIEW) continue;
     const x = t2x(bt.t);
-    if (bt.accent) { ctx.strokeStyle = C_ACC; ctx.lineWidth = 2; }
-    else { ctx.strokeStyle = "#64748b"; ctx.lineWidth = 1; }
-    const top = bt.accent ? H * 0.30 : H * 0.55;
-    ctx.beginPath(); ctx.moveTo(x, top); ctx.lineTo(x, H - 18); ctx.stroke();
+    if (bt.rest) {
+      // rest: faint short tick + hollow ring (sent to nothing → robot holds still)
+      ctx.strokeStyle = "#3b4759"; ctx.lineWidth = 1;
+      ctx.beginPath(); ctx.moveTo(x, H * 0.64); ctx.lineTo(x, H - 18); ctx.stroke();
+      ctx.strokeStyle = "#64748b";
+      ctx.beginPath(); ctx.arc(x, H * 0.55, 3, 0, 7); ctx.stroke();
+    } else {
+      if (bt.accent) { ctx.strokeStyle = C_ACC; ctx.lineWidth = 2; }
+      else { ctx.strokeStyle = "#64748b"; ctx.lineWidth = 1; }
+      const top = bt.accent ? H * 0.30 : H * 0.55;
+      ctx.beginPath(); ctx.moveTo(x, top); ctx.lineTo(x, H - 18); ctx.stroke();
+    }
     if (i === selectedBeat) {
       ctx.fillStyle = "#38bdf8"; ctx.beginPath(); ctx.arc(x, H - 18, 4, 0, 7); ctx.fill();
     }
@@ -402,6 +490,7 @@ $("mapFile").addEventListener("change", async (e) => {
     if (!Array.isArray(map.beats)) throw new Error("no beats");
     map.beats.forEach((b) => { b.motion = b.motion || "lr"; b.accent = !!b.accent; });
     rebuildSectionsFromBeats();
+    resetHistory();
     $("mapInfo").textContent = `${map.title || "?"} / ${map.bpm || "?"}BPM / ${map.beats.length} beats / ${sections.length} sections`;
     $("btnExport").disabled = false;
     $("btnSaveFs").disabled = !window.showSaveFilePicker;
@@ -456,7 +545,7 @@ $("detail").addEventListener("click", (e) => {
   const t = left + ((e.clientX - r.left) / r.width) * VIEW;
   const i = nearestBeatIndex(t);
   const bx = ((map.beats[i].t - left) / VIEW) * r.width;
-  if (Math.abs(bx - (e.clientX - r.left)) < 8) { map.beats[i].accent = !map.beats[i].accent; selectedBeat = i; }
+  if (Math.abs(bx - (e.clientX - r.left)) < 8) { mutate(() => { map.beats[i].accent = !map.beats[i].accent; selectedBeat = i; }); }
   else seek(t);
 });
 
@@ -464,25 +553,28 @@ $("detail").addEventListener("click", (e) => {
 window.addEventListener("keydown", (e) => {
   if (/^(INPUT|TEXTAREA|SELECT)$/.test(e.target.tagName)) return;
   if (!map && e.key !== " ") return;
+  if ((e.ctrlKey || e.metaKey) && (e.key === "z" || e.key === "Z")) { e.preventDefault(); e.shiftKey ? redo() : undo(); return; }
+  if ((e.ctrlKey || e.metaKey) && (e.key === "y" || e.key === "Y")) { e.preventDefault(); redo(); return; }
   const t = tapPos();
   switch (e.key) {
     case " ": e.preventDefault(); togglePlay(); break;
-    case "s": case "S": addBoundaryAt(t); break;
-    case "x": case "X": removeBoundaryNear(t); break;
-    case "l": case "L": setMotionNear(t, "lr"); break;
-    case "u": case "U": setMotionNear(t, "ud"); break;
-    case "a": case "A": toggleAccentNear(t); break;
+    case "s": case "S": mutate(() => addBoundaryAt(t)); break;
+    case "x": case "X": mutate(() => removeBoundaryNear(t)); break;
+    case "l": case "L": mutate(() => setMotionNear(t, "lr")); break;
+    case "u": case "U": mutate(() => setMotionNear(t, "ud")); break;
+    case "a": case "A": mutate(() => toggleAccentNear(t)); break;
+    case "r": case "R": mutate(() => toggleRestNear(t)); break;
     case "[": loop.inT = Math.round(songPos() * 100) / 100; if (loop.outT == null || loop.outT <= loop.inT) loop.outT = Math.min(audioBuffer.duration, loop.inT + 8); break;
     case "]": loop.outT = Math.round(songPos() * 100) / 100; if (loop.inT == null || loop.inT >= loop.outT) loop.inT = Math.max(0, loop.outT - 8); break;
     case "\\": loop.on = !loop.on; break;
     case "ArrowLeft":
       e.preventDefault();
-      if (e.shiftKey) nudgeBoundaryNear(songPos(), -1);
+      if (e.shiftKey) mutate(() => nudgeBoundaryNear(songPos(), -1));
       else { const i = Math.max(0, nearestBeatIndex(songPos()) - 1); selectedBeat = i; seek(map.beats[i].t); }
       break;
     case "ArrowRight":
       e.preventDefault();
-      if (e.shiftKey) nudgeBoundaryNear(songPos(), +1);
+      if (e.shiftKey) mutate(() => nudgeBoundaryNear(songPos(), +1));
       else { const i = Math.min(map.beats.length - 1, nearestBeatIndex(songPos()) + 1); selectedBeat = i; seek(map.beats[i].t); }
       break;
   }
@@ -494,7 +586,11 @@ $("btnPreview").addEventListener("click", () => {
   $("btnPreview").className = previewOn ? "primary" : "";
   if (previewOn) resync = true; else centerServo();
 });
-$("btnTest").addEventListener("click", () => { postBeat({ step: 0, accent: true, motion: "lr", bpm: map ? map.bpm : 120 }); });
+$("btnTest").addEventListener("click", sendTestBeat);
+$("btnSerial").addEventListener("click", toggleSerial);
+$("btnUndo").addEventListener("click", undo);
+$("btnRedo").addEventListener("click", redo);
+applyTransportUI();
 
 $("btnPlay").addEventListener("click", togglePlay);
 requestAnimationFrame(frame);

@@ -64,8 +64,10 @@ python generate_beatmap.py "BillieJean.mp3" --auto-motion -o billie_jean.json
    - <kbd>S</kbd> 直近の拍にセクション境界を追加（動きは自動反転）
    - <kbd>L</kbd>/<kbd>U</kbd> 現在セクションを 横(lr)/縦(ud) に
    - <kbd>A</kbd> 直近の拍のアクセントをトグル（拍をクリックでも可）
+   - <kbd>R</kbd> 直近の拍を**休符**にトグル（その拍は実機に送らない＝動かない）。薄い中空マーカーで表示
    - <kbd>X</kbd> 近くの境界を削除、<kbd>Shift</kbd>+<kbd>←/→</kbd> 境界を1拍ずらす
    - <kbd>[</kbd>/<kbd>]</kbd> ループ始点/終点、<kbd>\\</kbd> ループ on/off（区切りの追い込みに便利）
+   - <kbd>Ctrl</kbd>+<kbd>Z</kbd> 取り消し / <kbd>Ctrl</kbd>+<kbd>Y</kbd>（または <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>Z</kbd>）やり直し（上部の Undo/Redo ボタンでも可）
 5. 「⬇ JSON保存」でダウンロード（Chrome等は「💾 上書き保存」で元ファイルに直接保存可）
 
 - **タップ補正(ms)**: 再生中にキーを押すと人間の反応ぶん遅れるため、その値だけ手前の拍に合わせます（既定120ms）
@@ -85,6 +87,19 @@ python generate_beatmap.py "BillieJean.mp3" --auto-motion -o billie_jean.json
 - **早すぎる** → LEAD を**減らす**
 - 既定120msはサーボ移動（約140ms）を見込んだ初期値。曲・環境で微調整
 
+### 送信先: WiFi か USB（Web Serial）か
+`player.html` / `editor.html` の「送信先」で選べます。
+
+- **WiFi (HTTP)**: IPを入れて `/beat` を送る通常モード。手軽だが、スマホテザリングや混雑Wi‑Fiでは
+  パケットが滞留→バーストして「無反応→急に激しく動く」ことがある
+- **USB (Serial)**: スタックチャンを **USB-CでPCに直結**し、ブラウザの Web Serial で送る。
+  WiFiを介さないのでジッタ・滞留が原理的にゼロ。**カフェ等の不安定回線で確実**
+  1. CoreS3 を USB で接続（書き込みに使うのと同じケーブル）
+  2. 送信先で「USB (Serial)」を選ぶ →「USB接続」でポートを選択（Chrome系PCのみ）
+  3. あとは WiFi と同じ。「接続テスト」で首が振れることを確認して再生
+  - シリアル行プロトコル: `B <step> <accent 0|1> <motion lr|ud> <bpm>` / `C`（センター復帰）
+  - Web Serial は Chrome/Edge デスクトップが必要（スマホ・Safari不可）。シリアルモニタは閉じておく
+
 ## トラブルシュート
 
 - **首が動かない**: IP違い / Stack-chan が busy（会話中）/ 設定画面中。まず「接続テスト」で確認
@@ -94,5 +109,6 @@ python generate_beatmap.py "BillieJean.mp3" --auto-motion -o billie_jean.json
 
 ## 既知の制約 / 将来の最適化
 
-- WiFi のジッタが気になる場合、ビートマップを CoreS3 側に持たせ、再生側はトランスポートクロックのみ定期送信（NTP的位置合わせ）してファーム側でスケジュールする方式に拡張できます（Issue #24 参照）。
-- 低レイテンシのデスクトップ用途には UDP `/beat`（port 8888）も受信側にありますが、ブラウザからは使えないため本ツールは HTTP を使用します。
+- WiFi のジッタが気になる場合は **USB (Web Serial) 送信**を使ってください（上記）。WiFiを介さず最も安定します。
+- さらに高度な同期が必要なら、ビートマップを CoreS3 側に持たせ再生側はトランスポートクロックのみ送る方式にも拡張できます（Issue #24 参照）。
+- 低レイテンシのデスクトップ用途には UDP `/beat`（port 8888）も受信側にありますが、ブラウザからは使えません。

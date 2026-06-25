@@ -40,9 +40,17 @@
   <h1>🕺 Stack-chan Dance Player</h1>
 
   <div class="card">
-    <label>スタックチャンの IP アドレス</label>
-    <input type="text" id="ip" placeholder="192.168.x.x" autocomplete="off">
+    <label>送信先</label>
+    <select id="transport" style="width:100%;padding:8px;border-radius:6px;border:1px solid #475569;background:#0f172a;color:#e2e8f0">
+      <option value="wifi">WiFi (HTTP)</option>
+      <option value="usb">USB (Serial) — Chrome系PC、ジッタ回避</option>
+    </select>
+    <div id="wifiFields">
+      <label style="margin-top:8px">スタックチャンの IP アドレス</label>
+      <input type="text" id="ip" placeholder="192.168.x.x" autocomplete="off">
+    </div>
     <div class="row" style="margin-top:8px">
+      <button class="btn-ghost" id="btnSerial" style="display:none">USB接続</button>
       <button class="btn-ghost" id="btnTest">接続テスト (1ビート送信)</button>
     </div>
     <div class="stat"><span>接続状態</span><span id="connState">—</span></div>
@@ -85,15 +93,45 @@
 const $ = (id) => document.getElementById(id);
 const LS = window.localStorage;
 
-// ---- persisted IP / LEAD ----
+// ---- persisted IP / LEAD / transport ----
 $("ip").value = LS.getItem("sc_ip") || "";
 $("lead").value = LS.getItem("sc_lead") || "120";
 $("leadLabel").textContent = $("lead").value;
+$("transport").value = LS.getItem("sc_transport") || "wifi";
 $("ip").addEventListener("change", () => LS.setItem("sc_ip", $("ip").value.trim()));
 $("lead").addEventListener("input", () => {
   $("leadLabel").textContent = $("lead").value;
   LS.setItem("sc_lead", $("lead").value);
 });
+
+// ---- transport (WiFi/HTTP or USB/Web Serial) ----
+let serialPort = null, serialWriter = null;
+const enc = new TextEncoder();
+function transport() { return $("transport").value; }
+function applyTransportUI() {
+  const usb = transport() === "usb";
+  $("wifiFields").style.display = usb ? "none" : "";
+  $("btnSerial").style.display = usb ? "" : "none";
+  LS.setItem("sc_transport", transport());
+}
+$("transport").addEventListener("change", applyTransportUI);
+function sendSerial(str) {
+  if (!serialWriter) { setConn(false); return; }
+  serialWriter.write(enc.encode(str)).then(() => setConn(true)).catch(() => setConn(false));
+}
+async function toggleSerial() {
+  if (serialPort) {
+    try { if (serialWriter) { serialWriter.releaseLock(); serialWriter = null; } await serialPort.close(); } catch (e) {}
+    serialPort = null; $("btnSerial").textContent = "USB接続"; setConn(false); return;
+  }
+  if (!("serial" in navigator)) { const el = $("connState"); el.textContent = "Web Serial非対応(Chrome系PCで)"; el.className = "ng"; return; }
+  try {
+    serialPort = await navigator.serial.requestPort();
+    await serialPort.open({ baudRate: 115200 });
+    serialWriter = serialPort.writable.getWriter();
+    $("btnSerial").textContent = "USB: 接続済み"; setConn(true);
+  } catch (e) { serialPort = null; setConn(false); }
+}
 
 // ---- audio + beatmap state ----
 let audioCtx = null;
@@ -113,8 +151,12 @@ function ensureCtx() {
   return audioCtx;
 }
 
-// ---- send one beat to Stack-chan (fire-and-forget, no-cors simple request) ----
+// ---- send one beat to Stack-chan (WiFi/HTTP or USB/Serial) ----
 function sendBeat(step, accent, motion, bpm) {
+  if (transport() === "usb") {
+    sendSerial(`B ${step} ${accent ? 1 : 0} ${motion || "lr"} ${bpm || 0}\n`);
+    return;
+  }
   const ip = $("ip").value.trim();
   if (!ip) return;
   const body = JSON.stringify({ step, accent, motion, bpm });
@@ -153,9 +195,11 @@ function scheduler() {
   const beats = beatmap.beats;
   while (beatIndex < beats.length && (beats[beatIndex].t - lead) <= pos) {
     const b = beats[beatIndex];
-    sendBeat(beatIndex, b.accent, b.motion || "lr", beatmap.bpm || 0);
-    flashDot(b.accent);
-    sentCount++;
+    if (!b.rest) {  // rest = send nothing (robot holds still)
+      sendBeat(beatIndex, b.accent, b.motion || "lr", beatmap.bpm || 0);
+      flashDot(b.accent);
+      sentCount++;
+    }
     beatIndex++;
   }
   $("beatCount").textContent = sentCount;
@@ -220,6 +264,7 @@ function cleanupPlayback() {
 }
 
 function centerServo() {
+  if (transport() === "usb") { sendSerial("C\n"); return; }
   const ip = $("ip").value.trim();
   if (!ip) return;
   // Use the /servo endpoint's center command to return to the front pose.
@@ -265,6 +310,8 @@ $("btnTest").addEventListener("click", () => {
   sendBeat(0, true, "lr", beatmap ? beatmap.bpm : 120);
   flashDot(true);
 });
+$("btnSerial").addEventListener("click", toggleSerial);
+applyTransportUI();
 $("seek").addEventListener("change", (e) => {
   if (!audioBuffer) return;
   const pos = (e.target.value / 1000) * audioBuffer.duration;
