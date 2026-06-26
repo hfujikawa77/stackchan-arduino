@@ -2,6 +2,7 @@
 #include <M5Unified.h>
 #include <SPIFFS.h>
 #include <WiFi.h>
+#include <esp_now.h>
 #include <WiFiClientSecure.h>
 #include <WiFiUdp.h>
 #include <HTTPClient.h>
@@ -137,6 +138,25 @@ static uint32_t mavlink_attitude_servo_skips_last = 0;
 static uint32_t mavlink_attitude_servo_next_log_ms = 0;
 static uint32_t normal_touch_guard_until_ms = 0;
 static bool normal_touch_guard_wait_release = false;
+
+// ── Head tracking via ESP-NOW ─────────────────────────────────────────────────
+typedef struct { float pan; float tilt; } HeadTrackPacket;
+
+// Shared between WiFi task (callback) and main loop — protected by portMUX spinlock.
+// portMUX emits MEMW barriers on ESP32, guaranteeing cache-coherent visibility
+// between Core 0 (WiFi task) and Core 1 (Arduino loop).
+static portMUX_TYPE   head_track_mux          = portMUX_INITIALIZER_UNLOCKED;
+static bool           head_track_recv_ready   = false;
+static float          head_track_recv_x       = 0.0f;
+static float          head_track_recv_y       = 0.0f;
+static uint32_t       head_track_last_recv_ms = 0;  // millis of most recent packet
+// Main-loop-only state (no locking needed):
+static float          head_track_filtered_x  = 0.0f;
+static float          head_track_filtered_y  = 0.0f;
+static float          head_track_last_x      = 0.0f;
+static float          head_track_last_y      = 0.0f;
+static bool           head_track_filter_ready = false;
+static uint32_t       head_track_next_servo_ms = 0;
 static constexpr size_t WIFI_MAX = 3;
 struct WifiCredential {
     String ssid;
@@ -742,8 +762,8 @@ static void head_pat_reaction(HeadGesture gesture) {
         Serial.println("Head pat ignored: busy");
         return;
     }
-    if (!servo_idle_enabled) {
-        Serial.println("Head pat ignored: servo off");
+    if (!servo_ready) {
+        Serial.println("Head pat ignored: servo not ready");
         return;
     }
     uint32_t now = millis();
@@ -771,7 +791,7 @@ static void head_pat_reaction(HeadGesture gesture) {
             handle_speak_server();
             led_idle_log_tick();
             uint32_t loop_now = millis();
-            if (servo_ready && servo_idle_enabled && time_reached(loop_now, next_motion_ms)) {
+            if (servo_ready && time_reached(loop_now, next_motion_ms)) {
                 motion_phase = !motion_phase;
                 sc_servo.moveXY(srv_cx + (motion_phase ? 12 : -12), srv_cy - 8, 220);
                 next_motion_ms = loop_now + 320;
@@ -789,7 +809,7 @@ static void head_pat_reaction(HeadGesture gesture) {
             handle_speak_server();
             led_idle_log_tick();
             uint32_t loop_now = millis();
-            if (servo_ready && servo_idle_enabled && time_reached(loop_now, next_motion_ms)) {
+            if (servo_ready && time_reached(loop_now, next_motion_ms)) {
                 nod_down = !nod_down;
                 sc_servo.moveXY(srv_cx, nod_down ? srv_cy - 18 : srv_cy, 260);
                 next_motion_ms = loop_now + 280;
@@ -800,7 +820,7 @@ static void head_pat_reaction(HeadGesture gesture) {
         // 3+ taps: full X-axis spin (lower_limit → upper_limit → center)
         Serial.println("Head pat reaction: triple tap (full spin)");
         show("Yay!");
-        if (servo_ready && servo_idle_enabled) {
+        if (servo_ready) {
             auto* sx = system_config.getServoInfo(AXIS_X);
             int x_min = sx ? sx->lower_limit : 0;
             int x_max = sx ? sx->upper_limit : 300;
@@ -979,6 +999,80 @@ static void servo_attitude_tick() {
         mavlink_attitude_servo_skips_last = mavlink_attitude_servo_skips;
         mavlink_attitude_servo_next_log_ms = now + 2000;
     }
+}
+
+// Called from ESP-NOW WiFi task (Core 0). portMUX spinlock makes writes
+// atomically visible to Core 1 (Arduino loop) with full cache coherency.
+static void on_head_track_recv(const uint8_t* mac, const uint8_t* data, int len) {
+    if (len != sizeof(HeadTrackPacket)) return;
+    HeadTrackPacket pkt;
+    memcpy(&pkt, data, sizeof(pkt));
+    portENTER_CRITICAL_ISR(&head_track_mux);
+    head_track_recv_x     = pkt.pan;
+    head_track_recv_y     = pkt.tilt;
+    head_track_recv_ready = true;
+    portEXIT_CRITICAL_ISR(&head_track_mux);
+}
+
+static void head_track_tick() {
+    const uint32_t now = millis();
+
+    // Snapshot and consume the latest received packet under the spinlock.
+    float rx, ry;
+    bool ready;
+    portENTER_CRITICAL(&head_track_mux);
+    ready = head_track_recv_ready;
+    rx    = head_track_recv_x;
+    ry    = head_track_recv_y;
+    if (ready) {
+        head_track_recv_ready   = false;
+        head_track_last_recv_ms = now;
+    }
+    portEXIT_CRITICAL(&head_track_mux);
+
+    // If no packet for 500 ms, re-enable idle animation and reset filter.
+    if (head_track_last_recv_ms != 0 && (now - head_track_last_recv_ms) > 500) {
+        if (!servo_idle_enabled) {
+            servo_idle_enabled    = true;
+            head_track_filter_ready = false;
+        }
+        return;
+    }
+
+    if (!servo_ready || !ready || busy || app_mode != MODE_NORMAL) {
+        if (!ready) head_track_filter_ready = false;
+        return;
+    }
+    if (!time_reached(now, head_track_next_servo_ms)) return;
+
+    if (!head_track_filter_ready) {
+        head_track_filtered_x = rx;
+        head_track_filtered_y = ry;
+        head_track_last_x     = clamp_servo_axis_float(AXIS_X, srv_cx + (rx - 90.0f));
+        head_track_last_y     = clamp_servo_axis_float(AXIS_Y, srv_cy - (ry - 90.0f));
+        head_track_filter_ready = true;
+    } else {
+        constexpr float alpha = 0.32f;
+        head_track_filtered_x += (rx - head_track_filtered_x) * alpha;
+        head_track_filtered_y += (ry - head_track_filtered_y) * alpha;
+    }
+
+    // Packet angles are 90-centered (HeadTracker convention); remap onto this
+    // unit's own servo centers (e.g. SCS X center=150). Tilt sign flipped here
+    // so HeadTracker's TILT_GAIN stays untouched.
+    const float sx = clamp_servo_axis_float(AXIS_X, srv_cx + (head_track_filtered_x - 90.0f));
+    const float sy = clamp_servo_axis_float(AXIS_Y, srv_cy - (head_track_filtered_y - 90.0f));
+
+    if (fabsf(sx - head_track_last_x) < 0.05f && fabsf(sy - head_track_last_y) < 0.05f) {
+        head_track_next_servo_ms = now + 10;
+        return;
+    }
+
+    servo_idle_enabled = false;
+    sc_servo.moveXYContinuous(sx, sy, 60);
+    head_track_last_x = sx;
+    head_track_last_y = sy;
+    head_track_next_servo_ms = now + 10;
 }
 
 static void servo_web_move(int x, int y, int move_ms) {
@@ -3033,6 +3127,13 @@ static void draw_settings_ui() {
         draw_slider_row(84, "Volume", setting_volume);
         M5.Display.drawLine(0, 124, 320, 124, TFT_DARKGREY);
         draw_slider_row(126, "Brightness", setting_brightness);
+        M5.Display.drawLine(0, 168, 320, 168, TFT_DARKGREY);
+        M5.Display.setTextSize(1);
+        M5.Display.setTextColor(TFT_DARKGREY, TFT_BLACK);
+        M5.Display.setCursor(8, 176);
+        M5.Display.print("ESP-NOW MAC: ");
+        M5.Display.setTextColor(TFT_CYAN, TFT_BLACK);
+        M5.Display.print(WiFi.macAddress().c_str());
     } else {
         M5.Display.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
         M5.Display.setCursor(8, 42);
@@ -3673,6 +3774,15 @@ void setup() {
     } else {
         show("WiFi FAILED");
     }
+
+    // ESP-NOW head tracking receiver (works alongside WiFi on same channel)
+    if (esp_now_init() == ESP_OK) {
+        esp_now_register_recv_cb(on_head_track_recv);
+        M5_LOGI("ESP-NOW MAC: %s", WiFi.macAddress().c_str());
+        Serial.printf("ESP-NOW MAC: %s\n", WiFi.macAddress().c_str());
+    } else {
+        M5_LOGE("ESP-NOW init failed");
+    }
 }
 
 bool touchedZone(int zone) {
@@ -3896,6 +4006,7 @@ void loop() {
 
     http_beat_tick();
     periodic_tick();
+    head_track_tick();
     servo_idle_tick();
     uint32_t now = millis();
     if (!led_effect_active && time_reached(now, head_touch_next_poll_ms)) {
