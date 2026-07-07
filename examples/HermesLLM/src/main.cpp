@@ -3665,7 +3665,7 @@ static bool rc_ch6_school_greeting_update(const MavlinkRcChannels& rc_channels, 
 
     rc_ch6_school_greeting_active = next_active;
     if (next_active) {
-        notification = "ドローンエンジニア養成塾21期のみなさん、入塾おめでとうございます。これから、ArduPilotの学習を頑張っていきましょう。";
+        notification = "ｽﾀｯｸﾁｬﾝ 5歳のお誕生日おめでとうございます。M5Stackチーム、日本のコミュニティの皆さん、素晴らしいプロダクトをありがとうございます。";
         Serial.printf("[MAVLink] RC Ch6=%u school greeting notification\n", rc_channels.ch6_raw);
     }
     return !notification.isEmpty();
