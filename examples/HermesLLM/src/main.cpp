@@ -29,6 +29,7 @@ static bool speak_mavlink_notification(const String& text);
 static void mavlink_notification_tick();
 static void mavlink_receive_tick(bool allow_speech);
 static void load_wifi_credentials_from_yaml(const String& normalized_yaml);
+static void load_llm_models_from_yaml(const String& normalized_yaml);
 static void replace_wifi_yaml_sections(String& yaml, WifiCredential entries[], size_t entry_count);
 static void led_force_clear();
 static void chat_add(bool is_user, const String& text);
@@ -110,7 +111,14 @@ static bool setting_attitude_servo_enabled = false;
 static bool setting_rc_follow_enabled = false;
 static bool setting_attitude_yaw_source_roll = false;
 static int setting_attitude_scale = 50;
-static uint8_t setting_page = 0;
+static uint8_t setting_page = 0;   // 0=Main, 1=Flight, 2=LLM
+// Selectable LLM models — loaded from YAML `llm_models:` (falls back to built-in defaults).
+// All entries share the same hermes: endpoint/api_key; only `model` changes.
+struct LlmModelPreset { String label; String slug; };
+static constexpr size_t LLM_MODEL_MAX = 8;
+static LlmModelPreset llm_models[LLM_MODEL_MAX];
+static size_t llm_model_count = 0;
+static int setting_model_index = -1;   // -1 = current model is not in the list (custom)
 static int brightness_val     = 200;
 static bool mavlink_attitude_servo_enabled = false;
 static bool mavlink_rc_follow_enabled = false;
@@ -1207,6 +1215,9 @@ void servo_idle_tick() {
 String hermes_endpoint = "";
 String hermes_model    = "";
 String hermes_api_key  = "";
+// System instruction sent with every LLM call to keep replies short.
+// Editable via YAML `hermes: system: "..."` (no # or " chars). Falls back to this default.
+String hermes_system   = "あなたはStack-chan。返答は日本語で必ず1文・30文字以内。簡潔に。";
 int    tts_volume          = 100;
 int    hermes_max_tokens   = 60;
 int    hermes_timeout_ms   = 180000;
@@ -1282,6 +1293,8 @@ void load_hermes_config(fs::FS& fs) {
         hermes_endpoint = extract("endpoint");
         hermes_model    = extract("model");
         hermes_api_key  = extract("api_key");
+        String sys_override = extract("system");
+        if (!sys_override.isEmpty()) hermes_system = sys_override;
         M5_LOGI("Hermes endpoint: %s", hermes_endpoint.c_str());
     }
 
@@ -1309,6 +1322,7 @@ void load_hermes_config(fs::FS& fs) {
     voicevox_host = extractStr("voicevox_host");
     if (!voicevox_host.isEmpty()) M5_LOGI("Local VOICEVOX: %s speaker=%d", voicevox_host.c_str(), voicevox_speaker);
     load_wifi_credentials_from_yaml(normalized_yaml);
+    load_llm_models_from_yaml(normalized_yaml);
     brightness_val = extractInt("brightness", brightness_val);
     servo_on_boot = extractInt("servo_on_boot", servo_on_boot ? 1 : 0) != 0;
     mavlink_attitude_servo_enabled = extractInt("mavlink_attitude_servo", mavlink_attitude_servo_enabled ? 1 : 0) != 0;
@@ -1375,6 +1389,10 @@ String call_hermes(const String& user_message) {
     JsonDocument doc;
     doc["model"] = hermes_model;
     JsonArray messages = doc["messages"].to<JsonArray>();
+    if (!hermes_system.isEmpty()) {
+        JsonObject sys = messages.add<JsonObject>();
+        sys["role"] = "system"; sys["content"] = hermes_system;
+    }
     JsonObject msg = messages.add<JsonObject>();
     msg["role"] = "user"; msg["content"] = user_message;
     doc["max_tokens"] = hermes_max_tokens; doc["stream"] = false;
@@ -2207,6 +2225,57 @@ static void load_wifi_credentials_from_yaml(const String& normalized_yaml) {
     }
 }
 
+// Built-in fallback used when YAML has no `llm_models:` list.
+static void load_llm_default_models() {
+    static const struct { const char* label; const char* slug; } defaults[] = {
+        {"Gemini Flash", "google/gemini-2.5-flash"},
+        {"GPT-4o mini",  "openai/gpt-4o-mini"},
+        {"Claude Haiku", "anthropic/claude-3.5-haiku"},
+    };
+    llm_model_count = 0;
+    for (auto& d : defaults) {
+        llm_models[llm_model_count].label = d.label;
+        llm_models[llm_model_count].slug  = d.slug;
+        llm_model_count++;
+    }
+}
+
+// Parse `llm_models:` list (same style as wifi_list:) into llm_models[].
+//   llm_models:
+//     - label: "Gemini Flash"
+//       model: "google/gemini-2.5-flash"
+static void load_llm_models_from_yaml(const String& normalized_yaml) {
+    llm_model_count = 0;
+    int list_pos = normalized_yaml.indexOf("llm_models:");
+    if (list_pos >= 0) {
+        int scan = list_pos;
+        while (llm_model_count < LLM_MODEL_MAX) {
+            int label_pos = normalized_yaml.indexOf("  - label: \"", scan);
+            if (label_pos < 0) break;
+            int label_start = label_pos + String("  - label: \"").length();
+            int label_end = normalized_yaml.indexOf('"', label_start);
+            if (label_end < 0) break;
+            String label = normalized_yaml.substring(label_start, label_end);
+
+            int model_pos = normalized_yaml.indexOf("    model: \"", label_end);
+            if (model_pos < 0) break;
+            int model_start = model_pos + String("    model: \"").length();
+            int model_end = normalized_yaml.indexOf('"', model_start);
+            if (model_end < 0) break;
+            String slug = normalized_yaml.substring(model_start, model_end);
+
+            if (!slug.isEmpty()) {
+                llm_models[llm_model_count].label = label.isEmpty() ? slug : label;
+                llm_models[llm_model_count].slug  = slug;
+                llm_model_count++;
+            }
+            scan = model_end;
+        }
+    }
+    if (llm_model_count == 0) load_llm_default_models();
+    M5_LOGI("LLM models loaded: %u", (unsigned)llm_model_count);
+}
+
 static void replace_wifi_yaml_sections(String& yaml, WifiCredential entries[], size_t entry_count) {
     String first_ssid = entry_count > 0 ? entries[0].ssid : "";
     String first_pass = entry_count > 0 ? entries[0].password : "";
@@ -3004,6 +3073,9 @@ static void save_settings() {
     update_yaml_int_value(yaml, "mavlink_rc_follow", setting_rc_follow_enabled ? 1 : 0);
     update_yaml_int_value(yaml, "mavlink_yaw_source_roll", setting_attitude_yaw_source_roll ? 1 : 0);
     update_yaml_int_value(yaml, "mavlink_attitude_scale", setting_attitude_scale);
+    if (setting_model_index >= 0 && setting_model_index < (int)llm_model_count) {
+        update_yaml_quoted_in_section(yaml, "hermes", "  model: \"", llm_models[setting_model_index].slug);
+    }
     File fw = SPIFFS.open("/yaml/SC_SecConfig.yaml", "w");
     if (!fw) { M5_LOGE("save_settings: write failed"); return; }
     fw.print(yaml);
@@ -3103,6 +3175,36 @@ static void draw_attitude_settings_row() {
     M5.Display.print("Reset Front");
 }
 
+static void draw_llm_model_list() {
+    M5.Display.fillRect(0, 34, 320, 166, TFT_BLACK);
+    M5.Display.setTextSize(1);
+    M5.Display.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
+    M5.Display.setCursor(8, 40);
+    M5.Display.print("Select LLM model (OpenRouter)");
+    for (size_t i = 0; i < llm_model_count; ++i) {
+        int row_y = 58 + (int)i * 34;
+        bool selected = ((int)i == setting_model_index);
+        uint16_t bg = selected ? TFT_DARKGREEN : TFT_NAVY;
+        uint16_t fg = selected ? TFT_WHITE : TFT_LIGHTGREY;
+        M5.Display.fillRoundRect(12, row_y, 296, 30, 5, bg);
+        M5.Display.drawRoundRect(12, row_y, 296, 30, 5, selected ? TFT_GREEN : TFT_DARKGREY);
+        M5.Display.setTextColor(fg, bg);
+        M5.Display.setCursor(22, row_y + 4);
+        M5.Display.print(selected ? "> " : "  ");
+        M5.Display.print(llm_models[i].label);
+        M5.Display.setTextColor(selected ? TFT_GREENYELLOW : TFT_CYAN, bg);
+        M5.Display.setCursor(28, row_y + 17);
+        M5.Display.print(llm_models[i].slug);
+    }
+    if (setting_model_index < 0) {
+        M5.Display.setTextColor(TFT_ORANGE, TFT_BLACK);
+        M5.Display.setCursor(8, 58 + (int)llm_model_count * 34 + 2);
+        M5.Display.print("Current: custom (");
+        M5.Display.print(hermes_model);
+        M5.Display.print(")");
+    }
+}
+
 static void draw_settings_ui() {
     M5.Display.fillScreen(TFT_BLACK);
     M5.Display.setTextSize(1);
@@ -3117,6 +3219,10 @@ static void draw_settings_ui() {
     M5.Display.setTextColor(TFT_WHITE, setting_page == 1 ? TFT_NAVY : TFT_DARKGREY);
     M5.Display.setCursor(166, 11);
     M5.Display.print("Flight");
+    M5.Display.fillRoundRect(240, 4, 34, 22, 4, setting_page == 2 ? TFT_NAVY : TFT_DARKGREY);
+    M5.Display.setTextColor(TFT_WHITE, setting_page == 2 ? TFT_NAVY : TFT_DARKGREY);
+    M5.Display.setCursor(247, 11);
+    M5.Display.print("LLM");
     M5.Display.fillRoundRect(280, 4, 36, 28, 4, TFT_DARKGREY);
     M5.Display.setTextColor(TFT_WHITE, TFT_DARKGREY);
     M5.Display.setCursor(288, 10);
@@ -3134,11 +3240,13 @@ static void draw_settings_ui() {
         M5.Display.print("ESP-NOW MAC: ");
         M5.Display.setTextColor(TFT_CYAN, TFT_BLACK);
         M5.Display.print(WiFi.macAddress().c_str());
-    } else {
+    } else if (setting_page == 1) {
         M5.Display.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
         M5.Display.setCursor(8, 42);
         M5.Display.print("Select IMU or RC follow mode.");
         draw_attitude_settings_row();
+    } else {
+        draw_llm_model_list();
     }
     M5.Display.drawLine(0, 200, 320, 200, TFT_DARKGREY);
     M5.Display.fillRoundRect(10, 204, 135, 30, 6, TFT_DARKGREY);
@@ -3162,6 +3270,10 @@ static void settings_enter() {
     setting_rc_follow_enabled = mavlink_rc_follow_enabled;
     setting_attitude_yaw_source_roll = mavlink_attitude_yaw_source_roll;
     setting_attitude_scale = mavlink_attitude_scale;
+    setting_model_index = -1;
+    for (size_t i = 0; i < llm_model_count; ++i) {
+        if (hermes_model == llm_models[i].slug) { setting_model_index = (int)i; break; }
+    }
     setting_page = 0;
     avatar.suspend();
     draw_settings_ui();
@@ -3178,6 +3290,9 @@ static void settings_exit(bool save) {
         mavlink_attitude_target_ready = false;
         mavlink_attitude_yaw_source_roll = setting_attitude_yaw_source_roll;
         mavlink_attitude_scale = setting_attitude_scale;
+        if (setting_model_index >= 0 && setting_model_index < (int)llm_model_count) {
+            hermes_model = llm_models[setting_model_index].slug;
+        }
         M5.Display.setBrightness(brightness_val);
         save_settings();
         WiFi.disconnect(false, false);
@@ -3208,6 +3323,11 @@ static void handle_settings_touch() {
         }
         if (tx >= 150 && tx <= 236 && ty >= 4 && ty <= 26) {
             setting_page = 1;
+            draw_settings_ui();
+            return;
+        }
+        if (tx >= 240 && tx <= 274 && ty >= 4 && ty <= 26) {
+            setting_page = 2;
             draw_settings_ui();
             return;
         }
@@ -3247,6 +3367,20 @@ static void handle_settings_touch() {
             servo_attitude_reset_front();
             draw_attitude_settings_row();
             return;
+        }
+        return;
+    }
+
+    if (setting_page == 2) {
+        if (touch.wasPressed()) {
+            for (size_t i = 0; i < llm_model_count; ++i) {
+                int row_y = 58 + (int)i * 34;
+                if (tx >= 12 && tx <= 308 && ty >= row_y && ty <= row_y + 30) {
+                    setting_model_index = (int)i;
+                    draw_llm_model_list();
+                    return;
+                }
+            }
         }
         return;
     }
