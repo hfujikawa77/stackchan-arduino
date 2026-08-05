@@ -380,8 +380,14 @@ static constexpr uint32_t SPEECH_SCROLL_STEP_MS = 130;
 // --- LED ---
 #define LED_NUM 12
 static m5::PY32IOExpander_Class* led_io = nullptr;
-enum LedMode { LED_OFF, LED_HEARING, LED_THINKING, LED_SPEAKING, LED_ERROR, LED_HAPPY };
+enum LedMode { LED_OFF, LED_HEARING, LED_THINKING, LED_SPEAKING, LED_ERROR, LED_HAPPY, LED_MANUAL };
 static volatile LedMode led_mode = LED_OFF;
+
+enum ManualPattern : uint8_t { PAT_SOLID, PAT_BLINK, PAT_BREATH, PAT_CHASE, PAT_RAINBOW, PAT_WAVE };
+static volatile ManualPattern manual_pattern = PAT_SOLID;
+static volatile uint8_t manual_r = 0, manual_g = 0, manual_b = 0;
+static volatile uint8_t manual_speed = 5;  // 1-10
+static volatile uint16_t manual_on_ms = 300, manual_off_ms = 300;
 
 static constexpr uint32_t LED_IDLE_INTERVAL_MS = 180000;
 static constexpr uint32_t LED_IDLE_DURATION_MS = 20000;
@@ -683,6 +689,79 @@ static void led_task(void*) {
                 else              { if (anim > 6)   anim -= 6; else anim_dir =  1; }
                 led_all(anim, (anim * 3) / 5, anim / 6);  // warm happy breath
                 vTaskDelay(pdMS_TO_TICKS(25));
+                break;
+            case LED_MANUAL:
+                led_effect_active = true;
+                {
+                    uint8_t mr = manual_r, mg = manual_g, mb = manual_b;
+                    uint8_t spd = manual_speed;
+                    uint8_t delay_base = 11 - (spd > 10 ? 10 : (spd < 1 ? 1 : spd));
+                    switch (manual_pattern) {
+                        case PAT_SOLID:
+                            led_all(mr, mg, mb);
+                            vTaskDelay(pdMS_TO_TICKS(100));
+                            break;
+                        case PAT_BLINK:
+                            blink_state = !blink_state;
+                            led_all(blink_state ? mr : 0, blink_state ? mg : 0, blink_state ? mb : 0);
+                            vTaskDelay(pdMS_TO_TICKS(blink_state ? manual_on_ms : manual_off_ms));
+                            break;
+                        case PAT_BREATH:
+                            if (anim_dir > 0) { if (anim < 249) anim += 6; else anim_dir = -1; }
+                            else              { if (anim > 6)   anim -= 6; else anim_dir =  1; }
+                            led_all((mr * anim) / 255, (mg * anim) / 255, (mb * anim) / 255);
+                            vTaskDelay(pdMS_TO_TICKS(15 + delay_base * 3));
+                            break;
+                        case PAT_CHASE: {
+                            ScopedLock lock(io_mutex);
+                            for (int i = 0; i < LED_NUM; i++) led_io->setLedColor(i, 0, 0, 0);
+                            for (int i = 0; i < 3; i++) {
+                                int idx = (chase_pos + i * 4) % LED_NUM;
+                                uint8_t br = (i == 0) ? 255 : 100;
+                                led_io->setLedColor(idx, (mr * br) / 255, (mg * br) / 255, (mb * br) / 255);
+                            }
+                            led_io->refreshLeds();
+                            chase_pos = (chase_pos + 1) % LED_NUM;
+                            vTaskDelay(pdMS_TO_TICKS(30 + delay_base * 6));
+                            break;
+                        }
+                        case PAT_RAINBOW: {
+                            ScopedLock lock(io_mutex);
+                            for (int i = 0; i < LED_NUM; i++) {
+                                uint8_t hue = (uint8_t)(anim + (i * 255 / LED_NUM));
+                                uint8_t rr, gg, bb;
+                                uint8_t region = hue / 43;
+                                uint8_t remainder = (hue - region * 43) * 6;
+                                switch (region) {
+                                    case 0: rr = 255; gg = remainder; bb = 0; break;
+                                    case 1: rr = 255 - remainder; gg = 255; bb = 0; break;
+                                    case 2: rr = 0; gg = 255; bb = remainder; break;
+                                    case 3: rr = 0; gg = 255 - remainder; bb = 255; break;
+                                    case 4: rr = remainder; gg = 0; bb = 255; break;
+                                    default: rr = 255; gg = 0; bb = 255 - remainder; break;
+                                }
+                                led_io->setLedColor(i, rr, gg, bb);
+                            }
+                            led_io->refreshLeds();
+                            anim += 3;
+                            vTaskDelay(pdMS_TO_TICKS(20 + delay_base * 4));
+                            break;
+                        }
+                        case PAT_WAVE: {
+                            ScopedLock lock(io_mutex);
+                            for (int i = 0; i < LED_NUM; i++) {
+                                // simple sine-like wave using triangle
+                                int phase = ((int)anim + i * 255 / LED_NUM) & 0xFF;
+                                uint8_t br = (phase < 128) ? (phase * 2) : ((255 - phase) * 2);
+                                led_io->setLedColor(i, (mr * br) / 255, (mg * br) / 255, (mb * br) / 255);
+                            }
+                            led_io->refreshLeds();
+                            anim += 4;
+                            vTaskDelay(pdMS_TO_TICKS(20 + delay_base * 4));
+                            break;
+                        }
+                    }
+                }
                 break;
         }
     }
@@ -2373,7 +2452,7 @@ static void handle_config_get(WiFiClient& client) {
               "document.getElementById(id).classList.add('active');"
               "document.querySelector('[data-tab=\"'+id+'\"]').classList.add('active');"
               "const saveBtn=document.getElementById('save-btn');"
-              "if(saveBtn)saveBtn.style.display=(id==='tab-speak'||id==='tab-servo')?'none':'block';}"
+              "if(saveBtn)saveBtn.style.display=(id==='tab-speak'||id==='tab-servo'||id==='tab-led')?'none':'block';}"
               "function appendChat(role,text){const log=document.getElementById('chat-log');"
               "if(!log)return;"
               "const div=document.createElement('div');div.className='bubble '+role;div.textContent=text;"
@@ -2451,9 +2530,88 @@ static void handle_config_get(WiFiClient& client) {
               "pad.addEventListener('pointerup',()=>{active=false;lastYaw=null;lastRoll=null;});"
               "pad.addEventListener('pointercancel',()=>{active=false;lastYaw=null;lastRoll=null;});"
               "}"
+              "function setLedStatus(t){const e=document.getElementById('led-status');if(e)e.textContent=t;}"
+              "async function sendLed(preset){"
+              "setLedStatus('Applying...');"
+              "try{const r=await fetch('/led',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({preset:preset})});"
+              "const d=await r.json();if(d.ok)setLedStatus(d.pattern+' '+d.color);else setLedStatus('Error');"
+              "}catch(e){setLedStatus('Error: '+e.message);}}"
+              "async function applyLed(){"
+              "setLedStatus('Applying...');"
+              "const pat=document.getElementById('led-pattern').value;"
+              "const col=document.getElementById('led-color').value;"
+              "const spd=Number(document.getElementById('led-speed').value);"
+              "try{const r=await fetch('/led',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({pattern:pat,color:col,speed:spd})});"
+              "const d=await r.json();if(d.ok)setLedStatus(d.pattern+' '+d.color);else setLedStatus('Error');"
+              "}catch(e){setLedStatus('Error: '+e.message);}}"
+              "function initColorMap(){"
+              "const cv=document.getElementById('led-cmap');if(!cv)return;"
+              "const ctx=cv.getContext('2d');"
+              "const w=cv.width,h=cv.height;"
+              "for(let x=0;x<w;x++){"
+              "const hue=x*360/w;"
+              "for(let y=0;y<h;y++){"
+              "const sat=100;"
+              "const lit=100-y*100/h;"
+              "ctx.fillStyle='hsl('+hue+','+sat+'%,'+lit+'%)';"
+              "ctx.fillRect(x,y,1,1);}}"
+              "function pick(e){"
+              "const r=cv.getBoundingClientRect();"
+              "const ex=e.touches?e.touches[0].clientX:e.clientX;"
+              "const ey=e.touches?e.touches[0].clientY:e.clientY;"
+              "const px=Math.max(0,Math.min(w-1,Math.round((ex-r.left)*w/r.width)));"
+              "const py=Math.max(0,Math.min(h-1,Math.round((ey-r.top)*h/r.height)));"
+              "const d=ctx.getImageData(px,py,1,1).data;"
+              "const hex='#'+((1<<24)+(d[0]<<16)+(d[1]<<8)+d[2]).toString(16).slice(1).toUpperCase();"
+              "document.getElementById('led-color').value=hex;"
+              "document.getElementById('led-cval').textContent=hex;"
+              "document.getElementById('led-cswatch').style.background=hex;ledRtSend();}"
+              "cv.addEventListener('pointerdown',e=>{e.preventDefault();pick(e);cv._picking=true;});"
+              "cv.addEventListener('pointermove',e=>{if(cv._picking){e.preventDefault();pick(e);}});"
+              "cv.addEventListener('pointerup',()=>{cv._picking=false;});"
+              "cv.addEventListener('pointercancel',()=>{cv._picking=false;});"
+              "document.getElementById('led-cswatch').style.background='#FF8800';}"
+              "let _ledGenData=null;"
+              "async function ledGen(){"
+              "document.getElementById('led-gen-status').textContent='Generating...';"
+              "document.getElementById('led-gen-desc').textContent='';"
+              "document.getElementById('led-gen-preview').style.display='none';"
+              "document.getElementById('led-gen-apply').disabled=true;"
+              "document.getElementById('led-gen-apply').style.opacity='0.5';"
+              "const theme=(document.getElementById('led-gen-theme').value||'').trim();"
+              "try{const r=await fetch('/led-gen',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(theme?{theme:theme}:{})});"
+              "const d=await r.json();"
+              "if(!d.ok){document.getElementById('led-gen-status').textContent='Error: '+(d.error||'unknown');return;}"
+              "_ledGenData=d;"
+              "document.getElementById('led-gen-status').textContent='';"
+              "document.getElementById('led-gen-desc').textContent=d.description||'';"
+              "document.getElementById('led-gen-pat').textContent=d.pattern;"
+              "document.getElementById('led-gen-color').textContent=d.color;"
+              "document.getElementById('led-gen-swatch').style.background=d.color;"
+              "document.getElementById('led-gen-spd').textContent=d.speed;"
+              "document.getElementById('led-gen-preview').style.display='block';"
+              "document.getElementById('led-gen-apply').disabled=false;"
+              "document.getElementById('led-gen-apply').style.opacity='1';"
+              "}catch(e){document.getElementById('led-gen-status').textContent='Error: '+e.message;}}"
+              "async function ledGenApply(){"
+              "if(!_ledGenData)return;"
+              "setLedStatus('Applying...');"
+              "try{const r=await fetch('/led',{method:'POST',headers:{'Content-Type':'application/json'},"
+              "body:JSON.stringify({pattern:_ledGenData.pattern,color:_ledGenData.color,speed:_ledGenData.speed})});"
+              "const d=await r.json();if(d.ok)setLedStatus(d.pattern+' '+d.color);else setLedStatus('Error');"
+              "}catch(e){setLedStatus('Error: '+e.message);}}"
+              "let _ledRtTimer=null;"
+              "function ledRtSend(){if(!document.getElementById('led-rt').checked)return;"
+              "if(_ledRtTimer)clearTimeout(_ledRtTimer);"
+              "_ledRtTimer=setTimeout(()=>{_ledRtTimer=null;applyLed();},80);}"
+              "async function ledOff(){"
+              "setLedStatus('OFF');"
+              "try{await fetch('/led',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({off:true})});"
+              "}catch(e){setLedStatus('Error: '+e.message);}}"
               "window.addEventListener('DOMContentLoaded',()=>{"
               "openTab('tab-security');"
               "initServoPad();"
+              "initColorMap();"
               "const speakText=document.getElementById('speak-text');"
               "if(speakText){speakText.addEventListener('keydown',e=>{"
               "if(e.key==='Enter'&&!e.shiftKey&&!e.isComposing){e.preventDefault();sendSpeak();}"
@@ -2466,6 +2624,7 @@ static void handle_config_get(WiFiClient& client) {
               "<button type=button class=tab-btn data-tab=tab-speak onclick=\"openTab('tab-speak')\">Speak</button>"
               "<button type=button class=tab-btn data-tab=tab-servo onclick=\"openTab('tab-servo')\">Servo</button>"
               "<button type=button class=tab-btn data-tab=tab-bpm onclick=\"openTab('tab-bpm')\">BPM-Dance</button>"
+              "<button type=button class=tab-btn data-tab=tab-led onclick=\"openTab('tab-led')\">LED</button>"
               "<button type=button class=tab-btn data-tab=tab-general onclick=\"openTab('tab-general')\">General</button>"
               "<button type=button class=tab-btn data-tab=tab-periodic onclick=\"openTab('tab-periodic')\">Periodic</button>"
               "</div>"
@@ -2539,6 +2698,59 @@ static void handle_config_get(WiFiClient& client) {
               "<label>Play BPM<input type=number min=60 max=180 name=play_bpm value=\""); html += String(play_bpm); html += F("\"></label>"
               "</div>");
     html += F("</div>");
+    // --- LED tab ---
+    html += F("<div id=tab-led class=tab>"
+              "<div class=sec><h3>Presets</h3>"
+              "<div style=\"display:flex;flex-wrap:wrap;gap:6px\">"
+              "<button type=button class=mini-btn onclick=\"sendLed('warm_white')\">Warm White</button>"
+              "<button type=button class=mini-btn onclick=\"sendLed('cool_blue')\">Cool Blue</button>"
+              "<button type=button class=mini-btn onclick=\"sendLed('alert_red')\">Alert Red</button>"
+              "<button type=button class=mini-btn onclick=\"sendLed('calm_breath')\">Calm Breath</button>"
+              "<button type=button class=mini-btn onclick=\"sendLed('christmas')\">Christmas</button>"
+              "<button type=button class=mini-btn onclick=\"sendLed('ocean')\">Ocean</button>"
+              "<button type=button class=mini-btn onclick=\"sendLed('rainbow')\">Rainbow</button>"
+              "<button type=button class=mini-btn onclick=\"sendLed('party')\">Party</button>"
+              "<button type=button class=mini-btn onclick=ledOff() style=\"background:#888\">OFF</button>"
+              "</div></div>"
+              "<div class=sec><h3>LLM Generate</h3>"
+              "<div style=\"display:flex;gap:8px;align-items:center;flex-wrap:wrap\">"
+              "<input type=text id=led-gen-theme placeholder=\"例: うれしい気持ち\" style=\"flex:1;min-width:120px;padding:6px 8px;border:1px solid #ccc;border-radius:4px;font-size:14px\">"
+              "<button type=button class=mini-btn onclick=ledGen()>Gen</button>"
+              "<button type=button class=mini-btn id=led-gen-apply onclick=ledGenApply() disabled style=\"opacity:0.5\">Apply</button>"
+              "<span id=led-gen-status></span>"
+              "</div>"
+              "<p id=led-gen-desc style=\"margin:6px 0;color:#555;font-size:13px\"></p>"
+              "<div id=led-gen-preview style=\"display:none;font-size:13px;color:#333;margin:4px 0\">"
+              "<span id=led-gen-pat></span> <span id=led-gen-swatch style=\"display:inline-block;width:18px;height:18px;border-radius:3px;border:1px solid #999;vertical-align:middle\"></span> "
+              "<span id=led-gen-color></span> speed:<span id=led-gen-spd></span>"
+              "</div>"
+              "</div>"
+              "<div class=sec><h3>Custom</h3>"
+              "<label>Pattern<select id=led-pattern onchange=ledRtSend()>"
+              "<option value=solid>Solid</option>"
+              "<option value=blink>Blink</option>"
+              "<option value=breath>Breath</option>"
+              "<option value=chase>Chase</option>"
+              "<option value=rainbow>Rainbow</option>"
+              "<option value=wave>Wave</option>"
+              "</select></label>"
+              "<div style=\"margin:8px 0\"><b>Color</b>"
+              "<canvas id=led-cmap width=280 height=120 style=\"display:block;margin:6px 0;border-radius:6px;border:1px solid #ccc;cursor:crosshair;touch-action:none\"></canvas>"
+              "<div style=\"display:flex;align-items:center;gap:8px\"><span style=\"display:inline-block;width:28px;height:28px;border-radius:4px;border:1px solid #999\" id=led-cswatch></span>"
+              "<span id=led-cval>#FF8800</span></div>"
+              "<input type=hidden id=led-color value=\"#FF8800\">"
+              "</div>"
+              "<label>Speed &nbsp;<span class=range-val id=led-spd-lbl>5</span>"
+              "<input type=range min=1 max=10 value=5 id=led-speed "
+              "oninput=\"document.getElementById('led-spd-lbl').textContent=this.value;ledRtSend()\"></label>"
+              "<div style=\"display:flex;gap:8px;align-items:center;margin:8px 0\">"
+              "<button type=button class=mini-btn onclick=applyLed()>Apply</button>"
+              "<label style=\"display:flex;align-items:center;gap:6px;margin:0;cursor:pointer\">"
+              "<input type=checkbox id=led-rt onchange=\"this.parentElement.style.color=this.checked?'#e44':'#333'\"> Realtime</label>"
+              "</div>"
+              "</div>"
+              "<div class=sec><span id=led-status></span></div>"
+              "</div>");
     html += F("<div id=tab-general class=tab>");
     html += F("<div class=sec><h3>General</h3>"
               "<label>TTS Volume &nbsp;<span class=range-val id=vol_lbl>");
@@ -2758,6 +2970,8 @@ void handle_speak_server() {
     bool is_post_servo  = req_line.startsWith("POST /servo");
     bool is_post_speak  = req_line.startsWith("POST /speak");
     bool is_post_config = req_line.startsWith("POST /config");
+    bool is_post_led_gen = req_line.startsWith("POST /led-gen");
+    bool is_post_led    = !is_post_led_gen && req_line.startsWith("POST /led");
 
     int content_length = 0;
     String ws_key = "";
@@ -2886,6 +3100,148 @@ void handle_speak_server() {
 
         queue_http_beat(step_index, accent, bpm_hint, motion);
         client.print("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 42\r\nConnection: close\r\n\r\n{\"ok\":true,\"queued\":true,\"mode\":\"beat\"}");
+        client.stop();
+        return;
+    }
+
+    if (is_post_led_gen) {
+        // Read request body for optional theme
+        String led_gen_body = "";
+        uint32_t lg_deadline = millis() + 1000;
+        while ((int)led_gen_body.length() < content_length && millis() < lg_deadline) {
+            if (client.available()) led_gen_body += (char)client.read();
+        }
+        String led_gen_theme = "";
+        {
+            JsonDocument lg_doc;
+            if (!deserializeJson(lg_doc, led_gen_body)) {
+                led_gen_theme = lg_doc["theme"] | "";
+            }
+        }
+        // Call LLM to generate a random LED pattern
+        if (hermes_endpoint.isEmpty()) {
+            String err = "{\"ok\":false,\"error\":\"LLM not configured\"}";
+            client.print("HTTP/1.1 503 Service Unavailable\r\nContent-Type: application/json\r\nContent-Length: ");
+            client.print(err.length());
+            client.print("\r\nConnection: close\r\n\r\n");
+            client.print(err);
+            client.stop();
+            return;
+        }
+        String prompt = "Generate a creative LED lighting pattern for a small robot. "
+            "Reply ONLY with a JSON object (no markdown, no explanation outside JSON). Format:\n"
+            "{\"pattern\":\"solid|blink|breath|chase|rainbow|wave\","
+            "\"color\":\"#RRGGBB\",\"speed\":1-10,"
+            "\"description\":\"one-line description in Japanese\"}\n";
+        if (!led_gen_theme.isEmpty()) {
+            prompt += "Theme/mood requested by user: " + led_gen_theme + "\n"
+                      "Choose colors and pattern that match this theme.\n";
+        }
+        prompt += "Be creative and varied. Pick interesting color combinations and patterns.";
+        String llm_reply = call_hermes(prompt);
+        // Extract JSON from reply (LLM may wrap in markdown code block)
+        int json_start = llm_reply.indexOf('{');
+        int json_end = llm_reply.lastIndexOf('}');
+        if (json_start < 0 || json_end <= json_start) {
+            String err = "{\"ok\":false,\"error\":\"LLM returned no JSON\",\"raw\":\"" + llm_reply.substring(0, 100) + "\"}";
+            client.print("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: ");
+            client.print(err.length());
+            client.print("\r\nConnection: close\r\n\r\n");
+            client.print(err);
+            client.stop();
+            return;
+        }
+        String json_str = llm_reply.substring(json_start, json_end + 1);
+        // Validate it parses
+        JsonDocument gen_doc;
+        if (deserializeJson(gen_doc, json_str)) {
+            String err = "{\"ok\":false,\"error\":\"parse\",\"raw\":\"" + json_str.substring(0, 100) + "\"}";
+            client.print("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: ");
+            client.print(err.length());
+            client.print("\r\nConnection: close\r\n\r\n");
+            client.print(err);
+            client.stop();
+            return;
+        }
+        // Build response with ok:true merged
+        String res = "{\"ok\":true,\"pattern\":\"";
+        res += gen_doc["pattern"] | "solid";
+        res += "\",\"color\":\"";
+        res += gen_doc["color"] | "#FFFFFF";
+        res += "\",\"speed\":";
+        res += String((int)(gen_doc["speed"] | 5));
+        res += ",\"description\":\"";
+        String desc = gen_doc["description"] | "";
+        desc.replace("\"", "'");
+        desc.replace("\\", "");
+        res += desc;
+        res += "\"}";
+        client.print("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: ");
+        client.print(res.length());
+        client.print("\r\nConnection: close\r\n\r\n");
+        client.print(res);
+        client.stop();
+        return;
+    }
+
+    if (is_post_led) {
+        String body = "";
+        uint32_t deadline = millis() + 1000;
+        while ((int)body.length() < content_length && millis() < deadline) {
+            if (client.available()) body += (char)client.read();
+        }
+        JsonDocument doc;
+        if (deserializeJson(doc, body)) {
+            client.print("HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: 25\r\nConnection: close\r\n\r\n{\"ok\":false,\"error\":\"json\"}");
+            client.stop();
+            return;
+        }
+        String res_pattern = "off";
+        String res_color = "#000000";
+        if (doc["off"] | false) {
+            led_set(LED_OFF);
+            led_force_clear();
+        } else if (doc["preset"].is<const char*>()) {
+            String preset = doc["preset"].as<String>();
+            if (preset == "warm_white")     { manual_pattern = PAT_SOLID; manual_r = 255; manual_g = 200; manual_b = 120; }
+            else if (preset == "cool_blue") { manual_pattern = PAT_SOLID; manual_r = 0; manual_g = 100; manual_b = 255; }
+            else if (preset == "alert_red") { manual_pattern = PAT_BLINK; manual_r = 255; manual_g = 0; manual_b = 0; manual_on_ms = 300; manual_off_ms = 300; }
+            else if (preset == "calm_breath") { manual_pattern = PAT_BREATH; manual_r = 0; manual_g = 120; manual_b = 200; manual_speed = 5; }
+            else if (preset == "christmas") { manual_pattern = PAT_CHASE; manual_r = 255; manual_g = 0; manual_b = 0; manual_speed = 8; }
+            else if (preset == "ocean")     { manual_pattern = PAT_WAVE; manual_r = 0; manual_g = 80; manual_b = 200; manual_speed = 5; }
+            else if (preset == "rainbow")   { manual_pattern = PAT_RAINBOW; manual_speed = 5; }
+            else if (preset == "party")     { manual_pattern = PAT_CHASE; manual_r = (uint8_t)random(100, 256); manual_g = (uint8_t)random(100, 256); manual_b = (uint8_t)random(100, 256); manual_speed = 9; }
+            led_set(LED_MANUAL);
+            const char* pat_names[] = {"solid","blink","breath","chase","rainbow","wave"};
+            res_pattern = pat_names[manual_pattern];
+            char hex[8]; snprintf(hex, sizeof(hex), "#%02X%02X%02X", (int)manual_r, (int)manual_g, (int)manual_b);
+            res_color = hex;
+        } else {
+            String pat = doc["pattern"] | "solid";
+            if (pat == "solid")      manual_pattern = PAT_SOLID;
+            else if (pat == "blink") manual_pattern = PAT_BLINK;
+            else if (pat == "breath") manual_pattern = PAT_BREATH;
+            else if (pat == "chase") manual_pattern = PAT_CHASE;
+            else if (pat == "rainbow") manual_pattern = PAT_RAINBOW;
+            else if (pat == "wave")  manual_pattern = PAT_WAVE;
+            String color_str = doc["color"] | "#FFFFFF";
+            if (color_str.length() == 7 && color_str[0] == '#') {
+                manual_r = (uint8_t)strtol(color_str.substring(1, 3).c_str(), nullptr, 16);
+                manual_g = (uint8_t)strtol(color_str.substring(3, 5).c_str(), nullptr, 16);
+                manual_b = (uint8_t)strtol(color_str.substring(5, 7).c_str(), nullptr, 16);
+            }
+            manual_speed = doc["speed"] | 5;
+            if (manual_speed < 1) manual_speed = 1;
+            if (manual_speed > 10) manual_speed = 10;
+            led_set(LED_MANUAL);
+            res_pattern = pat;
+            res_color = color_str;
+        }
+        String res = "{\"ok\":true,\"pattern\":\"" + res_pattern + "\",\"color\":\"" + res_color + "\"}";
+        client.print("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: ");
+        client.print(res.length());
+        client.print("\r\nConnection: close\r\n\r\n");
+        client.print(res);
         client.stop();
         return;
     }
