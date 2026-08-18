@@ -383,9 +383,10 @@ static m5::PY32IOExpander_Class* led_io = nullptr;
 enum LedMode { LED_OFF, LED_HEARING, LED_THINKING, LED_SPEAKING, LED_ERROR, LED_HAPPY, LED_MANUAL };
 static volatile LedMode led_mode = LED_OFF;
 
-enum ManualPattern : uint8_t { PAT_SOLID, PAT_BLINK, PAT_BREATH, PAT_CHASE, PAT_RAINBOW, PAT_WAVE };
+enum ManualPattern : uint8_t { PAT_SOLID, PAT_BLINK, PAT_BREATH, PAT_CHASE, PAT_RAINBOW, PAT_WAVE, PAT_SPLIT, PAT_ALTERNATE, PAT_SPLIT_BLINK, PAT_SPLIT_BREATH, PAT_SPLIT_WAVE, PAT_SPLIT_CHASE };
 static volatile ManualPattern manual_pattern = PAT_SOLID;
 static volatile uint8_t manual_r = 0, manual_g = 0, manual_b = 0;
+static volatile uint8_t manual_r2 = 255, manual_g2 = 255, manual_b2 = 255;
 static volatile uint8_t manual_speed = 5;  // 1-10
 static volatile uint16_t manual_on_ms = 300, manual_off_ms = 300;
 
@@ -758,6 +759,101 @@ static void led_task(void*) {
                             led_io->refreshLeds();
                             anim += 4;
                             vTaskDelay(pdMS_TO_TICKS(20 + delay_base * 4));
+                            break;
+                        }
+                        case PAT_SPLIT: {
+                            uint8_t mr2 = manual_r2, mg2 = manual_g2, mb2 = manual_b2;
+                            ScopedLock lock(io_mutex);
+                            int half = LED_NUM / 2;
+                            for (int i = 0; i < LED_NUM; i++) {
+                                if (i < half)
+                                    led_io->setLedColor(i, mr, mg, mb);
+                                else
+                                    led_io->setLedColor(i, mr2, mg2, mb2);
+                            }
+                            led_io->refreshLeds();
+                            vTaskDelay(pdMS_TO_TICKS(100));
+                            break;
+                        }
+                        case PAT_ALTERNATE: {
+                            uint8_t mr2 = manual_r2, mg2 = manual_g2, mb2 = manual_b2;
+                            ScopedLock lock(io_mutex);
+                            for (int i = 0; i < LED_NUM; i++) {
+                                int idx = (i + chase_pos) % LED_NUM;
+                                if (idx % 2 == 0)
+                                    led_io->setLedColor(i, mr, mg, mb);
+                                else
+                                    led_io->setLedColor(i, mr2, mg2, mb2);
+                            }
+                            led_io->refreshLeds();
+                            chase_pos = (chase_pos + 1) % LED_NUM;
+                            vTaskDelay(pdMS_TO_TICKS(50 + delay_base * 8));
+                            break;
+                        }
+                        case PAT_SPLIT_BLINK: {
+                            uint8_t mr2 = manual_r2, mg2 = manual_g2, mb2 = manual_b2;
+                            blink_state = !blink_state;
+                            ScopedLock lock(io_mutex);
+                            int half = LED_NUM / 2;
+                            for (int i = 0; i < LED_NUM; i++) {
+                                if (i < half)
+                                    led_io->setLedColor(i, blink_state ? mr : 0, blink_state ? mg : 0, blink_state ? mb : 0);
+                                else
+                                    led_io->setLedColor(i, blink_state ? mr2 : 0, blink_state ? mg2 : 0, blink_state ? mb2 : 0);
+                            }
+                            led_io->refreshLeds();
+                            vTaskDelay(pdMS_TO_TICKS(blink_state ? manual_on_ms : manual_off_ms));
+                            break;
+                        }
+                        case PAT_SPLIT_BREATH: {
+                            uint8_t mr2 = manual_r2, mg2 = manual_g2, mb2 = manual_b2;
+                            if (anim_dir > 0) { if (anim < 249) anim += 6; else anim_dir = -1; }
+                            else              { if (anim > 6)   anim -= 6; else anim_dir =  1; }
+                            ScopedLock lock(io_mutex);
+                            int half = LED_NUM / 2;
+                            for (int i = 0; i < LED_NUM; i++) {
+                                if (i < half)
+                                    led_io->setLedColor(i, (mr * anim) / 255, (mg * anim) / 255, (mb * anim) / 255);
+                                else
+                                    led_io->setLedColor(i, (mr2 * anim) / 255, (mg2 * anim) / 255, (mb2 * anim) / 255);
+                            }
+                            led_io->refreshLeds();
+                            vTaskDelay(pdMS_TO_TICKS(15 + delay_base * 3));
+                            break;
+                        }
+                        case PAT_SPLIT_WAVE: {
+                            uint8_t mr2 = manual_r2, mg2 = manual_g2, mb2 = manual_b2;
+                            ScopedLock lock(io_mutex);
+                            int half = LED_NUM / 2;
+                            for (int i = 0; i < LED_NUM; i++) {
+                                int phase = ((int)anim + i * 255 / LED_NUM) & 0xFF;
+                                uint8_t br = (phase < 128) ? (phase * 2) : ((255 - phase) * 2);
+                                if (i < half)
+                                    led_io->setLedColor(i, (mr * br) / 255, (mg * br) / 255, (mb * br) / 255);
+                                else
+                                    led_io->setLedColor(i, (mr2 * br) / 255, (mg2 * br) / 255, (mb2 * br) / 255);
+                            }
+                            led_io->refreshLeds();
+                            anim += 4;
+                            vTaskDelay(pdMS_TO_TICKS(20 + delay_base * 4));
+                            break;
+                        }
+                        case PAT_SPLIT_CHASE: {
+                            uint8_t mr2 = manual_r2, mg2 = manual_g2, mb2 = manual_b2;
+                            ScopedLock lock(io_mutex);
+                            int half = LED_NUM / 2;
+                            for (int i = 0; i < LED_NUM; i++) led_io->setLedColor(i, 0, 0, 0);
+                            for (int j = 0; j < 3; j++) {
+                                int idx = (chase_pos + j * 4) % LED_NUM;
+                                uint8_t br = (j == 0) ? 255 : 100;
+                                if (idx < half)
+                                    led_io->setLedColor(idx, (mr * br) / 255, (mg * br) / 255, (mb * br) / 255);
+                                else
+                                    led_io->setLedColor(idx, (mr2 * br) / 255, (mg2 * br) / 255, (mb2 * br) / 255);
+                            }
+                            led_io->refreshLeds();
+                            chase_pos = (chase_pos + 1) % LED_NUM;
+                            vTaskDelay(pdMS_TO_TICKS(30 + delay_base * 6));
                             break;
                         }
                     }
@@ -2536,12 +2632,17 @@ static void handle_config_get(WiFiClient& client) {
               "try{const r=await fetch('/led',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({preset:preset})});"
               "const d=await r.json();if(d.ok)setLedStatus(d.pattern+' '+d.color);else setLedStatus('Error');"
               "}catch(e){setLedStatus('Error: '+e.message);}}"
+              "function ledPatChg(){const p=document.getElementById('led-pattern').value;"
+              "const w=document.getElementById('led-c2-wrap');"
+              "if(w)w.style.display=(p.startsWith('split')||p==='alternate')?'block':'none';}"
               "async function applyLed(){"
               "setLedStatus('Applying...');"
               "const pat=document.getElementById('led-pattern').value;"
               "const col=document.getElementById('led-color').value;"
               "const spd=Number(document.getElementById('led-speed').value);"
-              "try{const r=await fetch('/led',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({pattern:pat,color:col,speed:spd})});"
+              "const payload={pattern:pat,color:col,speed:spd};"
+              "if(pat.startsWith('split')||pat==='alternate')payload.color2=document.getElementById('led-color2').value;"
+              "try{const r=await fetch('/led',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});"
               "const d=await r.json();if(d.ok)setLedStatus(d.pattern+' '+d.color);else setLedStatus('Error');"
               "}catch(e){setLedStatus('Error: '+e.message);}}"
               "function initColorMap(){"
@@ -2570,36 +2671,62 @@ static void handle_config_get(WiFiClient& client) {
               "cv.addEventListener('pointermove',e=>{if(cv._picking){e.preventDefault();pick(e);}});"
               "cv.addEventListener('pointerup',()=>{cv._picking=false;});"
               "cv.addEventListener('pointercancel',()=>{cv._picking=false;});"
-              "document.getElementById('led-cswatch').style.background='#FF8800';}"
-              "let _ledGenData=null;"
+              "document.getElementById('led-cswatch').style.background='#FF8800';"
+              "const cv2=document.getElementById('led-cmap2');if(cv2){"
+              "const ctx2=cv2.getContext('2d');"
+              "const w2=cv2.width,h2=cv2.height;"
+              "for(let x=0;x<w2;x++){const hue=x*360/w2;"
+              "for(let y=0;y<h2;y++){ctx2.fillStyle='hsl('+hue+',100%,'+(100-y*100/h2)+'%)';ctx2.fillRect(x,y,1,1);}}"
+              "function pick2(e){"
+              "const r2=cv2.getBoundingClientRect();"
+              "const ex=e.touches?e.touches[0].clientX:e.clientX;"
+              "const ey=e.touches?e.touches[0].clientY:e.clientY;"
+              "const px=Math.max(0,Math.min(w2-1,Math.round((ex-r2.left)*w2/r2.width)));"
+              "const py=Math.max(0,Math.min(h2-1,Math.round((ey-r2.top)*h2/r2.height)));"
+              "const d2=ctx2.getImageData(px,py,1,1).data;"
+              "const hex='#'+((1<<24)+(d2[0]<<16)+(d2[1]<<8)+d2[2]).toString(16).slice(1).toUpperCase();"
+              "document.getElementById('led-color2').value=hex;"
+              "document.getElementById('led-cval2').textContent=hex;"
+              "document.getElementById('led-cswatch2').style.background=hex;ledRtSend();}"
+              "cv2.addEventListener('pointerdown',e=>{e.preventDefault();pick2(e);cv2._picking=true;});"
+              "cv2.addEventListener('pointermove',e=>{if(cv2._picking){e.preventDefault();pick2(e);}});"
+              "cv2.addEventListener('pointerup',()=>{cv2._picking=false;});"
+              "cv2.addEventListener('pointercancel',()=>{cv2._picking=false;});"
+              "document.getElementById('led-cswatch2').style.background='#FFFFFF';}}"
+              "async function ledGenApply(data,el){"
+              "setLedStatus('Applying...');"
+              "const p={pattern:data.pattern,color:data.color,speed:data.speed};"
+              "if(data.color2)p.color2=data.color2;"
+              "try{const r=await fetch('/led',{method:'POST',headers:{'Content-Type':'application/json'},"
+              "body:JSON.stringify(p)});"
+              "const d=await r.json();if(d.ok)setLedStatus(d.pattern+' '+d.color);else setLedStatus('Error');"
+              "document.querySelectorAll('.gen-hist-item').forEach(e=>e.style.outline='none');"
+              "if(el)el.style.outline='2px solid #4CAF50';"
+              "}catch(e){setLedStatus('Error: '+e.message);}}"
+              "function ledGenAddHistory(d){"
+              "const hist=document.getElementById('led-gen-history');if(!hist)return null;"
+              "const dual=d.color2&&(d.pattern.startsWith('split')||d.pattern==='alternate');"
+              "const swatch=dual?'linear-gradient(90deg,'+d.color+' 50%,'+d.color2+' 50%)':d.color;"
+              "const div=document.createElement('div');div.className='gen-hist-item';"
+              "div.style.cssText='display:flex;align-items:center;gap:8px;padding:6px 8px;margin:3px 0;background:#f6f8fa;border:1px solid #ddd;border-radius:6px;cursor:pointer;font-size:13px';"
+              "div._data=d;"
+              "div.innerHTML='<span style=\"display:inline-block;width:22px;height:22px;border-radius:3px;border:1px solid #999;flex-shrink:0;background:'+swatch+'\"></span>'"
+              "+'<span style=\"flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap\">'+d.pattern+(d.description?' — '+d.description:'')+'</span>'"
+              "+'<span style=\"color:#888;flex-shrink:0\">spd:'+d.speed+'</span>';"
+              "div.onclick=()=>ledGenApply(div._data,div);"
+              "hist.insertBefore(div,hist.firstChild);"
+              "while(hist.children.length>5)hist.removeChild(hist.lastChild);"
+              "return div;}"
               "async function ledGen(){"
               "document.getElementById('led-gen-status').textContent='Generating...';"
-              "document.getElementById('led-gen-desc').textContent='';"
-              "document.getElementById('led-gen-preview').style.display='none';"
-              "document.getElementById('led-gen-apply').disabled=true;"
-              "document.getElementById('led-gen-apply').style.opacity='0.5';"
               "const theme=(document.getElementById('led-gen-theme').value||'').trim();"
               "try{const r=await fetch('/led-gen',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(theme?{theme:theme}:{})});"
               "const d=await r.json();"
               "if(!d.ok){document.getElementById('led-gen-status').textContent='Error: '+(d.error||'unknown');return;}"
-              "_ledGenData=d;"
               "document.getElementById('led-gen-status').textContent='';"
-              "document.getElementById('led-gen-desc').textContent=d.description||'';"
-              "document.getElementById('led-gen-pat').textContent=d.pattern;"
-              "document.getElementById('led-gen-color').textContent=d.color;"
-              "document.getElementById('led-gen-swatch').style.background=d.color;"
-              "document.getElementById('led-gen-spd').textContent=d.speed;"
-              "document.getElementById('led-gen-preview').style.display='block';"
-              "document.getElementById('led-gen-apply').disabled=false;"
-              "document.getElementById('led-gen-apply').style.opacity='1';"
+              "const el=ledGenAddHistory(d);"
+              "await ledGenApply(d,el);"
               "}catch(e){document.getElementById('led-gen-status').textContent='Error: '+e.message;}}"
-              "async function ledGenApply(){"
-              "if(!_ledGenData)return;"
-              "setLedStatus('Applying...');"
-              "try{const r=await fetch('/led',{method:'POST',headers:{'Content-Type':'application/json'},"
-              "body:JSON.stringify({pattern:_ledGenData.pattern,color:_ledGenData.color,speed:_ledGenData.speed})});"
-              "const d=await r.json();if(d.ok)setLedStatus(d.pattern+' '+d.color);else setLedStatus('Error');"
-              "}catch(e){setLedStatus('Error: '+e.message);}}"
               "let _ledRtTimer=null;"
               "function ledRtSend(){if(!document.getElementById('led-rt').checked)return;"
               "if(_ledRtTimer)clearTimeout(_ledRtTimer);"
@@ -2716,29 +2843,36 @@ static void handle_config_get(WiFiClient& client) {
               "<div style=\"display:flex;gap:8px;align-items:center;flex-wrap:wrap\">"
               "<input type=text id=led-gen-theme placeholder=\"例: うれしい気持ち\" style=\"flex:1;min-width:120px;padding:6px 8px;border:1px solid #ccc;border-radius:4px;font-size:14px\">"
               "<button type=button class=mini-btn onclick=ledGen()>Gen</button>"
-              "<button type=button class=mini-btn id=led-gen-apply onclick=ledGenApply() disabled style=\"opacity:0.5\">Apply</button>"
               "<span id=led-gen-status></span>"
               "</div>"
-              "<p id=led-gen-desc style=\"margin:6px 0;color:#555;font-size:13px\"></p>"
-              "<div id=led-gen-preview style=\"display:none;font-size:13px;color:#333;margin:4px 0\">"
-              "<span id=led-gen-pat></span> <span id=led-gen-swatch style=\"display:inline-block;width:18px;height:18px;border-radius:3px;border:1px solid #999;vertical-align:middle\"></span> "
-              "<span id=led-gen-color></span> speed:<span id=led-gen-spd></span>"
-              "</div>"
+              "<div id=led-gen-history style=\"margin:6px 0\"></div>"
               "</div>"
               "<div class=sec><h3>Custom</h3>"
-              "<label>Pattern<select id=led-pattern onchange=ledRtSend()>"
+              "<label>Pattern<select id=led-pattern onchange=\"ledPatChg();ledRtSend()\">"
               "<option value=solid>Solid</option>"
               "<option value=blink>Blink</option>"
               "<option value=breath>Breath</option>"
               "<option value=chase>Chase</option>"
               "<option value=rainbow>Rainbow</option>"
               "<option value=wave>Wave</option>"
+              "<option value=split>Split (2-color)</option>"
+              "<option value=split_blink>Split + Blink</option>"
+              "<option value=split_breath>Split + Breath</option>"
+              "<option value=split_wave>Split + Wave</option>"
+              "<option value=split_chase>Split + Chase</option>"
+              "<option value=alternate>Alternate (2-color)</option>"
               "</select></label>"
-              "<div style=\"margin:8px 0\"><b>Color</b>"
+              "<div style=\"margin:8px 0\"><b>Color 1</b>"
               "<canvas id=led-cmap width=280 height=120 style=\"display:block;margin:6px 0;border-radius:6px;border:1px solid #ccc;cursor:crosshair;touch-action:none\"></canvas>"
               "<div style=\"display:flex;align-items:center;gap:8px\"><span style=\"display:inline-block;width:28px;height:28px;border-radius:4px;border:1px solid #999\" id=led-cswatch></span>"
               "<span id=led-cval>#FF8800</span></div>"
               "<input type=hidden id=led-color value=\"#FF8800\">"
+              "</div>"
+              "<div id=led-c2-wrap style=\"margin:8px 0;display:none\"><b>Color 2</b>"
+              "<canvas id=led-cmap2 width=280 height=120 style=\"display:block;margin:6px 0;border-radius:6px;border:1px solid #ccc;cursor:crosshair;touch-action:none\"></canvas>"
+              "<div style=\"display:flex;align-items:center;gap:8px\"><span style=\"display:inline-block;width:28px;height:28px;border-radius:4px;border:1px solid #999\" id=led-cswatch2></span>"
+              "<span id=led-cval2>#FFFFFF</span></div>"
+              "<input type=hidden id=led-color2 value=\"#FFFFFF\">"
               "</div>"
               "<label>Speed &nbsp;<span class=range-val id=led-spd-lbl>5</span>"
               "<input type=range min=1 max=10 value=5 id=led-speed "
@@ -3128,11 +3262,20 @@ void handle_speak_server() {
             client.stop();
             return;
         }
-        String prompt = "Generate a creative LED lighting pattern for a small robot. "
+        String prompt = "Generate a creative LED lighting pattern for a small robot with a 12-LED ring. "
             "Reply ONLY with a JSON object (no markdown, no explanation outside JSON). Format:\n"
-            "{\"pattern\":\"solid|blink|breath|chase|rainbow|wave\","
-            "\"color\":\"#RRGGBB\",\"speed\":1-10,"
-            "\"description\":\"one-line description in Japanese\"}\n";
+            "{\"pattern\":\"solid|blink|breath|chase|rainbow|wave|split|split_blink|split_breath|split_wave|split_chase|alternate\","
+            "\"color\":\"#RRGGBB\",\"color2\":\"#RRGGBB\",\"speed\":1-10,"
+            "\"description\":\"one-line description in Japanese\"}\n"
+            "Two-color patterns (require color2):\n"
+            "  split: static, left half=color, right half=color2\n"
+            "  split_blink: split colors blinking on/off together\n"
+            "  split_breath: split colors with breathing brightness\n"
+            "  split_wave: split colors with wave animation across the ring\n"
+            "  split_chase: split colors with chase dots running around\n"
+            "  alternate: even LEDs=color, odd=color2, rotating\n"
+            "IMPORTANT: color2 is ONLY used by split*/alternate. Other patterns ignore color2.\n"
+            "When the theme involves two or more colors (e.g. flags, Christmas), use a two-color pattern.\n";
         if (!led_gen_theme.isEmpty()) {
             prompt += "Theme/mood requested by user: " + led_gen_theme + "\n"
                       "Choose colors and pattern that match this theme.\n";
@@ -3170,6 +3313,12 @@ void handle_speak_server() {
         res += gen_doc["color"] | "#FFFFFF";
         res += "\",\"speed\":";
         res += String((int)(gen_doc["speed"] | 5));
+        const char* gen_color2 = gen_doc["color2"];
+        if (gen_color2) {
+            res += ",\"color2\":\"";
+            res += gen_color2;
+            res += "\"";
+        }
         res += ",\"description\":\"";
         String desc = gen_doc["description"] | "";
         desc.replace("\"", "'");
@@ -3207,12 +3356,12 @@ void handle_speak_server() {
             else if (preset == "cool_blue") { manual_pattern = PAT_SOLID; manual_r = 0; manual_g = 100; manual_b = 255; }
             else if (preset == "alert_red") { manual_pattern = PAT_BLINK; manual_r = 255; manual_g = 0; manual_b = 0; manual_on_ms = 300; manual_off_ms = 300; }
             else if (preset == "calm_breath") { manual_pattern = PAT_BREATH; manual_r = 0; manual_g = 120; manual_b = 200; manual_speed = 5; }
-            else if (preset == "christmas") { manual_pattern = PAT_CHASE; manual_r = 255; manual_g = 0; manual_b = 0; manual_speed = 8; }
+            else if (preset == "christmas") { manual_pattern = PAT_ALTERNATE; manual_r = 255; manual_g = 0; manual_b = 0; manual_r2 = 0; manual_g2 = 200; manual_b2 = 0; manual_speed = 7; }
             else if (preset == "ocean")     { manual_pattern = PAT_WAVE; manual_r = 0; manual_g = 80; manual_b = 200; manual_speed = 5; }
             else if (preset == "rainbow")   { manual_pattern = PAT_RAINBOW; manual_speed = 5; }
             else if (preset == "party")     { manual_pattern = PAT_CHASE; manual_r = (uint8_t)random(100, 256); manual_g = (uint8_t)random(100, 256); manual_b = (uint8_t)random(100, 256); manual_speed = 9; }
             led_set(LED_MANUAL);
-            const char* pat_names[] = {"solid","blink","breath","chase","rainbow","wave"};
+            const char* pat_names[] = {"solid","blink","breath","chase","rainbow","wave","split","alternate","split_blink","split_breath","split_wave","split_chase"};
             res_pattern = pat_names[manual_pattern];
             char hex[8]; snprintf(hex, sizeof(hex), "#%02X%02X%02X", (int)manual_r, (int)manual_g, (int)manual_b);
             res_color = hex;
@@ -3224,11 +3373,23 @@ void handle_speak_server() {
             else if (pat == "chase") manual_pattern = PAT_CHASE;
             else if (pat == "rainbow") manual_pattern = PAT_RAINBOW;
             else if (pat == "wave")  manual_pattern = PAT_WAVE;
+            else if (pat == "split") manual_pattern = PAT_SPLIT;
+            else if (pat == "alternate") manual_pattern = PAT_ALTERNATE;
+            else if (pat == "split_blink") manual_pattern = PAT_SPLIT_BLINK;
+            else if (pat == "split_breath") manual_pattern = PAT_SPLIT_BREATH;
+            else if (pat == "split_wave") manual_pattern = PAT_SPLIT_WAVE;
+            else if (pat == "split_chase") manual_pattern = PAT_SPLIT_CHASE;
             String color_str = doc["color"] | "#FFFFFF";
             if (color_str.length() == 7 && color_str[0] == '#') {
                 manual_r = (uint8_t)strtol(color_str.substring(1, 3).c_str(), nullptr, 16);
                 manual_g = (uint8_t)strtol(color_str.substring(3, 5).c_str(), nullptr, 16);
                 manual_b = (uint8_t)strtol(color_str.substring(5, 7).c_str(), nullptr, 16);
+            }
+            String color2_str = doc["color2"] | "";
+            if (color2_str.length() == 7 && color2_str[0] == '#') {
+                manual_r2 = (uint8_t)strtol(color2_str.substring(1, 3).c_str(), nullptr, 16);
+                manual_g2 = (uint8_t)strtol(color2_str.substring(3, 5).c_str(), nullptr, 16);
+                manual_b2 = (uint8_t)strtol(color2_str.substring(5, 7).c_str(), nullptr, 16);
             }
             manual_speed = doc["speed"] | 5;
             if (manual_speed < 1) manual_speed = 1;
