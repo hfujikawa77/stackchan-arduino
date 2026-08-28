@@ -2494,7 +2494,7 @@ static void handle_config_get(WiFiClient& client) {
     }
 
     String html;
-    html.reserve(11000);
+    html.reserve(16000);
     html  = F("<!DOCTYPE html><html><head>"
               "<meta charset=UTF-8>"
               "<meta name=viewport content=\"width=device-width,initial-scale=1\">"
@@ -2548,7 +2548,7 @@ static void handle_config_get(WiFiClient& client) {
               "document.getElementById(id).classList.add('active');"
               "document.querySelector('[data-tab=\"'+id+'\"]').classList.add('active');"
               "const saveBtn=document.getElementById('save-btn');"
-              "if(saveBtn)saveBtn.style.display=(id==='tab-speak'||id==='tab-servo'||id==='tab-led')?'none':'block';}"
+              "if(saveBtn)saveBtn.style.display=(id==='tab-speak'||id==='tab-servo'||id==='tab-led'||id==='tab-camera')?'none':'block';}"
               "function appendChat(role,text){const log=document.getElementById('chat-log');"
               "if(!log)return;"
               "const div=document.createElement('div');div.className='bubble '+role;div.textContent=text;"
@@ -2807,6 +2807,7 @@ static void handle_config_get(WiFiClient& client) {
               "<button type=button class=tab-btn data-tab=tab-servo onclick=\"openTab('tab-servo')\">Servo</button>"
               "<button type=button class=tab-btn data-tab=tab-bpm onclick=\"openTab('tab-bpm')\">BPM-Dance</button>"
               "<button type=button class=tab-btn data-tab=tab-led onclick=\"openTab('tab-led')\">LED</button>"
+              "<button type=button class=tab-btn data-tab=tab-camera onclick=\"openTab('tab-camera')\">Camera</button>"
               "<button type=button class=tab-btn data-tab=tab-general onclick=\"openTab('tab-general')\">General</button>"
               "<button type=button class=tab-btn data-tab=tab-periodic onclick=\"openTab('tab-periodic')\">Periodic</button>"
               "</div>"
@@ -2947,6 +2948,26 @@ static void handle_config_get(WiFiClient& client) {
               "</div>"
               "<div class=sec><span id=led-status></span></div>"
               "</div>");
+    html += F("<div id=tab-camera class=tab>"
+              "<div class=sec><h3>Camera Gesture</h3>"
+              "<div style=\"display:flex;align-items:center;gap:10px;margin-bottom:10px\">"
+              "<button type=button class=mini-btn id=cam-toggle onclick=camToggle()>Start Camera</button>"
+              "<button type=button class=mini-btn id=cam-mirror-btn onclick=camMirror()>Mirror</button>"
+              "<span id=cam-status style=\"font-size:13px;color:#888\"></span>"
+              "</div>"
+              "<div style=\"position:relative;max-width:480px\">"
+              "<video id=cam-video autoplay playsinline muted style=\"width:100%;border-radius:8px;background:#000;display:none\"></video>"
+              "<canvas id=cam-canvas style=\"position:absolute;top:0;left:0;width:100%;height:100%;pointer-events:none\"></canvas>"
+              "</div>"
+              "<div id=cam-gesture style=\"margin-top:10px;font-size:18px;font-weight:bold\"></div>"
+              "<div id=cam-secure-hint style=\"display:none;margin-top:10px;padding:10px;background:#fff3cd;border:1px solid #ffc107;border-radius:6px;font-size:13px\">"
+              "<b>Camera requires HTTPS</b><br>"
+              "HTTP page does not allow camera access.<br>"
+              "Chrome: open <code>chrome://flags/#unsafely-treat-insecure-origin-as-secure</code>, add this page URL, restart Chrome.<br>"
+              "Or use a phone browser that allows camera on local network HTTP."
+              "</div>"
+              "<div id=cam-log style=\"margin-top:6px;font-size:13px;color:#666;max-height:120px;overflow-y:auto\"></div>"
+              "</div></div>");
     html += F("<div id=tab-general class=tab>");
     html += F("<div class=sec><h3>General</h3>"
               "<label>TTS Volume &nbsp;<span class=range-val id=vol_lbl>");
@@ -3012,10 +3033,144 @@ static void handle_config_get(WiFiClient& client) {
     html += F("<button id=save-btn class=btn type=submit>Save &amp; Restart</button>"
               "</form></body></html>");
 
-    client.print("HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: ");
-    client.print(html.length());
-    client.print("\r\nConnection: close\r\n\r\n");
-    client.print(html);
+    client.print("HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n");
+    // Send html in chunks
+    {
+        size_t pos = 0;
+        const size_t chunk_sz = 2048;
+        while (pos < html.length()) {
+            size_t len = min(chunk_sz, html.length() - pos);
+            client.printf("%x\r\n", (unsigned)len);
+            client.write((const uint8_t*)(html.c_str() + pos), len);
+            client.print("\r\n");
+            pos += len;
+        }
+    }
+    html = String(); // free memory
+    // Send camera script as separate chunk from PROGMEM
+    {
+        static const char cam_script[] PROGMEM =
+            "<script>"
+            "var _camHL=null,_camOn=false,_camStream=null,_camRaf=null,_camLastMs=0,_camMirrored=false;"
+            "function camMirror(){"
+            "_camMirrored=!_camMirrored;"
+            "var s=_camMirrored?'scaleX(-1)':'';"
+            "document.getElementById('cam-video').style.transform=s;"
+            "document.getElementById('cam-canvas').style.transform=s;"
+            "var btn=document.getElementById('cam-mirror-btn');"
+            "btn.style.background=_camMirrored?'#2196F3':'';"
+            "btn.style.color=_camMirrored?'#fff':'';}"
+            "function camLog(t){var d=document.getElementById('cam-log');if(!d)return;"
+            "var p=document.createElement('div');p.textContent=new Date().toLocaleTimeString()+' '+t;"
+            "d.prepend(p);while(d.children.length>20)d.lastChild.remove();}"
+            "function camIsPeace(lm){"
+            "var idxUp=lm[8].y<lm[6].y;"
+            "var midUp=lm[12].y<lm[10].y;"
+            "var ringDn=lm[16].y>lm[14].y;"
+            "var pinkyDn=lm[20].y>lm[18].y;"
+            "return idxUp&&midUp&&ringDn&&pinkyDn;}"
+            "function camIsPointing(lm){"
+            "var idxUp=lm[8].y<lm[6].y;"
+            "var midDn=lm[12].y>lm[10].y;"
+            "var ringDn=lm[16].y>lm[14].y;"
+            "var pinkyDn=lm[20].y>lm[18].y;"
+            "return idxUp&&midDn&&ringDn&&pinkyDn;}"
+            "function camIsFist(lm){"
+            "var idxDn=lm[8].y>lm[6].y;"
+            "var midDn=lm[12].y>lm[10].y;"
+            "var ringDn=lm[16].y>lm[14].y;"
+            "var pinkyDn=lm[20].y>lm[18].y;"
+            "return idxDn&&midDn&&ringDn&&pinkyDn;}"
+            "var _camServoMs=0,_camFistMs=0;"
+            "function camDetect(){"
+            "if(!_camOn)return;"
+            "var video=document.getElementById('cam-video');"
+            "var cv=document.getElementById('cam-canvas');"
+            "var ctx=cv.getContext('2d');"
+            "ctx.clearRect(0,0,cv.width,cv.height);"
+            "if(video.readyState>=2&&_camHL){"
+            "try{var r=_camHL.detectForVideo(video,performance.now());"
+            "if(r.landmarks&&r.landmarks.length>0){"
+            "var lm=r.landmarks[0];"
+            "ctx.strokeStyle='#0f0';ctx.lineWidth=2;"
+            "for(var i=0;i<lm.length;i++){ctx.beginPath();ctx.arc(lm[i].x*cv.width,lm[i].y*cv.height,3,0,Math.PI*2);ctx.stroke();}"
+            "var gest=document.getElementById('cam-gesture');"
+            "if(camIsPeace(lm)){"
+            "var now=Date.now();"
+            "gest.textContent='\\u270C Peace!';gest.style.color='#4CAF50';"
+            "if(now-_camLastMs>4000){"
+            "_camLastMs=now;camLog('Peace detected -> PatPat!');"
+            "fetch('/gesture',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:'patpat'})}).catch(function(e){camLog('Error: '+e.message);});}"
+            "}else if(camIsPointing(lm)){"
+            "var dx=lm[8].x-lm[5].x;"
+            "var dy=lm[8].y-lm[5].y;"
+            "var sx=Math.round(dx*-180);"
+            "var sy=Math.round(dy*-140);"
+            "sx=Math.max(-45,Math.min(45,sx));"
+            "sy=Math.max(-35,Math.min(35,sy));"
+            "gest.textContent='\\u261D Point ('+sx+', '+sy+')';gest.style.color='#2196F3';"
+            "var now2=Date.now();"
+            "if(now2-_camServoMs>300){"
+            "_camServoMs=now2;"
+            "fetch('/servo',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({x:sx,y:sy,ms:250})}).catch(function(e){camLog('Servo error: '+e.message);});}"
+            "}else if(camIsFist(lm)){"
+            "gest.textContent='\\u270A Fist!';gest.style.color='#FF9800';"
+            "var now3=Date.now();"
+            "if(now3-_camFistMs>1000){"
+            "_camFistMs=now3;camLog('Fist detected -> Center!');"
+            "fetch('/servo',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({x:0,y:0,ms:300,center:true})}).catch(function(e){camLog('Servo error: '+e.message);});}"
+            "}else{"
+            "gest.textContent='';gest.style.color='';}"
+            "}else{"
+            "document.getElementById('cam-gesture').textContent='';}"
+            "}catch(e){camLog('Detect error: '+e.message);}}"
+            "_camRaf=requestAnimationFrame(camDetect);}"
+            "function camStop(){"
+            "_camOn=false;if(_camRaf){cancelAnimationFrame(_camRaf);_camRaf=null;}"
+            "if(_camStream){_camStream.getTracks().forEach(function(t){t.stop();});_camStream=null;}"
+            "var v=document.getElementById('cam-video');v.style.display='none';v.srcObject=null;"
+            "document.getElementById('cam-canvas').getContext('2d').clearRect(0,0,9999,9999);"
+            "document.getElementById('cam-gesture').textContent='';}"
+            "async function camToggle(){"
+            "var btn=document.getElementById('cam-toggle');"
+            "var st=document.getElementById('cam-status');"
+            "if(_camOn){camStop();btn.textContent='Start Camera';btn.style.background='';st.textContent='';return;}"
+            "btn.textContent='Loading...';btn.style.background='#e44';"
+            "try{"
+            "if(!_camHL){"
+            "st.textContent='Loading MediaPipe...';camLog('Loading vision module...');"
+            "var mod=await import('https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.18/vision_bundle.mjs');"
+            "camLog('Module loaded. Resolving WASM...');"
+            "st.textContent='Loading WASM...';"
+            "var fs=await mod.FilesetResolver.forVisionTasks('https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.18/wasm');"
+            "camLog('WASM ready. Creating HandLandmarker...');"
+            "st.textContent='Loading model (GPU)...';"
+            "var modelUrl='https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/latest/hand_landmarker.task';"
+            "try{_camHL=await mod.HandLandmarker.createFromOptions(fs,{baseOptions:{modelAssetPath:modelUrl,delegate:'GPU'},"
+            "runningMode:'VIDEO',numHands:1});camLog('HandLandmarker ready (GPU)');"
+            "}catch(ge){camLog('GPU failed: '+ge.message+', trying CPU...');"
+            "st.textContent='Loading model (CPU)...';"
+            "_camHL=await mod.HandLandmarker.createFromOptions(fs,{baseOptions:{modelAssetPath:modelUrl,delegate:'CPU'},"
+            "runningMode:'VIDEO',numHands:1});camLog('HandLandmarker ready (CPU)');}}"
+            "st.textContent='Starting camera...';"
+            "if(!navigator.mediaDevices||!navigator.mediaDevices.getUserMedia){"
+            "document.getElementById('cam-secure-hint').style.display='block';"
+            "throw new Error('Camera API not available (HTTPS required)');}"
+            "var video=document.getElementById('cam-video');"
+            "_camStream=await navigator.mediaDevices.getUserMedia({video:{facingMode:'user',width:{ideal:480},height:{ideal:360}}});"
+            "video.srcObject=_camStream;video.style.display='block';"
+            "await new Promise(function(r){video.onloadeddata=r;});"
+            "var cv=document.getElementById('cam-canvas');cv.width=video.videoWidth;cv.height=video.videoHeight;"
+            "_camOn=true;btn.textContent='Stop Camera';st.textContent='Running';"
+            "camDetect();"
+            "}catch(e){camLog('Error: '+e.message);btn.textContent='Start Camera';btn.style.background='';st.textContent='Error: '+e.message;}}"
+            "</script>";
+        size_t slen = strlen_P(cam_script);
+        client.printf("%x\r\n", (unsigned)slen);
+        client.write_P(cam_script, slen);
+        client.print("\r\n");
+    }
+    client.print("0\r\n\r\n");
     client.flush();
     client.stop();
 }
@@ -3166,6 +3321,7 @@ void handle_speak_server() {
     bool is_post_servo  = req_line.startsWith("POST /servo");
     bool is_post_speak  = req_line.startsWith("POST /speak");
     bool is_post_config = req_line.startsWith("POST /config");
+    bool is_post_gesture = req_line.startsWith("POST /gesture");
     bool is_post_led_gen = req_line.startsWith("POST /led-gen");
     bool is_post_led    = !is_post_led_gen && req_line.startsWith("POST /led");
 
@@ -3477,6 +3633,41 @@ void handle_speak_server() {
             avatar.setExpression(Expression::Neutral);
         }
         String res = "{\"ok\":true,\"pattern\":\"" + res_pattern + "\",\"color\":\"" + res_color + "\"}";
+        client.print("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: ");
+        client.print(res.length());
+        client.print("\r\nConnection: close\r\n\r\n");
+        client.print(res);
+        client.stop();
+        return;
+    }
+
+    if (is_post_gesture) {
+        String body = "";
+        uint32_t deadline = millis() + 1000;
+        while ((int)body.length() < content_length && millis() < deadline) {
+            if (client.available()) body += (char)client.read();
+        }
+        JsonDocument doc;
+        if (deserializeJson(doc, body)) {
+            client.print("HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: 25\r\nConnection: close\r\n\r\n{\"ok\":false,\"error\":\"json\"}");
+            client.stop();
+            return;
+        }
+        String action = doc["action"] | "";
+        if (action == "patpat" && servo_ready && !busy) {
+            avatar.setExpression(Expression::Happy);
+            avatar.setMouthOpenRatio(0.3f);
+            bool nod_down = false;
+            for (int i = 0; i < 7; i++) {
+                nod_down = !nod_down;
+                sc_servo.moveXY(srv_cx, nod_down ? srv_cy - 18 : srv_cy, 260);
+                delay(280);
+            }
+            sc_servo.moveXY(srv_cx, srv_cy, 300);
+            avatar.setMouthOpenRatio(0.0f);
+            avatar.setExpression(Expression::Neutral);
+        }
+        String res = "{\"ok\":true,\"action\":\"" + action + "\"}";
         client.print("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: ");
         client.print(res.length());
         client.print("\r\nConnection: close\r\n\r\n");
