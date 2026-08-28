@@ -1004,12 +1004,9 @@ static void head_pat_reaction(HeadGesture gesture) {
         Serial.println("Head pat reaction: triple tap (full spin)");
         show("Yay!");
         if (servo_ready) {
-            auto* sx = system_config.getServoInfo(AXIS_X);
-            int x_min = sx ? sx->lower_limit : 0;
-            int x_max = sx ? sx->upper_limit : 300;
-            sc_servo.moveXY(x_min, srv_cy - 5, 300);
-            sc_servo.moveXY(x_max, srv_cy - 5, 1200);
-            sc_servo.moveXY(srv_cx, srv_cy,     400);
+            sc_servo.turnX(500, false, 2000);
+            sc_servo.moveXY(srv_cx, srv_cy, 500);
+            delay(600);
         } else {
             delay(2000);
         }
@@ -3081,7 +3078,13 @@ static void handle_config_get(WiFiClient& client) {
             "var ringDn=lm[16].y>lm[14].y;"
             "var pinkyDn=lm[20].y>lm[18].y;"
             "return idxDn&&midDn&&ringDn&&pinkyDn;}"
-            "var _camServoMs=0,_camFistMs=0;"
+            "function camIsOpenPalm(lm){"
+            "var idxUp=lm[8].y<lm[5].y;"
+            "var midUp=lm[12].y<lm[9].y;"
+            "var ringUp=lm[16].y<lm[13].y;"
+            "var pinkyUp=lm[20].y<lm[17].y;"
+            "return idxUp&&midUp&&ringUp&&pinkyUp;}"
+            "var _camServoMs=0,_camFistMs=0,_camPalmMs=0;"
             "function camDetect(){"
             "if(!_camOn)return;"
             "var video=document.getElementById('cam-video');"
@@ -3119,6 +3122,12 @@ static void handle_config_get(WiFiClient& client) {
             "if(now3-_camFistMs>1000){"
             "_camFistMs=now3;camLog('Fist detected -> Center!');"
             "fetch('/servo',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({x:0,y:0,ms:300,center:true})}).catch(function(e){camLog('Servo error: '+e.message);});}"
+            "}else if(camIsOpenPalm(lm)){"
+            "gest.textContent='\\u270B Palm!';gest.style.color='#9C27B0';"
+            "var now4=Date.now();"
+            "if(now4-_camPalmMs>5000){"
+            "_camPalmMs=now4;camLog('Palm detected -> Spin!');"
+            "fetch('/gesture',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:'spin'})}).catch(function(e){camLog('Error: '+e.message);});}"
             "}else{"
             "gest.textContent='';gest.style.color='';}"
             "}else{"
@@ -3664,6 +3673,15 @@ void handle_speak_server() {
                 delay(280);
             }
             sc_servo.moveXY(srv_cx, srv_cy, 300);
+            avatar.setMouthOpenRatio(0.0f);
+            avatar.setExpression(Expression::Neutral);
+        } else if (action == "spin" && servo_ready && !busy) {
+            servo_idle_enabled = false;
+            avatar.setExpression(Expression::Happy);
+            avatar.setMouthOpenRatio(0.4f);
+            sc_servo.turnX(500, false, 2000);
+            sc_servo.moveXY(srv_cx, srv_cy, 500);
+            delay(600);
             avatar.setMouthOpenRatio(0.0f);
             avatar.setExpression(Expression::Neutral);
         }
