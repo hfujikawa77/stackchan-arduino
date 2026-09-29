@@ -2911,7 +2911,7 @@ static void handle_config_get(WiFiClient& client) {
               "</div>"
               "<div style=\"display:flex;gap:8px;align-items:center;margin:6px 0\">"
               "<label style=\"display:flex;align-items:center;gap:6px;margin:0;cursor:pointer\">"
-              "<input type=checkbox id=led-gen-announce> Announce</label>"
+              "<input type=checkbox id=led-gen-announce> 話す</label>"
               "</div>"
               "<div id=led-gen-history style=\"margin:6px 0\"></div>"
               "</div>"
