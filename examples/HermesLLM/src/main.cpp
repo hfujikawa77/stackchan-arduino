@@ -2740,6 +2740,8 @@ static void handle_config_get(WiFiClient& client) {
               "const announce=document.getElementById('led-gen-announce').checked;"
               "if(announce&&d.description){"
               "try{await fetch('/speak',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({mode:'tts',text:d.description})});"
+              "await new Promise(r=>setTimeout(r,500));"
+              "await ledGenApply(d,el);"
               "}catch(e){console.error('Announce error:',e);}}"
               "}catch(e){document.getElementById('led-gen-status').textContent='Error: '+e.message;}}"
               "let _ledRtTimer=null;"
