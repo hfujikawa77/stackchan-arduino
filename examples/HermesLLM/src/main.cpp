@@ -39,6 +39,10 @@ static void speech_scroll_run_to_end(uint8_t repeat_count = 3);
 static void speech_scroll_stop();
 static bool play_wav_file(const char* path);
 static bool call_tts_cache_wav(const String& text, const char* cache_path);
+static bool call_tts_fetch_wav(const String& text, uint8_t** out_buf, int* out_len);
+static void play_wav(uint8_t* wav_buf, int read_len);
+static bool ensure_wifi_connected(uint32_t timeout_ms = 15000);
+static String call_hermes(const String& user_message);
 static String mavlink_notification_audio_path(const String& text);
 static const char B64_TABLE[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 static size_t base64_encode(uint8_t* out, const uint8_t* in, size_t in_len) {
@@ -93,6 +97,7 @@ static int16_t srv_cx = 150, srv_cy = 90;
 static uint32_t servo_idle_next_ms = 0;
 static uint32_t head_pat_cooldown_until_ms = 0;
 static uint32_t head_touch_next_poll_ms = 0;
+static uint32_t startup_stable_until_ms = 0;
 static int16_t servo_web_x = 150;
 static int16_t servo_web_y = 90;
 static WiFiClient servo_ws_client;
@@ -100,6 +105,30 @@ static bool servo_ws_active = false;
 static uint32_t servo_ws_last_ms = 0;
 static volatile bool led_effect_active = false;
 static SemaphoreHandle_t io_mutex = nullptr;
+
+// --- Precache voice queue ---
+#define PRECACHE_QUEUE_MAX 3
+#define PRECACHE_ITEMS_MAX 20
+struct PrecacheEntry {
+    uint8_t* wav = nullptr;  // PSRAM buffer, owned by the queue
+    int wav_len = 0;
+    String text;
+    uint32_t created_ms = 0;
+};
+struct PrecacheItem {
+    String type;  // "fixed" or "llm"
+    String text;  // for fixed type
+    String prompt;  // for llm type
+};
+static std::array<PrecacheEntry, PRECACHE_QUEUE_MAX> precache_queue;
+static uint8_t precache_queue_size = 0;
+static uint32_t precache_next_generate_ms = 0;
+static bool precache_on_pat_enabled = true;
+static float weather_lat = 35.681f;  // Tokyo by default; override with weather_lat/weather_lon in SC_SecConfig.yaml
+static float weather_lon = 139.767f;
+static std::array<PrecacheItem, PRECACHE_ITEMS_MAX> precache_items;
+static uint8_t precache_items_count = 0;
+static uint8_t precache_item_index = 0;
 
 // --- Settings ---
 enum AppMode { MODE_NORMAL, MODE_SETTINGS, MODE_BPM_DETECT, MODE_BPM_PLAY };
@@ -109,6 +138,7 @@ static int setting_brightness = 200;
 static int setting_wifi_index = 0;
 static bool setting_attitude_servo_enabled = false;
 static bool setting_rc_follow_enabled = false;
+static bool setting_pat_talk_enabled = true;
 static bool setting_attitude_yaw_source_roll = false;
 static int setting_attitude_scale = 50;
 static uint8_t setting_page = 0;   // 0=Main, 1=Flight, 2=LLM
@@ -928,6 +958,229 @@ void led_idle_log_tick() {
     }
 }
 
+static const uint32_t PRECACHE_IDLE_DELAY_MS = 15000;
+static const int PRECACHE_RECENT_MAX = 3;
+static String precache_recent[PRECACHE_ITEMS_MAX][PRECACHE_RECENT_MAX];
+static uint8_t precache_recent_pos[PRECACHE_ITEMS_MAX];
+
+static void precache_cleanup_files() {
+    File dir = SPIFFS.open("/cache");
+    if (!dir) return;
+    String stale[64];
+    int n = 0;
+    for (File f = dir.openNextFile(); f && n < 64; f = dir.openNextFile()) {
+        String name = f.name();
+        if (name.indexOf("precache_") >= 0) stale[n++] = name.startsWith("/") ? name : "/spiffs/cache/" + name;
+    }
+    dir.close();
+    for (int i = 0; i < n; i++) {
+        String p = stale[i].startsWith("/spiffs") ? stale[i].substring(7) : stale[i];
+        SPIFFS.remove(p);
+    }
+    Serial.printf("Precache cleanup: removed %d stale files\n", n);
+}
+
+// Caller owns the returned buffer and must heap_caps_free it.
+static bool precache_pop(uint8_t** out_wav, int* out_len) {
+    if (precache_queue_size == 0) {
+        Serial.println("Precache queue empty");
+        return false;
+    }
+    *out_wav = precache_queue[0].wav;
+    *out_len = precache_queue[0].wav_len;
+    Serial.printf("Precache pop: text=%s, queue_size=%d\n", precache_queue[0].text.c_str(), precache_queue_size);
+    for (int i = 0; i < precache_queue_size - 1; i++) {
+        precache_queue[i] = precache_queue[i + 1];
+    }
+    precache_queue_size--;
+    precache_queue[precache_queue_size].wav = nullptr;
+    precache_queue[precache_queue_size].wav_len = 0;
+    return true;
+}
+
+static bool precache_push(uint8_t* wav, int wav_len, const String& text) {
+    if (precache_queue_size >= PRECACHE_QUEUE_MAX) {
+        M5_LOGI("Precache queue full");
+        return false;
+    }
+    precache_queue[precache_queue_size].wav = wav;
+    precache_queue[precache_queue_size].wav_len = wav_len;
+    precache_queue[precache_queue_size].text = text;
+    precache_queue[precache_queue_size].created_ms = millis();
+    precache_queue_size++;
+    M5_LOGI("Precache push: %s (queue size: %d)", text.c_str(), precache_queue_size);
+    return true;
+}
+
+static const char* weather_code_text(int code) {
+    if (code == 0) return "快晴";
+    if (code == 1) return "晴れ";
+    if (code == 2) return "薄曇り";
+    if (code == 3) return "曇り";
+    if (code == 45 || code == 48) return "霧";
+    if (code >= 51 && code <= 57) return "霧雨";
+    if (code >= 61 && code <= 67) return "雨";
+    if (code >= 71 && code <= 77) return "雪";
+    if (code >= 80 && code <= 82) return "にわか雨";
+    if (code == 85 || code == 86) return "にわか雪";
+    if (code >= 95) return "雷雨";
+    return "不明";
+}
+
+// Returns e.g. "9月30日（水）", or "" if the clock is not synced yet.
+static String today_date_text() {
+    static bool ntp_started = false;
+    if (!ntp_started) {
+        if (!ensure_wifi_connected()) return "";
+        configTzTime("JST-9", "ntp.nict.jp", "pool.ntp.org");
+        ntp_started = true;
+    }
+    struct tm t;
+    if (!getLocalTime(&t, 3000) || t.tm_year + 1900 < 2024) return "";
+    static const char* wd[] = {"日", "月", "火", "水", "木", "金", "土"};
+    char buf[40];
+    snprintf(buf, sizeof(buf), "%d月%d日（%s）", t.tm_mon + 1, t.tm_mday, wd[t.tm_wday]);
+    return String(buf);
+}
+
+static String fetch_weather_summary() {
+    if (!ensure_wifi_connected()) return "";
+    char url[320];
+    snprintf(url, sizeof(url),
+             "https://api.open-meteo.com/v1/forecast?latitude=%.3f&longitude=%.3f"
+             "&current=temperature_2m,weather_code&daily=temperature_2m_max,temperature_2m_min,"
+             "precipitation_probability_max&timezone=auto&forecast_days=1",
+             weather_lat, weather_lon);
+    HTTPClient http;
+    WiFiClientSecure client;
+    client.setInsecure();
+    http.begin(client, url);
+    http.setTimeout(10000);
+    int st = http.GET();
+    if (st != 200) {
+        Serial.printf("WEATHER http=%d\n", st);
+        http.end();
+        return "";
+    }
+    String body = http.getString();
+    http.end();
+    JsonDocument doc;
+    if (deserializeJson(doc, body)) { Serial.println("WEATHER JSON parse error"); return ""; }
+    if (doc["current"].isNull()) return "";
+    char buf[160];
+    snprintf(buf, sizeof(buf), "天気は%s、現在の気温%.0f度、最高%.0f度、最低%.0f度、降水確率%d%%",
+             weather_code_text(doc["current"]["weather_code"] | -1),
+             doc["current"]["temperature_2m"] | 0.0f,
+             doc["daily"]["temperature_2m_max"][0] | 0.0f,
+             doc["daily"]["temperature_2m_min"][0] | 0.0f,
+             doc["daily"]["precipitation_probability_max"][0] | 0);
+    Serial.printf("WEATHER %s\n", buf);
+    return String(buf);
+}
+
+struct PrecacheIndicator {
+    bool led_taken;
+    PrecacheIndicator() {
+        avatar.setExpression(Expression::Doubt);
+        show("おしゃべり準備中…");
+        led_taken = (led_mode == LED_OFF);
+        if (led_taken) led_set(LED_THINKING);
+    }
+    ~PrecacheIndicator() {
+        avatar.setExpression(Expression::Neutral);
+        show("");
+        if (led_taken && led_mode == LED_THINKING) led_set(LED_OFF);
+    }
+};
+
+static void precache_generate_next() {
+    if (!precache_on_pat_enabled || precache_queue_size >= PRECACHE_QUEUE_MAX || busy || precache_items_count == 0
+        || app_mode != MODE_NORMAL) {
+        return;
+    }
+    uint32_t now = millis();
+    if (!time_reached(now, precache_next_generate_ms)) {
+        return;
+    }
+    precache_next_generate_ms = now + 3000;
+    PrecacheIndicator indicator;
+
+    Serial.printf("DEBUG precache_generate_next: index=%d, count=%d\n", precache_item_index, precache_items_count);
+    PrecacheItem& item = precache_items[precache_item_index];
+    Serial.printf("DEBUG item: type=%s, text=%s, prompt=%s\n", item.type.c_str(), item.text.c_str(), item.prompt.c_str());
+    const int item_idx = precache_item_index;
+    precache_item_index = (precache_item_index + 1) % precache_items_count;
+
+    String text;
+    if (item.type == "fixed") {
+        Serial.println("DEBUG: Using fixed text");
+        text = item.text;
+    } else if (item.type == "llm") {
+        Serial.println("DEBUG: Calling LLM...");
+        String avoid;
+        for (int i = 0; i < PRECACHE_RECENT_MAX; i++) {
+            if (!precache_recent[item_idx][i].isEmpty()) avoid += (avoid.isEmpty() ? "" : "、") + precache_recent[item_idx][i];
+        }
+        String topic = item.prompt;
+        if (topic.indexOf("{weather}") >= 0) {
+            String w = fetch_weather_summary();
+            if (w.isEmpty()) {
+                Serial.println("DEBUG: weather fetch failed, skip");
+                return;
+            }
+            topic.replace("{weather}", w);
+        }
+        if (topic.indexOf("{date}") >= 0) {
+            String d = today_date_text();
+            if (d.isEmpty()) {
+                Serial.println("DEBUG: date not available, skip");
+                return;
+            }
+            Serial.printf("DATE %s\n", d.c_str());
+            topic.replace("{date}", d);
+        }
+        String prompt = "次のお題について、そのまま声に出して話せる自然な口語で答えて。"
+                        "説明や記号は不要。長さの指定がなければ30文字以内の一〜二文で。\nお題: " + topic;
+        if (!avoid.isEmpty()) prompt += "\n（前回までの答え「" + avoid + "」とは違う言い方で）";
+        text = call_hermes(prompt);
+        Serial.printf("DEBUG LLM result: %s\n", text.c_str());
+        if (text.startsWith("Error:")) {
+            Serial.printf("Precache LLM error: %s\n", text.c_str());
+            return;
+        }
+        for (int i = 0; i < PRECACHE_RECENT_MAX; i++) {
+            if (precache_recent[item_idx][i] == text) {
+                Serial.println("DEBUG: LLM text duplicate, skip");
+                return;
+            }
+        }
+    } else {
+        Serial.printf("DEBUG: Unknown type: %s\n", item.type.c_str());
+        return;
+    }
+
+    Serial.printf("DEBUG: Generating TTS for: %s\n", text.c_str());
+    uint8_t* wav = nullptr;
+    int wav_len = 0;
+    bool tts_ok = call_tts_fetch_wav(text, &wav, &wav_len);
+    Serial.printf("DEBUG: TTS result=%d (%d bytes)\n", tts_ok ? 1 : 0, wav_len);
+
+    if (tts_ok) {
+        Serial.printf("DEBUG: Pushing to queue: %s\n", text.c_str());
+        if (!precache_push(wav, wav_len, text)) {
+            heap_caps_free(wav);
+            return;
+        }
+        if (item.type == "llm") {
+            precache_recent[item_idx][precache_recent_pos[item_idx]] = text;
+            precache_recent_pos[item_idx] = (precache_recent_pos[item_idx] + 1) % PRECACHE_RECENT_MAX;
+        }
+        Serial.printf("DEBUG: Queue size now: %d\n", precache_queue_size);
+    } else {
+        Serial.println("DEBUG: TTS generation failed");
+    }
+}
+
 static HeadGesture head_pat_detected() {
     head_touch_sensor.update();
     if (head_touch_sensor.was_swiped_forward() || head_touch_sensor.was_swiped_backward())
@@ -950,6 +1203,10 @@ static void head_pat_reaction(HeadGesture gesture) {
         return;
     }
     uint32_t now = millis();
+    if (!time_reached(now, startup_stable_until_ms)) {
+        Serial.println("Head pat ignored: startup stabilization");
+        return;
+    }
     if (!time_reached(now, head_pat_cooldown_until_ms)) {
         Serial.println("Head pat ignored: cooldown");
         return;
@@ -967,6 +1224,26 @@ static void head_pat_reaction(HeadGesture gesture) {
     if (gesture == GESTURE_PAT) {
         Serial.println("Head pat reaction: pat (left-right)");
         show("Pat pat");
+        Serial.printf("DEBUG: precache_on_pat_enabled=%d, queue_size=%d\n", precache_on_pat_enabled ? 1 : 0, precache_queue_size);
+        if (precache_on_pat_enabled) {
+            Serial.printf("Precache speak: enabled, queue_size=%d\n", precache_queue_size);
+            for (int i = 0; i < precache_queue_size; i++) {
+                Serial.printf("  Queue[%d]: text=%s, %d bytes\n", i, precache_queue[i].text.c_str(), precache_queue[i].wav_len);
+            }
+            uint8_t* voice_wav = nullptr;
+            int voice_len = 0;
+            if (precache_pop(&voice_wav, &voice_len)) {
+                const bool led_taken = (led_mode == LED_OFF);
+                if (led_taken) led_set(LED_SPEAKING);
+                play_wav(voice_wav, voice_len);
+                if (led_taken && led_mode == LED_SPEAKING) led_set(LED_OFF);
+                heap_caps_free(voice_wav);
+            } else {
+                Serial.println("No voice file available");
+            }
+        } else {
+            Serial.println("Precache speak: disabled");
+        }
         uint32_t next_motion_ms = reaction_started_ms;
         bool motion_phase = false;
         while (!time_reached(millis(), reaction_started_ms + HEAD_PAT_REACTION_MS)) {
@@ -981,6 +1258,7 @@ static void head_pat_reaction(HeadGesture gesture) {
             }
             delay(10);
         }
+        precache_next_generate_ms = millis() + PRECACHE_IDLE_DELAY_MS;
     } else if (gesture == GESTURE_DOUBLE_TAP) {
         // 2 taps: vertical nod
         Serial.println("Head pat reaction: double tap (vertical nod)");
@@ -1396,7 +1674,7 @@ int    hermes_timeout_ms   = 180000;
 String voicevox_host    = "";  // e.g. "192.168.1.100:50021" - use local VOICEVOX if set
 int    voicevox_speaker = 1;
 
-static bool ensure_wifi_connected(uint32_t timeout_ms = 15000) {
+static bool ensure_wifi_connected(uint32_t timeout_ms) {
     if (WiFi.status() == WL_CONNECTED) return true;
 
     M5_LOGW("WiFi disconnected (status=%d), reconnecting...", WiFi.status());
@@ -1492,6 +1770,11 @@ void load_hermes_config(fs::FS& fs) {
         return normalized_yaml.substring(pos, normalized_yaml.indexOf("\"", pos));
     };
     voicevox_host = extractStr("voicevox_host");
+    {
+        String lat = extractStr("weather_lat");
+        String lon = extractStr("weather_lon");
+        if (!lat.isEmpty() && !lon.isEmpty()) { weather_lat = lat.toFloat(); weather_lon = lon.toFloat(); }
+    }
     if (!voicevox_host.isEmpty()) M5_LOGI("Local VOICEVOX: %s speaker=%d", voicevox_host.c_str(), voicevox_speaker);
     load_wifi_credentials_from_yaml(normalized_yaml);
     load_llm_models_from_yaml(normalized_yaml);
@@ -1499,6 +1782,7 @@ void load_hermes_config(fs::FS& fs) {
     servo_on_boot = extractInt("servo_on_boot", servo_on_boot ? 1 : 0) != 0;
     mavlink_attitude_servo_enabled = extractInt("mavlink_attitude_servo", mavlink_attitude_servo_enabled ? 1 : 0) != 0;
     mavlink_rc_follow_enabled = extractInt("mavlink_rc_follow", mavlink_rc_follow_enabled ? 1 : 0) != 0;
+    precache_on_pat_enabled = extractInt("precache_on_pat", precache_on_pat_enabled ? 1 : 0) != 0;
     if (mavlink_rc_follow_enabled) mavlink_attitude_servo_enabled = false;
     mavlink_attitude_yaw_source_roll = extractInt("mavlink_yaw_source_roll", mavlink_attitude_yaw_source_roll ? 1 : 0) != 0;
     mavlink_attitude_scale = constrain(extractInt("mavlink_attitude_scale", mavlink_attitude_scale), 0, 100);
@@ -1837,8 +2121,22 @@ static bool save_and_play_wav(uint8_t* wav_buf, int read_len, const char* cache_
     return true;
 }
 
-static bool call_tts_cache_wav(const String& text, const char* cache_path) {
-    bpm_stop_audio();
+static bool save_wav_only(uint8_t* wav_buf, int wav_size, const char* cache_path) {
+    File f = SPIFFS.open(cache_path, "w");
+    if (!f) { M5_LOGE("save_wav_only: open failed: %s", cache_path); return false; }
+    size_t written = f.write(wav_buf, wav_size);
+    f.close();
+    bool ok = (written == (size_t)wav_size);
+    if (!ok) SPIFFS.remove(cache_path);
+    Serial.printf("save_wav_only: %s (%d bytes, written=%u) -> %s, spiffs free=%u\n", cache_path, wav_size,
+                  (unsigned)written, ok ? "OK" : "FAIL", (unsigned)(SPIFFS.totalBytes() - SPIFFS.usedBytes()));
+    return ok;
+}
+
+// Downloads WAV into a PSRAM buffer (caller frees with heap_caps_free). Does not play.
+static bool call_tts_fetch_wav(const String& text, uint8_t** out_buf, int* out_len) {
+    *out_buf = nullptr;
+    *out_len = 0;
     if (!ensure_wifi_connected()) return false;
 
     if (!voicevox_host.isEmpty()) {
@@ -1869,9 +2167,10 @@ static bool call_tts_cache_wav(const String& text, const char* cache_path) {
         int read_len = http2.getStream().readBytes(wav_buf, wav_size);
         http2.end();
 
-        bool ok = read_len > 44 && save_and_play_wav(wav_buf, read_len, cache_path);
-        heap_caps_free(wav_buf);
-        return ok;
+        if (read_len <= 44) { heap_caps_free(wav_buf); return false; }
+        *out_buf = wav_buf;
+        *out_len = read_len;
+        return true;
     }
 
     String api_key = system_config.getAPISetting()->tts;
@@ -1884,41 +2183,59 @@ static bool call_tts_cache_wav(const String& text, const char* cache_path) {
     http1.begin(c1, synth_url);
     http1.setTimeout(15000);
     int st1 = http1.GET();
-    if (st1 != 200) { M5_LOGE("TTS synth error: %d", st1); http1.end(); return false; }
+    if (st1 != 200) {
+        Serial.printf("TTSDBG synth http=%d body=%s\n", st1, http1.getString().c_str());
+        http1.end();
+        return false;
+    }
 
     String json_resp = http1.getString();
     http1.end();
+    Serial.printf("TTSDBG synth resp=%s\n", json_resp.c_str());
 
     JsonDocument jdoc;
-    if (deserializeJson(jdoc, json_resp)) { M5_LOGE("TTS JSON parse error"); return false; }
+    if (deserializeJson(jdoc, json_resp)) { Serial.println("TTSDBG JSON parse error"); return false; }
     if (!jdoc["success"].as<bool>()) {
-        M5_LOGE("TTS API success=false: %s", jdoc["errorMessage"].as<const char*>());
+        Serial.printf("TTSDBG success=false err=%s\n", jdoc["errorMessage"].as<const char*>());
         return false;
     }
 
     String wav_url = jdoc["wavDownloadUrl"].as<String>();
-    if (wav_url.isEmpty()) return false;
+    if (wav_url.isEmpty()) { Serial.println("TTSDBG empty wavDownloadUrl"); return false; }
+    int st2 = 0;
     for (int i = 0; i < 10; ++i) {
         HTTPClient http2;
         WiFiClientSecure c2; c2.setInsecure();
         http2.begin(c2, wav_url);
         http2.setTimeout(15000);
-        int st2 = http2.GET();
+        st2 = http2.GET();
         if (st2 == 200) {
             int wav_size = http2.getSize();
             if (wav_size <= 0) wav_size = 512 * 1024;
             uint8_t* wav_buf = (uint8_t*)heap_caps_malloc(wav_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-            if (!wav_buf) { M5_LOGE("malloc failed"); http2.end(); return false; }
+            if (!wav_buf) { Serial.println("TTSDBG malloc failed"); http2.end(); return false; }
             int read_len = http2.getStream().readBytes(wav_buf, wav_size);
             http2.end();
-            bool ok = read_len > 44 && save_and_play_wav(wav_buf, read_len, cache_path);
-            heap_caps_free(wav_buf);
-            return ok;
+            Serial.printf("TTSDBG wav read_len=%d size=%d try=%d\n", read_len, wav_size, i);
+            if (read_len <= 44) { heap_caps_free(wav_buf); return false; }
+            *out_buf = wav_buf;
+            *out_len = read_len;
+            return true;
         }
         http2.end();
         delay(1000);
     }
+    Serial.printf("TTSDBG wav download gave up, last http=%d\n", st2);
     return false;
+}
+
+static bool call_tts_cache_wav(const String& text, const char* cache_path) {
+    uint8_t* buf = nullptr;
+    int len = 0;
+    if (!call_tts_fetch_wav(text, &buf, &len)) return false;
+    bool ok = save_wav_only(buf, len, cache_path);
+    heap_caps_free(buf);
+    return ok;
 }
 
 bool call_tts_local(const String& text) {
@@ -2813,6 +3130,7 @@ static void handle_config_get(WiFiClient& client) {
               "<button type=button class=tab-btn data-tab=tab-camera onclick=\"openTab('tab-camera')\">Camera</button>"
               "<button type=button class=tab-btn data-tab=tab-general onclick=\"openTab('tab-general')\">General</button>"
               "<button type=button class=tab-btn data-tab=tab-periodic onclick=\"openTab('tab-periodic')\">Periodic</button>"
+              "<button type=button class=tab-btn data-tab=tab-precache onclick=\"openTab('tab-precache')\">Voice Cache</button>"
               "</div>"
               "<form method=post action=/config>");
     html += F("<div id=tab-security class=\"tab active\">");
@@ -3037,7 +3355,24 @@ static void handle_config_get(WiFiClient& client) {
         html += "\"></label></div>";
     }
     html += F("</div>");
-    html += F("<button id=save-btn class=btn type=submit>Save &amp; Restart</button>"
+    html += F("<div id=tab-precache class=tab>"
+              "<div class=sec><h3>Voice Cache Queue</h3>"
+              "<p id=precache-status>Queue: ");
+    html += String(precache_queue_size);
+    html += F("/3</p>"
+              "<p>ナデナデ会話のOn/Offは本体の設定画面(Main)で変更します。</p>"
+              "<button type=button class=mini-btn onclick=\"precacheRefresh()\">Refresh Status</button>"
+              "</div>"
+              "<div class=sec><h3>Precache Items (Fixed/LLM)</h3>"
+              "<p>JSON format: [<br>"
+              "&nbsp;&nbsp;{\"type\":\"fixed\",\"text\":\"うれしい\"},<br>"
+              "&nbsp;&nbsp;{\"type\":\"llm\",\"prompt\":\"今日の天気を短く説明\"}<br>"
+              "]</p>"
+              "<textarea id=precache-items-json name=precache_items_json style=\"width:100%;height:200px;font-family:monospace;padding:8px;border:1px solid #ccc;border-radius:4px\" placeholder=\"Enter JSON array here\"></textarea>"
+              "<input type=hidden id=precache-items-json-hidden name=precache_items_json_hidden>"
+              "</div>"
+              "</div>");
+    html += F("<button id=save-btn class=btn type=submit onclick=\"precachePrepareSubmit()\">Save &amp; Restart</button>"
               "</form></body></html>");
 
     client.print("HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n");
@@ -3054,6 +3389,31 @@ static void handle_config_get(WiFiClient& client) {
         }
     }
     html = String(); // free memory
+    // Send precache script
+    {
+        static const char precache_script[] PROGMEM =
+            "<script>"
+            "function precacheRefresh(){"
+            "fetch('/config',{method:'GET'}).then(r=>r.text()).then(html=>{"
+            "var m=html.match(/Queue:\\s*(\\d+)\\/(\\d+)/);"
+            "var st=document.getElementById('precache-status');"
+            "if(m&&st)st.textContent='Queue: '+m[1]+'/'+m[2];"
+            "}).catch(e=>console.error('Precache refresh error:',e));}"
+            "function precachePrepareSubmit(){"
+            "var textarea=document.getElementById('precache-items-json');"
+            "var hidden=document.getElementById('precache-items-json-hidden');"
+            "if(textarea&&hidden){"
+            "try{JSON.parse(textarea.value);hidden.value=textarea.value;}"
+            "catch(e){alert('Invalid JSON: '+e.message);return false;}"
+            "}"
+            "document.querySelector('form').submit();"
+            "}"
+            "</script>";
+        size_t slen = strlen_P(precache_script);
+        client.printf("%x\r\n", (unsigned)slen);
+        client.write_P(precache_script, slen);
+        client.print("\r\n");
+    }
     // Send camera script as separate chunk from PROGMEM
     {
         static const char cam_script[] PROGMEM =
@@ -3226,6 +3586,36 @@ static void handle_config_post(WiFiClient& client, int content_length) {
     String volume    = form_field(body, "tts_volume");
     String bright    = form_field(body, "brightness");
     bool servo_boot  = form_has_checked(body, "servo_on_boot");
+    String items_json = form_field(body, "precache_items_json_hidden");
+
+    M5_LOGI("Precache items_json received: %s", items_json.c_str());
+
+    // Parse and update precache items
+    if (!items_json.isEmpty()) {
+        JsonDocument doc;
+        DeserializationError error = deserializeJson(doc, items_json);
+        if (!error) {
+            if (doc.is<JsonArray>()) {
+                precache_item_index = 0;
+                precache_items_count = 0;
+                for (size_t i = 0; i < doc.size() && i < PRECACHE_ITEMS_MAX; i++) {
+                    JsonObject obj = doc[i];
+                    precache_items[i].type = obj["type"] | "";
+                    precache_items[i].text = obj["text"] | "";
+                    precache_items[i].prompt = obj["prompt"] | "";
+                    precache_items_count++;
+                    M5_LOGI("Set precache item[%d]: type=%s", i, precache_items[i].type.c_str());
+                }
+                M5_LOGI("Updated precache items from config. Total: %d", precache_items_count);
+            } else {
+                M5_LOGI("JSON is not array");
+            }
+        } else {
+            M5_LOGI("JSON deserialize failed: %s", error.c_str());
+        }
+    } else {
+        M5_LOGI("No precache_items_json_hidden field");
+    }
 
     File f = SPIFFS.open("/yaml/SC_SecConfig.yaml", "r");
     if (!f) { M5_LOGE("config_post: open failed"); ESP.restart(); return; }
@@ -3890,6 +4280,7 @@ static void save_settings() {
     update_yaml_int_value(yaml, "mavlink_rc_follow", setting_rc_follow_enabled ? 1 : 0);
     update_yaml_int_value(yaml, "mavlink_yaw_source_roll", setting_attitude_yaw_source_roll ? 1 : 0);
     update_yaml_int_value(yaml, "mavlink_attitude_scale", setting_attitude_scale);
+    update_yaml_int_value(yaml, "precache_on_pat", precache_on_pat_enabled ? 1 : 0);
     if (setting_model_index >= 0 && setting_model_index < (int)llm_model_count) {
         update_yaml_quoted_in_section(yaml, "hermes", "  model: \"", llm_models[setting_model_index].slug);
     }
@@ -3955,6 +4346,16 @@ static void draw_slider_row(int y, const char* label, int val) {
     M5.Display.drawRect(bar_x, bar_y, bar_w, bar_h, TFT_WHITE);
     M5.Display.setTextSize(1);
     M5.Display.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
+}
+
+static void draw_pat_talk_button() {
+    uint16_t bg = setting_pat_talk_enabled ? TFT_DARKGREEN : TFT_DARKGREY;
+    M5.Display.fillRoundRect(8, 170, 148, 28, 5, bg);
+    M5.Display.drawRoundRect(8, 170, 148, 28, 5, TFT_WHITE);
+    M5.Display.setTextSize(1);
+    M5.Display.setTextColor(TFT_WHITE, bg);
+    M5.Display.setCursor(24, 180);
+    M5.Display.print(setting_pat_talk_enabled ? "Pat talk: ON" : "Pat talk: OFF");
 }
 
 static void draw_attitude_settings_row() {
@@ -4051,11 +4452,13 @@ static void draw_settings_ui() {
         M5.Display.drawLine(0, 124, 320, 124, TFT_DARKGREY);
         draw_slider_row(126, "Brightness", setting_brightness);
         M5.Display.drawLine(0, 168, 320, 168, TFT_DARKGREY);
+        draw_pat_talk_button();
         M5.Display.setTextSize(1);
         M5.Display.setTextColor(TFT_DARKGREY, TFT_BLACK);
-        M5.Display.setCursor(8, 176);
-        M5.Display.print("ESP-NOW MAC: ");
+        M5.Display.setCursor(168, 172);
+        M5.Display.print("ESP-NOW MAC");
         M5.Display.setTextColor(TFT_CYAN, TFT_BLACK);
+        M5.Display.setCursor(168, 186);
         M5.Display.print(WiFi.macAddress().c_str());
     } else if (setting_page == 1) {
         M5.Display.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
@@ -4085,6 +4488,7 @@ static void settings_enter() {
     setting_wifi_index = current_wifi_credential_index();
     setting_attitude_servo_enabled = mavlink_attitude_servo_enabled;
     setting_rc_follow_enabled = mavlink_rc_follow_enabled;
+    setting_pat_talk_enabled = precache_on_pat_enabled;
     setting_attitude_yaw_source_roll = mavlink_attitude_yaw_source_roll;
     setting_attitude_scale = mavlink_attitude_scale;
     setting_model_index = -1;
@@ -4102,6 +4506,7 @@ static void settings_exit(bool save) {
         brightness_val = setting_brightness;
         mavlink_attitude_servo_enabled = setting_attitude_servo_enabled;
         mavlink_rc_follow_enabled = setting_rc_follow_enabled;
+        precache_on_pat_enabled = setting_pat_talk_enabled;
         if (mavlink_rc_follow_enabled) mavlink_attitude_servo_enabled = false;
         mavlink_attitude_filter_ready = false;
         mavlink_attitude_target_ready = false;
@@ -4152,6 +4557,12 @@ static void handle_settings_touch() {
     // Save
     if (touch.wasPressed()) {
         if (tx >= 165 && tx <= 310 && ty >= 204 && ty <= 234) { settings_exit(true); return; }
+    }
+
+    if (setting_page == 0 && touch.wasPressed() && tx >= 0 && tx <= 162 && ty >= 166 && ty <= 200) {
+        setting_pat_talk_enabled = !setting_pat_talk_enabled;
+        draw_pat_talk_button();
+        return;
     }
 
     if (setting_page == 1) {
@@ -4699,6 +5110,7 @@ void setup() {
     M5.Speaker.begin();
 
     if (!SPIFFS.begin(true)) { M5.Display.println("SPIFFS ERROR"); return; }
+    precache_cleanup_files();
 
     system_config.loadConfig(SPIFFS, "/yaml/SC_BasicConfig.yaml");
     servo_begin();
@@ -4725,6 +5137,43 @@ void setup() {
     } else {
         show("WiFi FAILED");
     }
+
+    // Load precache items from YAML or use defaults
+    Serial.println("DEBUG: Loading precache items...");
+    File f_precache = SPIFFS.open("/yaml/precache_items.yaml", "r");
+    bool use_defaults = true;
+    if (f_precache) {
+        String yaml_content = f_precache.readString();
+        f_precache.close();
+        // TODO: Parse YAML and populate precache_items
+        // For now, use defaults anyway
+        Serial.println("DEBUG: YAML found (parsing not yet implemented)");
+    }
+
+    // Use default items (mix of fixed and LLM)
+    if (use_defaults) {
+        precache_items[0] = {"llm", "", "とってもかわいい猫の鳴き声（例：にゃおーん、にゃんにゃん、みゃー等）"};
+        precache_items[1] = {"llm", "", "なでてくれてうれしい気持ち"};
+        precache_items[2] = {"llm", "", "ｽﾀｯｸﾁｬﾝの大好物は？回答は「ｽﾀｯｸﾁｬﾝは、」で始めてください。"};
+        precache_items[3] = {"llm", "", "ｽﾀｯｸﾁｬﾝの自己紹介をして？"};
+        precache_items[4] = {"llm", "", "いろんな動物の鳴き声（例: わんわん、モォー、ひひーん、メェー、ウキキ等）"};
+        precache_items[5] = {"llm", "", "次の天気情報を、事実どおりに親しみやすく一言で伝えて（例: 晴れです。いい天気ですね。）。情報: {weather}"};
+        precache_items[6] = {"fixed", "ありがとー", ""};
+        precache_items[7] = {"llm", "", "ｽﾀｯｸﾁｬﾝの気持ち"};
+        precache_items[8] = {"llm", "", "今日は{date}。この日にちなんだ記念日や豆知識を一つ、短く伝えて"};
+        precache_items_count = 9;
+        Serial.printf("DEBUG: Precache items initialized: %d items\n", precache_items_count);
+    }
+
+    if (precache_items_count > 0) precache_item_index = random(0, precache_items_count);
+    Serial.printf("DEBUG: Precache start index=%d\n", precache_item_index);
+
+    // Initialize precache generation
+    precache_next_generate_ms = millis() + 5000;
+    precache_queue_size = 0;  // Clear any cached voice on startup
+
+    // Ignore head touch for 5 seconds after startup to avoid sensor noise
+    startup_stable_until_ms = millis() + 5000;
 
     // ESP-NOW head tracking receiver (works alongside WiFi on same channel)
     if (esp_now_init() == ESP_OK) {
@@ -4786,6 +5235,7 @@ void loop() {
     M5.update();
     current_touch_detail = M5.Touch.getDetail();
     mavlink_notification_tick();
+    precache_generate_next();
 
     if (M5.BtnPWR.wasHold()) {
         bpm_stop_audio();
