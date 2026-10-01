@@ -1079,6 +1079,67 @@ static String fetch_weather_summary() {
     return String(buf);
 }
 
+static bool is_gloomy_headline(const String& t) {
+    static const char* const kw[] = {
+        "死亡", "死去", "亡くな", "逝去", "訃報", "死者", "死傷", "犠牲", "遺体", "心肺停止",
+        "事故", "殺害", "殺人", "追悼", "葬儀", "お別れ", "刺され", "墜落", "転覆", "衝突", "火災", "爆発",
+    };
+    for (const char* k : kw) {
+        if (t.indexOf(k) >= 0) return true;
+    }
+    return false;
+}
+
+// Yahoo!ニュース topics RSS categories, indexed by the N in "{news:N}".
+static const char* const kNewsCategories[] = {
+    "top-picks", "domestic", "world", "business", "entertainment", "sports", "it", "science", "local",
+};
+
+// Picks a random headline from the Yahoo! News topics RSS (excluding the previous pick). "" on failure.
+static String fetch_news_headline(int category) {
+    if (!ensure_wifi_connected()) return "";
+    HTTPClient http;
+    WiFiClientSecure client;
+    client.setInsecure();
+    http.begin(client, "https://news.yahoo.co.jp/rss/topics/" + String(kNewsCategories[category]) + ".xml");
+    http.setTimeout(10000);
+    int st = http.GET();
+    if (st != 200) {
+        Serial.printf("NEWS http=%d\n", st);
+        http.end();
+        return "";
+    }
+    String xml = http.getString();
+    http.end();
+
+    static String last_headline[9];
+    String titles[30];
+    int n = 0;
+    int skipped = 0;
+    int pos = xml.indexOf("<item>");
+    while (pos >= 0 && n < 30) {
+        int ts = xml.indexOf("<title>", pos);
+        int te = xml.indexOf("</title>", ts);
+        if (ts < 0 || te < 0) break;
+        String t = xml.substring(ts + 7, te);
+        t.replace("<![CDATA[", "");
+        t.replace("]]>", "");
+        t.trim();
+        if (!t.isEmpty()) {
+            if (is_gloomy_headline(t)) skipped++;
+            else titles[n++] = t;
+        }
+        pos = xml.indexOf("<item>", te);
+    }
+    if (n == 0) { Serial.printf("NEWS no usable items (excluded %d)\n", skipped); return ""; }
+    int pick = random(0, n);
+    String& last = last_headline[category];
+    if (n > 1 && titles[pick] == last) pick = (pick + 1) % n;
+    last = titles[pick];
+    Serial.printf("NEWS cat%d (%d items, excluded %d) %s\n", category, n, skipped, last.c_str());
+    return last;
+}
+
 struct PrecacheIndicator {
     bool led_taken;
     PrecacheIndicator() {
@@ -1093,6 +1154,8 @@ struct PrecacheIndicator {
         if (led_taken && led_mode == LED_THINKING) led_set(LED_OFF);
     }
 };
+
+static String riddle_pending_answer;  // set by a "riddle_q" item, spoken by the next "riddle_a" item
 
 static void precache_generate_next() {
     if (!precache_on_pat_enabled || precache_queue_size >= PRECACHE_QUEUE_MAX || busy || precache_items_count == 0
@@ -1113,10 +1176,19 @@ static void precache_generate_next() {
     precache_item_index = (precache_item_index + 1) % precache_items_count;
 
     String text;
+    String new_riddle_answer;
+    const bool is_riddle_q = (item.type == "riddle_q");
+    if (is_riddle_q) riddle_pending_answer = "";
     if (item.type == "fixed") {
         Serial.println("DEBUG: Using fixed text");
         text = item.text;
-    } else if (item.type == "llm") {
+    } else if (item.type == "riddle_a") {
+        if (riddle_pending_answer.isEmpty()) {
+            Serial.println("DEBUG: riddle answer not pending, skip");
+            return;
+        }
+        text = "答えは、" + riddle_pending_answer + "、でした！";
+    } else if (item.type == "llm" || is_riddle_q) {
         Serial.println("DEBUG: Calling LLM...");
         String avoid;
         for (int i = 0; i < PRECACHE_RECENT_MAX; i++) {
@@ -1131,6 +1203,21 @@ static void precache_generate_next() {
             }
             topic.replace("{weather}", w);
         }
+        int news_pos = topic.indexOf("{news");
+        if (news_pos >= 0) {
+            int news_end = topic.indexOf('}', news_pos);
+            if (news_end > news_pos) {
+                int category = 0;
+                int colon = topic.indexOf(':', news_pos);
+                if (colon > news_pos && colon < news_end) category = constrain(topic.substring(colon + 1, news_end).toInt(), 0, 8);
+                String h = fetch_news_headline(category);
+                if (h.isEmpty()) {
+                    Serial.println("DEBUG: news fetch failed, skip");
+                    return;
+                }
+                topic = topic.substring(0, news_pos) + h + topic.substring(news_end + 1);
+            }
+        }
         if (topic.indexOf("{date}") >= 0) {
             String d = today_date_text();
             if (d.isEmpty()) {
@@ -1140,14 +1227,38 @@ static void precache_generate_next() {
             Serial.printf("DATE %s\n", d.c_str());
             topic.replace("{date}", d);
         }
-        String prompt = "次のお題について、そのまま声に出して話せる自然な口語で答えて。"
-                        "説明や記号は不要。長さの指定がなければ30文字以内の一〜二文で。\nお題: " + topic;
-        if (!avoid.isEmpty()) prompt += "\n（前回までの答え「" + avoid + "」とは違う言い方で）";
+        String prompt;
+        if (is_riddle_q) {
+            prompt = "子ども向けのなぞなぞを1つ作って。必ず「問題文|答え」の形式だけで出力して。"
+                     "問題文は答えの言葉を含めず、口語で40文字以内。答えは名詞1語。";
+            if (!item.prompt.isEmpty()) prompt += "\n条件: " + item.prompt;
+            if (!avoid.isEmpty()) prompt += "\n（次の問題とは違うものを: " + avoid + "）";
+        } else {
+            prompt = "次のお題について、そのまま声に出して話せる自然な口語で答えて。"
+                     "説明や記号は不要。長さの指定がなければ30文字以内の一〜二文で。\nお題: " + topic;
+            if (!avoid.isEmpty()) prompt += "\n（前回までの答え「" + avoid + "」とは違う言い方で）";
+        }
         text = call_hermes(prompt);
         Serial.printf("DEBUG LLM result: %s\n", text.c_str());
         if (text.startsWith("Error:")) {
             Serial.printf("Precache LLM error: %s\n", text.c_str());
             return;
+        }
+        if (is_riddle_q) {
+            int bar = text.indexOf('|');
+            if (bar < 0) bar = text.indexOf("｜");
+            if (bar <= 0) {
+                Serial.println("DEBUG: riddle format invalid, skip");
+                return;
+            }
+            new_riddle_answer = text.substring(bar + (text[bar] == '|' ? 1 : 3));
+            text = text.substring(0, bar);
+            text.trim();
+            new_riddle_answer.trim();
+            if (text.isEmpty() || new_riddle_answer.isEmpty()) {
+                Serial.println("DEBUG: riddle parts empty, skip");
+                return;
+            }
         }
         for (int i = 0; i < PRECACHE_RECENT_MAX; i++) {
             if (precache_recent[item_idx][i] == text) {
@@ -1172,10 +1283,12 @@ static void precache_generate_next() {
             heap_caps_free(wav);
             return;
         }
-        if (item.type == "llm") {
+        if (item.type == "llm" || is_riddle_q) {
             precache_recent[item_idx][precache_recent_pos[item_idx]] = text;
             precache_recent_pos[item_idx] = (precache_recent_pos[item_idx] + 1) % PRECACHE_RECENT_MAX;
         }
+        if (is_riddle_q) riddle_pending_answer = new_riddle_answer;
+        else if (item.type == "riddle_a") riddle_pending_answer = "";
         Serial.printf("DEBUG: Queue size now: %d\n", precache_queue_size);
     } else {
         Serial.println("DEBUG: TTS generation failed");
@@ -5158,15 +5271,17 @@ void setup() {
     // Use default items (mix of fixed and LLM)
     if (use_defaults) {
         precache_items[0] = {"llm", "", "とってもかわいい猫の鳴き声（例：にゃおーん、にゃんにゃん、みゃー等）"};
-        precache_items[1] = {"llm", "", "なでてくれてうれしい気持ち"};
+        precache_items[1] = {"llm", "", "なでてくれてうれしい気持ち。感謝の気持ちを短く伝えて。"};
         precache_items[2] = {"llm", "", "ｽﾀｯｸﾁｬﾝの大好物は？回答は「ｽﾀｯｸﾁｬﾝは、」で始めてください。"};
         precache_items[3] = {"llm", "", "ｽﾀｯｸﾁｬﾝの自己紹介をして？"};
         precache_items[4] = {"llm", "", "いろんな動物の鳴き声（例: わんわん、モォー、ひひーん、メェー、ウキキ等）"};
-        precache_items[5] = {"llm", "", "次の天気情報を、事実どおりに親しみやすく一言で伝えて（例: 晴れです。いい天気ですね。）。情報: {weather}"};
-        precache_items[6] = {"fixed", "ありがとー", ""};
-        precache_items[7] = {"llm", "", "ｽﾀｯｸﾁｬﾝの気持ち"};
-        precache_items[8] = {"llm", "", "今日は{date}。この日にちなんだ記念日や豆知識を一つ、短く伝えて。返答に「〇月〇日〇曜日」を含めてください。"};
-        precache_items_count = 9;
+        precache_items[5] = {"llm", "", "次のニュース見出しの内容だけを元に、親しみやすく短く伝えて。見出しにない事実は足さない。見出し: {news:7}"};
+        precache_items[6] = {"riddle_q", "", ""};
+        precache_items[7] = {"riddle_a", "", ""};
+        precache_items[8] = {"llm", "", "ｽﾀｯｸﾁｬﾝの気持ち"};
+        precache_items[9] = {"llm", "", "今日は{date}。この日にちなんだ記念日や豆知識を一つ、短く伝えて。返答に「〇月〇日〇曜日」を含めてください。"};
+        precache_items[10] = {"llm", "", "次のニュース見出しの内容だけを元に、親しみやすく短く伝えて。見出しにない事実は足さない。見出し: {news:4}"};
+        precache_items_count = 11;
         Serial.printf("DEBUG: Precache items initialized: %d items\n", precache_items_count);
     }
 
