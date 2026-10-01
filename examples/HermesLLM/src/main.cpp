@@ -42,6 +42,7 @@ static bool call_tts_cache_wav(const String& text, const char* cache_path);
 static bool call_tts_fetch_wav(const String& text, uint8_t** out_buf, int* out_len);
 static void play_wav(uint8_t* wav_buf, int read_len);
 static bool ensure_wifi_connected(uint32_t timeout_ms = 15000);
+String url_encode(const String& text);
 static String call_hermes(const String& user_message);
 static String mavlink_notification_audio_path(const String& text);
 static const char B64_TABLE[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -1095,24 +1096,46 @@ static const char* const kNewsCategories[] = {
     "top-picks", "domestic", "world", "business", "entertainment", "sports", "it", "science", "local",
 };
 
-// Picks a random headline from the Yahoo! News topics RSS (excluding the previous pick). "" on failure.
-static String fetch_news_headline(int category) {
+// spec: "0".."8" = Yahoo! News topics category, otherwise a Google News search keyword (last 7 days).
+// Picks a random headline (excluding the previous pick for that spec). "" on failure.
+static String fetch_news_headline(const String& spec_in) {
     if (!ensure_wifi_connected()) return "";
+    String spec = spec_in;
+    spec.trim();
+    bool numeric = !spec.isEmpty();
+    for (int i = 0; i < (int)spec.length(); i++) if (!isDigit(spec[i])) numeric = false;
+    int category = numeric ? constrain(spec.toInt(), 0, 8) : -1;
+
+    String url;
+    if (numeric) {
+        url = "https://news.yahoo.co.jp/rss/topics/" + String(kNewsCategories[category]) + ".xml";
+    } else {
+        url = "https://news.google.com/rss/search?q=" + url_encode(spec + " when:7d") + "&hl=ja&gl=JP&ceid=JP:ja";
+    }
+
     HTTPClient http;
     WiFiClientSecure client;
     client.setInsecure();
-    http.begin(client, "https://news.yahoo.co.jp/rss/topics/" + String(kNewsCategories[category]) + ".xml");
+    http.begin(client, url);
     http.setTimeout(10000);
+    http.useHTTP10(true);  // no chunked encoding, so the body can be read as a plain prefix
     int st = http.GET();
     if (st != 200) {
         Serial.printf("NEWS http=%d\n", st);
         http.end();
         return "";
     }
-    String xml = http.getString();
+    // Google's feed is ~100KB; the first part holds the newest items.
+    const size_t kMaxRead = 24 * 1024;
+    char* raw = (char*)heap_caps_malloc(kMaxRead + 1, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!raw) { http.end(); return ""; }
+    size_t got = http.getStream().readBytes(raw, kMaxRead);
+    raw[got] = '\0';
     http.end();
+    String xml(raw);
+    heap_caps_free(raw);
 
-    static String last_headline[9];
+    static String last_headline[16];
     String titles[30];
     int n = 0;
     int skipped = 0;
@@ -1124,6 +1147,10 @@ static String fetch_news_headline(int category) {
         String t = xml.substring(ts + 7, te);
         t.replace("<![CDATA[", "");
         t.replace("]]>", "");
+        t.replace("&amp;", "&");
+        t.replace("&quot;", "\"");
+        int src = t.lastIndexOf(" - ");  // Google News appends " - 配信元"
+        if (!numeric && src > 0) t = t.substring(0, src);
         t.trim();
         if (!t.isEmpty()) {
             if (is_gloomy_headline(t)) skipped++;
@@ -1133,10 +1160,10 @@ static String fetch_news_headline(int category) {
     }
     if (n == 0) { Serial.printf("NEWS no usable items (excluded %d)\n", skipped); return ""; }
     int pick = random(0, n);
-    String& last = last_headline[category];
+    String& last = last_headline[numeric ? category : 9 + (spec.length() % 7)];
     if (n > 1 && titles[pick] == last) pick = (pick + 1) % n;
     last = titles[pick];
-    Serial.printf("NEWS cat%d (%d items, excluded %d) %s\n", category, n, skipped, last.c_str());
+    Serial.printf("NEWS [%s] (%d items, excluded %d) %s\n", spec.c_str(), n, skipped, last.c_str());
     return last;
 }
 
@@ -1203,14 +1230,29 @@ static void precache_generate_next() {
             }
             topic.replace("{weather}", w);
         }
+        for (int guard = 0; guard < 4; guard++) {
+            int pick_pos = topic.indexOf("{pick:");
+            int pick_end = pick_pos >= 0 ? topic.indexOf('}', pick_pos) : -1;
+            if (pick_pos < 0 || pick_end < 0) break;
+            String opts = topic.substring(pick_pos + 6, pick_end);
+            int count = 1;
+            for (int i = 0; i < (int)opts.length(); i++) if (opts[i] == '|') count++;
+            int which = random(0, count);
+            int start = 0;
+            for (int i = 0; i < which; i++) start = opts.indexOf('|', start) + 1;
+            int stop = opts.indexOf('|', start);
+            String chosen = opts.substring(start, stop < 0 ? opts.length() : stop);
+            Serial.printf("PICK %s\n", chosen.c_str());
+            topic = topic.substring(0, pick_pos) + chosen + topic.substring(pick_end + 1);
+        }
         int news_pos = topic.indexOf("{news");
         if (news_pos >= 0) {
             int news_end = topic.indexOf('}', news_pos);
             if (news_end > news_pos) {
-                int category = 0;
+                String spec = "0";
                 int colon = topic.indexOf(':', news_pos);
-                if (colon > news_pos && colon < news_end) category = constrain(topic.substring(colon + 1, news_end).toInt(), 0, 8);
-                String h = fetch_news_headline(category);
+                if (colon > news_pos && colon < news_end) spec = topic.substring(colon + 1, news_end);
+                String h = fetch_news_headline(spec);
                 if (h.isEmpty()) {
                     Serial.println("DEBUG: news fetch failed, skip");
                     return;
@@ -5272,16 +5314,18 @@ void setup() {
     if (use_defaults) {
         precache_items[0] = {"llm", "", "とってもかわいい猫の鳴き声（例：にゃおーん、にゃんにゃん、みゃー等）"};
         precache_items[1] = {"llm", "", "なでてくれてうれしい気持ち。感謝の気持ちを短く伝えて。"};
-        precache_items[2] = {"llm", "", "ｽﾀｯｸﾁｬﾝの大好物は？回答は「ｽﾀｯｸﾁｬﾝは、」で始めてください。"};
-        precache_items[3] = {"llm", "", "ｽﾀｯｸﾁｬﾝの自己紹介をして？"};
-        precache_items[4] = {"llm", "", "いろんな動物の鳴き声（例: わんわん、モォー、ひひーん、メェー、ウキキ等）"};
-        precache_items[5] = {"llm", "", "次のニュース見出しの内容だけを元に、親しみやすく短く伝えて。見出しにない事実は足さない。見出し: {news:7}"};
-        precache_items[6] = {"riddle_q", "", ""};
-        precache_items[7] = {"riddle_a", "", ""};
-        precache_items[8] = {"llm", "", "ｽﾀｯｸﾁｬﾝの気持ち"};
-        precache_items[9] = {"llm", "", "今日は{date}。この日にちなんだ記念日や豆知識を一つ、短く伝えて。返答に「〇月〇日〇曜日」を含めてください。"};
-        precache_items[10] = {"llm", "", "次のニュース見出しの内容だけを元に、親しみやすく短く伝えて。見出しにない事実は足さない。見出し: {news:4}"};
-        precache_items_count = 11;
+        precache_items[2] = {"llm", "", "ｽﾀｯｸﾁｬﾝが好きな{pick:食べ物|飲み物|場所|季節|天気|音|色|動物|遊び|乗り物|花|スポーツ|歌|おもちゃ|時間帯}を一つ、理由も添えて。回答は「ｽﾀｯｸﾁｬﾝは、」で始めてください。"};
+        precache_items[3] = {"llm", "", "次のニュース見出しの内容だけを元に、親しみやすく短く伝えて。見出しにない事実は足さない。見出し: {news:4}"};
+        precache_items[4] = {"llm", "", "ｽﾀｯｸﾁｬﾝの自己紹介を、{pick:名前と見た目|性格|特技|苦手なこと|うれしいこと|毎日の過ごし方|将来の夢|ともだち|好きな言葉|ちょっとした失敗談}の話題で短くして。"};
+        precache_items[5] = {"llm", "", "いろんな動物の鳴き声（例: わんわん、モォー、ひひーん、メェー、ウキキ等）"};
+        precache_items[6] = {"llm", "", "次のドローン関連ニュース見出しの内容だけを元に、親しみやすく短く伝えて。見出しにない事実は足さない。見出し: {news:ドローン}"};
+        precache_items[7] = {"llm", "", "ｽﾀｯｸﾁｬﾝの気持ち"};
+        precache_items[8] = {"llm", "", "次のAI関連ニュース見出しの内容だけを元に、親しみやすく短く伝えて。見出しにない事実は足さない。見出し: {news:生成AI}"};
+        precache_items[9] = {"riddle_q", "", ""};
+        precache_items[10] = {"riddle_a", "", ""};
+        precache_items[11] = {"llm", "", "今日は{date}。この日にちなんだ記念日や豆知識を一つ、短く伝えて。返答に「〇月〇日〇曜日」を含めてください。"};
+        precache_items[12] = {"llm", "", "次のニュース見出しの内容だけを元に、親しみやすく短く伝えて。見出しにない事実は足さない。見出し: {news:4}"};
+        precache_items_count = 13;
         Serial.printf("DEBUG: Precache items initialized: %d items\n", precache_items_count);
     }
 
