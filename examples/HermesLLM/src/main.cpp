@@ -981,13 +981,14 @@ static void precache_cleanup_files() {
 }
 
 // Caller owns the returned buffer and must heap_caps_free it.
-static bool precache_pop(uint8_t** out_wav, int* out_len) {
+static bool precache_pop(uint8_t** out_wav, int* out_len, String* out_text) {
     if (precache_queue_size == 0) {
         Serial.println("Precache queue empty");
         return false;
     }
     *out_wav = precache_queue[0].wav;
     *out_len = precache_queue[0].wav_len;
+    *out_text = precache_queue[0].text;
     Serial.printf("Precache pop: text=%s, queue_size=%d\n", precache_queue[0].text.c_str(), precache_queue_size);
     for (int i = 0; i < precache_queue_size - 1; i++) {
         precache_queue[i] = precache_queue[i + 1];
@@ -1232,10 +1233,14 @@ static void head_pat_reaction(HeadGesture gesture) {
             }
             uint8_t* voice_wav = nullptr;
             int voice_len = 0;
-            if (precache_pop(&voice_wav, &voice_len)) {
+            String voice_text;
+            if (precache_pop(&voice_wav, &voice_len, &voice_text)) {
                 const bool led_taken = (led_mode == LED_OFF);
                 if (led_taken) led_set(LED_SPEAKING);
+                speech_scroll_start(voice_text);
                 play_wav(voice_wav, voice_len);
+                speech_scroll_stop();
+                show("");
                 if (led_taken && led_mode == LED_SPEAKING) led_set(LED_OFF);
                 heap_caps_free(voice_wav);
             } else {
@@ -5160,7 +5165,7 @@ void setup() {
         precache_items[5] = {"llm", "", "次の天気情報を、事実どおりに親しみやすく一言で伝えて（例: 晴れです。いい天気ですね。）。情報: {weather}"};
         precache_items[6] = {"fixed", "ありがとー", ""};
         precache_items[7] = {"llm", "", "ｽﾀｯｸﾁｬﾝの気持ち"};
-        precache_items[8] = {"llm", "", "今日は{date}。この日にちなんだ記念日や豆知識を一つ、短く伝えて"};
+        precache_items[8] = {"llm", "", "今日は{date}。この日にちなんだ記念日や豆知識を一つ、短く伝えて。返答に「〇月〇日〇曜日」を含めてください。"};
         precache_items_count = 9;
         Serial.printf("DEBUG: Precache items initialized: %d items\n", precache_items_count);
     }
