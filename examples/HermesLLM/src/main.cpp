@@ -127,6 +127,8 @@ static uint32_t precache_next_generate_ms = 0;
 static bool precache_on_pat_enabled = true;
 static float weather_lat = 35.681f;  // Tokyo by default; override with weather_lat/weather_lon in SC_SecConfig.yaml
 static float weather_lon = 139.767f;
+static String digest_url;    // Cloudflare Worker base URL ("{digest:CATEGORY}" facts); SC_SecConfig.yaml digest_url
+static String digest_token;  // Bearer token for the Worker; SC_SecConfig.yaml digest_token
 static std::array<PrecacheItem, PRECACHE_ITEMS_MAX> precache_items;
 static uint8_t precache_items_count = 0;
 static uint8_t precache_item_index = 0;
@@ -1080,6 +1082,41 @@ static String fetch_weather_summary() {
     return String(buf);
 }
 
+// Grounded facts for "{digest:CATEGORY}" (weather|gourmet|trivia|sleep) from the Cloudflare Worker, based on the
+// phone's last reported location. "" when unconfigured or unavailable (the precache item is then skipped).
+static String fetch_digest(const String& category) {
+    if (digest_url.isEmpty() || digest_token.isEmpty()) return "";
+    if (category.isEmpty() || category.length() > 16) return "";
+    for (int i = 0; i < (int)category.length(); i++) if (category[i] < 'a' || category[i] > 'z') return "";
+    if (!ensure_wifi_connected()) return "";
+
+    const String url = digest_url + "/digest/" + category;
+    HTTPClient http;
+    WiFiClientSecure secure_client;
+    WiFiClient plain_client;
+    if (url.startsWith("https://")) {
+        secure_client.setInsecure();
+        http.begin(secure_client, url);
+    } else {
+        http.begin(plain_client, url);
+    }
+    http.setTimeout(10000);
+    http.addHeader("Authorization", "Bearer " + digest_token);
+    int st = http.GET();
+    if (st != 200) {
+        Serial.printf("DIGEST %s http=%d\n", category.c_str(), st);
+        http.end();
+        return "";
+    }
+    String body = http.getString();
+    http.end();
+    JsonDocument doc;
+    if (deserializeJson(doc, body)) { Serial.println("DIGEST JSON parse error"); return ""; }
+    String text = doc["text"] | "";
+    Serial.printf("DIGEST %s %s\n", category.c_str(), text.c_str());
+    return text;
+}
+
 static bool is_gloomy_headline(const String& t) {
     static const char* const kw[] = {
         "死亡", "死去", "亡くな", "逝去", "訃報", "死者", "死傷", "犠牲", "遺体", "心肺停止",
@@ -1229,6 +1266,18 @@ static void precache_generate_next() {
                 return;
             }
             topic.replace("{weather}", w);
+        }
+        for (int guard = 0; guard < 4; guard++) {
+            int dg_pos = topic.indexOf("{digest:");
+            int dg_end = dg_pos >= 0 ? topic.indexOf('}', dg_pos) : -1;
+            if (dg_pos < 0 || dg_end < 0) break;
+            String cat = topic.substring(dg_pos + 8, dg_end);
+            String facts = fetch_digest(cat);
+            if (facts.isEmpty()) {
+                Serial.printf("DEBUG: digest %s unavailable, skip\n", cat.c_str());
+                return;
+            }
+            topic = topic.substring(0, dg_pos) + facts + topic.substring(dg_end + 1);
         }
         for (int guard = 0; guard < 4; guard++) {
             int pick_pos = topic.indexOf("{pick:");
@@ -1930,6 +1979,10 @@ void load_hermes_config(fs::FS& fs) {
         return normalized_yaml.substring(pos, normalized_yaml.indexOf("\"", pos));
     };
     voicevox_host = extractStr("voicevox_host");
+    digest_url   = extractStr("digest_url");
+    digest_token = extractStr("digest_token");
+    while (digest_url.endsWith("/")) digest_url.remove(digest_url.length() - 1);
+    if (!digest_url.isEmpty()) M5_LOGI("Digest endpoint: %s", digest_url.c_str());
     {
         String lat = extractStr("weather_lat");
         String lon = extractStr("weather_lon");
@@ -5326,6 +5379,12 @@ void setup() {
         precache_items[11] = {"llm", "", "今日は{date}。この日にちなんだ記念日や豆知識を一つ、短く伝えて。返答に「〇月〇日〇曜日」を含めてください。"};
         precache_items[12] = {"llm", "", "次のニュース見出しの内容だけを元に、親しみやすく短く伝えて。見出しにない事実は足さない。見出し: {news:4}"};
         precache_items_count = 13;
+        if (!digest_url.isEmpty() && !digest_token.isEmpty()) {
+            precache_items[precache_items_count++] = {"llm", "", "次の天気情報だけを元に、お出かけ中の人に向けて親しみやすく短く伝えて。情報にない事実は足さない。情報: {digest:weather}"};
+            precache_items[precache_items_count++] = {"llm", "", "次のお店の情報だけを元に、近くのおすすめとして親しみやすく短く紹介して。味や営業時間など情報にない事実は足さない。情報: {digest:gourmet}"};
+            precache_items[precache_items_count++] = {"llm", "", "次の情報だけを元に、いま居る場所の近くにあるものの豆知識として親しみやすく短く伝えて。情報にない事実は足さない。情報: {digest:trivia}"};
+            precache_items[precache_items_count++] = {"llm", "", "次の睡眠データだけを元に、ねぎらいの一言を短く伝えて。医療的な助言や診断はしない。情報にない事実は足さない。情報: {digest:sleep}"};
+        }
         Serial.printf("DEBUG: Precache items initialized: %d items\n", precache_items_count);
     }
 

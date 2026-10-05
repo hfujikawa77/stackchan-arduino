@@ -1,0 +1,8 @@
+name = "stackchan-digest"
+main = "src/index.js"
+compatibility_date = "2026-10-01"
+
+# Create with: npx wrangler kv namespace create STATE   (then paste the id below)
+[[kv_namespaces]]
+binding = "STATE"
+id = "9dcaa283537e46b596845a32a18ddd21"
