@@ -21,6 +21,8 @@
 #include "StackChanSpeech.h"
 #include <Avatar.h>
 using namespace m5avatar;
+// The 8KB default overflows when precache_generate_next() calls into a TLS handshake.
+SET_LOOP_TASK_STACK_SIZE(16 * 1024);
 struct WifiCredential;
 bool touchedZone(int zone);
 void show(const String& text);
@@ -1084,7 +1086,7 @@ static String fetch_weather_summary() {
 
 // Grounded facts for "{digest:CATEGORY}" (weather|gourmet|trivia|sleep) from the Cloudflare Worker, based on the
 // phone's last reported location. "" when unconfigured or unavailable (the precache item is then skipped).
-static String fetch_digest(const String& category) {
+__attribute__((noinline)) static String fetch_digest(const String& category) {
     if (digest_url.isEmpty() || digest_token.isEmpty()) return "";
     if (category.isEmpty() || category.length() > 16) return "";
     for (int i = 0; i < (int)category.length(); i++) if (category[i] < 'a' || category[i] > 'z') return "";
@@ -5380,10 +5382,24 @@ void setup() {
         precache_items[12] = {"llm", "", "次のニュース見出しの内容だけを元に、親しみやすく短く伝えて。見出しにない事実は足さない。見出し: {news:4}"};
         precache_items_count = 13;
         if (!digest_url.isEmpty() && !digest_token.isEmpty()) {
-            precache_items[precache_items_count++] = {"llm", "", "次の天気情報だけを元に、お出かけ中の人に向けて親しみやすく短く伝えて。情報にない事実は足さない。情報: {digest:weather}"};
-            precache_items[precache_items_count++] = {"llm", "", "次のお店の情報だけを元に、近くのおすすめとして親しみやすく短く紹介して。味や営業時間など情報にない事実は足さない。情報: {digest:gourmet}"};
-            precache_items[precache_items_count++] = {"llm", "", "次の情報だけを元に、いま居る場所の近くにあるものの豆知識として親しみやすく短く伝えて。情報にない事実は足さない。情報: {digest:trivia}"};
-            precache_items[precache_items_count++] = {"llm", "", "次の睡眠データだけを元に、ねぎらいの一言を短く伝えて。医療的な助言や診断はしない。情報にない事実は足さない。情報: {digest:sleep}"};
+            const PrecacheItem digest_items[] = {
+                {"llm", "", "次の天気情報だけを元に、お出かけ中の人に向けて親しみやすく短く伝えて。情報にない事実は足さない。情報: {digest:weather}"},
+                {"llm", "", "次のお店の情報だけを元に、近くのおすすめとして親しみやすく短く紹介して。味や営業時間など情報にない事実は足さない。情報: {digest:gourmet}"},
+                {"llm", "", "次の情報だけを元に、いま居る場所の近くにあるものの豆知識として親しみやすく短く伝えて。情報にない事実は足さない。情報: {digest:trivia}"},
+                {"llm", "", "次の睡眠データだけを元に、ねぎらいの一言を短く伝えて。医療的な助言や診断はしない。情報にない事実は足さない。情報: {digest:sleep}"},
+            };
+            const int digest_count = sizeof(digest_items) / sizeof(digest_items[0]);
+            // Spread them out: one after every 3 base items (never between riddle_q and riddle_a at 9/10).
+            const int base_count = precache_items_count;
+            PrecacheItem base_items[PRECACHE_ITEMS_MAX];
+            for (int i = 0; i < base_count; i++) base_items[i] = precache_items[i];
+            int out = 0, next_digest = 0;
+            for (int i = 0; i < base_count; i++) {
+                precache_items[out++] = base_items[i];
+                if (next_digest < digest_count && i % 3 == 2) precache_items[out++] = digest_items[next_digest++];
+            }
+            while (next_digest < digest_count) precache_items[out++] = digest_items[next_digest++];
+            precache_items_count = out;
         }
         Serial.printf("DEBUG: Precache items initialized: %d items\n", precache_items_count);
     }
