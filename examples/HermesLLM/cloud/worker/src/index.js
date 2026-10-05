@@ -1,6 +1,6 @@
 import {
   constantTimeEqual, formatGourmet, formatSleep, formatTrivia, formatWeather,
-  haversineM, jstDate, parsePlace, pickRandom, trimExtract, validLatLon,
+  haversineM, jstDate, parsePlace, pickRandom, toNumber, trimExtract, validLatLon,
 } from "./lib.js";
 
 const UA = "stackchan-digest/1.0 (personal hobby project)";
@@ -158,9 +158,10 @@ async function digestSleep(env, now) {
 
 async function postLocation(request, env, now) {
   const body = await readBody(request);
-  const lat = Number(body.lat);
-  const lon = Number(body.lon);
-  if (!validLatLon(lat, lon)) throw new HttpError(400, "invalid_lat_lon");
+  const lat = toNumber(body.lat);
+  const lon = toNumber(body.lon);
+  // (0, 0) is never a real fix; it is what an unresolved variable tends to produce.
+  if (!validLatLon(lat, lon) || (lat === 0 && lon === 0)) throw new HttpError(400, "invalid_lat_lon");
   const prev = await readKV(env, "loc");
   await writeKV(env, "loc", { lat, lon, at: now });
   const moved = prev ? Math.round(haversineM(prev.lat, prev.lon, lat, lon)) : null;

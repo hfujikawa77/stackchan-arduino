@@ -11,6 +11,13 @@ export function haversineM(lat1, lon1, lat2, lon2) {
   return 2 * R * Math.asin(Math.min(1, Math.sqrt(a)));
 }
 
+// Number("") is 0, so blank strings must not be accepted as coordinates.
+export function toNumber(v) {
+  if (typeof v === "number") return v;
+  if (typeof v === "string" && v.trim() !== "") return Number(v);
+  return NaN;
+}
+
 export function validLatLon(lat, lon) {
   return (
     typeof lat === "number" && typeof lon === "number" &&

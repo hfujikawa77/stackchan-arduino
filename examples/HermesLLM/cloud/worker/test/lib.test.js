@@ -2,7 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
   constantTimeEqual, formatGourmet, formatSleep, formatTrivia, formatWeather,
-  haversineM, jstDate, parsePlace, trimExtract, validLatLon, weatherCodeText,
+  haversineM, jstDate, parsePlace, toNumber, trimExtract, validLatLon, weatherCodeText,
 } from "../src/lib.js";
 
 test("haversineM: Tokyo Station to Yokohama Station is about 27 km", () => {
@@ -17,6 +17,16 @@ test("validLatLon rejects NaN, strings and out-of-range", () => {
   assert.ok(!validLatLon("35", 139));
   assert.ok(!validLatLon(91, 0));
   assert.ok(!validLatLon(0, 181));
+});
+
+test("toNumber treats blank and non-numeric input as NaN, not 0", () => {
+  assert.equal(toNumber("35.68"), 35.68);
+  assert.equal(toNumber(139.76), 139.76);
+  assert.ok(Number.isNaN(toNumber("")));
+  assert.ok(Number.isNaN(toNumber("  ")));
+  assert.ok(Number.isNaN(toNumber("{lat}")));
+  assert.ok(Number.isNaN(toNumber(null)));
+  assert.ok(Number.isNaN(toNumber(undefined)));
 });
 
 test("constantTimeEqual", () => {
