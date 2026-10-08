@@ -1084,6 +1084,33 @@ static String fetch_weather_summary() {
     return String(buf);
 }
 
+// Forwards a line the device just spoke to the Worker's POST /log (-> Discord). Best effort: failures are dropped.
+static void post_spoken_log(const String& text) {
+    if (digest_url.isEmpty() || digest_token.isEmpty() || text.isEmpty()) return;
+    if (WiFi.status() != WL_CONNECTED) return;
+    JsonDocument doc;
+    doc["text"] = text;
+    String body;
+    serializeJson(doc, body);
+
+    const String url = digest_url + "/log";
+    HTTPClient http;
+    WiFiClientSecure secure_client;
+    WiFiClient plain_client;
+    if (url.startsWith("https://")) {
+        secure_client.setInsecure();
+        http.begin(secure_client, url);
+    } else {
+        http.begin(plain_client, url);
+    }
+    http.setTimeout(4000);
+    http.addHeader("Authorization", "Bearer " + digest_token);
+    http.addHeader("Content-Type", "application/json");
+    int st = http.POST(body);
+    if (st != 200) Serial.printf("LOG post http=%d\n", st);
+    http.end();
+}
+
 // Grounded facts for "{digest:CATEGORY}" (weather|gourmet|trivia|sleep) from the Cloudflare Worker, based on the
 // phone's last reported location. "" when unconfigured or unavailable (the precache item is then skipped).
 __attribute__((noinline)) static String fetch_digest(const String& category) {
@@ -1449,6 +1476,7 @@ static void head_pat_reaction(HeadGesture gesture) {
                 show("");
                 if (led_taken && led_mode == LED_SPEAKING) led_set(LED_OFF);
                 heap_caps_free(voice_wav);
+                post_spoken_log(voice_text);
             } else {
                 Serial.println("No voice file available");
             }
@@ -5386,7 +5414,8 @@ void setup() {
                 {"llm", "", "次の天気情報だけを元に、お出かけ中の人に向けて親しみやすく短く伝えて。情報にない事実は足さない。情報: {digest:weather}"},
                 {"llm", "", "次のお店の情報だけを元に、近くのおすすめとして親しみやすく短く紹介して。味や営業時間など情報にない事実は足さない。情報: {digest:gourmet}"},
                 {"llm", "", "次の情報だけを元に、いま居る場所の近くにあるものの豆知識として親しみやすく短く伝えて。情報にない事実は足さない。情報: {digest:trivia}"},
-                {"llm", "", "次の睡眠データだけを元に、ねぎらいの一言を短く伝えて。医療的な助言や診断はしない。情報にない事実は足さない。情報: {digest:sleep}"},
+                {"llm", "", "次の睡眠データだけを元に、昨日の睡眠時間の数値を必ず含めてねぎらって。深い睡眠の時間もあれば数値で含める。例: 「昨日の睡眠は7時間、深い睡眠1時間半だったよ。よく眠れて元気だね。」。60文字以内の一〜二文で。医療的な助言や診断はしない。情報にない事実は足さない。情報: {digest:sleep}"},
+                {"llm", "", "次の歩数の情報だけを元に、昨日の歩数の数値を必ず含めて伝えて。例: 「昨日は8000歩あるいたよ。」。1週間の1日平均より多いときだけ褒め、少ないときは責めずに励まして。60文字以内の一〜二文で。医療的な助言や診断はしない。情報にない事実は足さない。情報: {digest:steps}"},
             };
             const int digest_count = sizeof(digest_items) / sizeof(digest_items[0]);
             // Spread them out: one after every 3 base items (never between riddle_q and riddle_a at 9/10).

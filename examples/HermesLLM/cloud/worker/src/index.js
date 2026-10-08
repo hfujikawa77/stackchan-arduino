@@ -1,10 +1,11 @@
 import {
-  constantTimeEqual, formatGourmet, formatSleep, formatTrivia, formatWeather,
+  addDays, constantTimeEqual, discordPayload, formatGourmet, formatSleep, formatSteps, formatTrivia, formatWeather,
   haversineM, jstDate, parsePlace, pickRandom, toNumber, trimExtract, validLatLon,
 } from "./lib.js";
+import { fetchSleepRecord, fetchStepsRecord, getAccessToken } from "./google_health.js";
 
 const UA = "stackchan-digest/1.0 (personal hobby project)";
-const CATEGORIES = ["weather", "gourmet", "trivia", "sleep"];
+const CATEGORIES = ["weather", "gourmet", "trivia", "sleep", "steps"];
 
 // A cached value is reused until it is older than TTL or the phone moved farther than MOVE_M from where it was computed.
 const MOVE_M = { place: 300, weather: 3000, gourmet: 400, trivia: 400 };
@@ -156,6 +157,17 @@ async function digestSleep(env, now) {
   return { text, place: "", updated_at: rec.received_at };
 }
 
+// Yesterday's steps (fetched by the morning cron). The day before yesterday is still accepted, e.g. just after midnight.
+async function digestSteps(env, now) {
+  const rec = (await readKV(env, "steps"))?.latest;
+  if (!rec) throw new HttpError(404, "no_steps_data");
+  const today = jstDate(now);
+  if (rec.date !== addDays(today, -1) && rec.date !== addDays(today, -2)) throw new HttpError(404, "no_recent_steps");
+  const text = formatSteps(rec, today);
+  if (!text) throw new HttpError(404, "no_steps_data");
+  return { text, place: "", updated_at: rec.received_at };
+}
+
 async function postLocation(request, env, now) {
   const body = await readBody(request);
   const lat = toNumber(body.lat);
@@ -174,17 +186,77 @@ async function postSleep(request, env, now) {
   const minutes_asleep = num(b.minutes_asleep);
   if (!(minutes_asleep > 0)) throw new HttpError(400, "minutes_asleep_required");
   const date = /^\d{4}-\d{2}-\d{2}$/.test(b.date ?? "") ? b.date : jstDate(now);
-  const latest = {
-    date, minutes_asleep, received_at: now,
+  await saveSleep(env, {
+    date, minutes_asleep,
     minutes_awake: num(b.minutes_awake), efficiency: num(b.efficiency),
     deep: num(b.deep), light: num(b.light), rem: num(b.rem),
-  };
-  await writeKV(env, "sleep", { latest });
+  }, now);
   return json({ ok: true, date });
+}
+
+// Shared by POST /sleep and the Google Health cron.
+const saveSleep = (env, rec, now) => writeKV(env, "sleep", { latest: { ...rec, received_at: now } });
+const saveSteps = (env, rec, now) => writeKV(env, "steps", { latest: { ...rec, received_at: now } });
+
+// Cron: pull last night's sleep and yesterday's steps from Google Health. Each part fails independently, and a
+// part with no data never overwrites an earlier value. Only statuses are logged/stored, never health values.
+async function collectHealth(env, now) {
+  const status = { at: now, sleep: "", steps: "" };
+  let token;
+  try {
+    token = await getAccessToken(env);
+  } catch (e) {
+    status.error = e.message;
+    console.log("health: token failed:", e.message);
+    await writeKV(env, "health_status", status);
+    return status;
+  }
+  const parts = [
+    ["sleep", fetchSleepRecord, saveSleep],
+    ["steps", fetchStepsRecord, saveSteps],
+  ];
+  for (const [name, fetchRec, save] of parts) {
+    try {
+      const rec = await fetchRec(token, now);
+      if (rec) {
+        await save(env, rec, now);
+        status[name] = `ok ${rec.date}`;
+      } else {
+        status[name] = "no_data";
+      }
+    } catch (e) {
+      status[name] = `error: ${e.message}`;
+      console.log(`health: ${name} failed:`, e.message);
+    }
+  }
+  await writeKV(env, "health_status", status);
+  console.log(`health: sleep=${status.sleep.split(":")[0]} steps=${status.steps.split(":")[0]}`);
+  return status;
+}
+
+// Forwards a line the device just spoke to Discord. The webhook URL stays a Worker secret, off the device.
+async function postLog(request, env) {
+  if (!env.DISCORD_WEBHOOK_URL) throw new HttpError(503, "discord_not_configured");
+  const body = await readBody(request);
+  const payload = discordPayload(body.text);
+  if (!payload) throw new HttpError(400, "text_required");
+  const res = await fetch(env.DISCORD_WEBHOOK_URL, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(payload),
+    signal: AbortSignal.timeout(8000),
+  });
+  // Never echo Discord's response: it can carry the webhook id/token.
+  if (!res.ok) {
+    console.log("discord webhook responded", res.status);
+    throw new HttpError(502, "discord_error");
+  }
+  return json({ ok: true });
 }
 
 async function getDigest(category, env, now) {
   if (category === "sleep") return json({ ok: true, category, ...(await digestSleep(env, now)) });
+  if (category === "steps") return json({ ok: true, category, ...(await digestSteps(env, now)) });
   const loc = await readKV(env, "loc");
   if (!loc) throw new HttpError(409, "no_location");
   const handler = { weather: digestWeather, gourmet: digestGourmet, trivia: digestTrivia }[category];
@@ -209,6 +281,14 @@ export default {
         return loc ? json({ ok: true, ...loc }) : fail(404, "no_location");
       }
       if (path === "/sleep" && request.method === "POST") return await postSleep(request, env, now);
+      if (path === "/log" && request.method === "POST") return await postLog(request, env);
+      if (path === "/health/status" && request.method === "GET") {
+        const st = await readKV(env, "health_status");
+        return st ? json({ ok: true, ...st }) : fail(404, "no_status");
+      }
+      if (path === "/health/refresh" && request.method === "POST") {
+        return json({ ok: true, ...(await collectHealth(env, now)) });
+      }
       const m = path.match(/^\/digest\/([a-z]+)$/);
       if (m && request.method === "GET") {
         if (!CATEGORIES.includes(m[1])) return fail(404, "unknown_category");
@@ -220,5 +300,10 @@ export default {
       console.log("unhandled error:", e.stack ?? e.message);
       return fail(502, "upstream_error");
     }
+  },
+
+  // Cron Triggers (see wrangler.toml)
+  async scheduled(_controller, env, ctx) {
+    ctx.waitUntil(collectHealth(env, Date.now()));
   },
 };

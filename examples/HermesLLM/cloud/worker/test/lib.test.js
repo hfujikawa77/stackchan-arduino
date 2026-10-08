@@ -1,8 +1,9 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
-  constantTimeEqual, formatGourmet, formatSleep, formatTrivia, formatWeather,
-  haversineM, jstDate, parsePlace, toNumber, trimExtract, validLatLon, weatherCodeText,
+  addDays, constantTimeEqual, discordPayload, formatGourmet, formatSleep, formatSteps, formatTrivia, formatWeather,
+  haversineM, jstDate, jstDayStartUtc, parsePlace, pickMainSleep, sleepRecordFromGoogle,
+  stepsRecordFromRollup, toNumber, trimExtract, validLatLon, weatherCodeText,
 } from "../src/lib.js";
 
 test("haversineM: Tokyo Station to Yokohama Station is about 27 km", () => {
@@ -96,4 +97,94 @@ test("formatSleep", () => {
     "昨夜の睡眠時間は7時間12分、睡眠効率は91%、深い睡眠は70分、レム睡眠は95分、途中で起きていた時間は28分",
   );
   assert.equal(formatSleep({ minutes_asleep: 0 }), "");
+});
+
+// ---- Google Health API (synthetic values in the real response shape: numbers are strings) ----
+
+const sleepPoint = (endTime, { main = true, inPeriod = "475", asleep = "432" } = {}) => ({
+  sleep: {
+    interval: { startTime: "2026-10-05T15:00:00Z", endTime },
+    type: "STAGES",
+    metadata: { mainSleep: main },
+    summary: {
+      minutesInSleepPeriod: inPeriod,
+      minutesAsleep: asleep,
+      minutesAwake: "43",
+      stagesSummary: [
+        { type: "AWAKE", minutes: "43", count: "3" },
+        { type: "LIGHT", minutes: "250", count: "9" },
+        { type: "DEEP", minutes: "70", count: "4" },
+        { type: "REM", minutes: "112", count: "5" },
+      ],
+    },
+  },
+});
+
+test("jstDayStartUtc / addDays", () => {
+  assert.equal(jstDayStartUtc("2026-10-06"), "2026-10-05T15:00:00Z");
+  assert.equal(addDays("2026-10-01", -1), "2026-09-30");
+  assert.equal(addDays("2026-12-31", 1), "2027-01-01");
+});
+
+test("sleepRecordFromGoogle maps stages, derives efficiency and the JST wake date", () => {
+  // 21:51Z on 10/5 is 06:51 JST on 10/6
+  const rec = sleepRecordFromGoogle(sleepPoint("2026-10-05T21:51:00Z"));
+  assert.deepEqual(rec, {
+    date: "2026-10-06", minutes_asleep: 432, minutes_awake: 43, efficiency: 91, deep: 70, light: 250, rem: 112,
+  });
+  assert.equal(
+    formatSleep(rec),
+    "昨夜の睡眠時間は7時間12分、睡眠効率は91%、深い睡眠は70分、レム睡眠は112分、途中で起きていた時間は43分",
+  );
+});
+
+test("sleepRecordFromGoogle returns undefined for missing or empty data", () => {
+  assert.equal(sleepRecordFromGoogle(undefined), undefined);
+  assert.equal(sleepRecordFromGoogle({ sleep: {} }), undefined);
+  assert.equal(sleepRecordFromGoogle(sleepPoint("2026-10-05T21:51:00Z", { asleep: "0" })), undefined);
+  // no time-in-bed -> efficiency is simply omitted
+  assert.equal(sleepRecordFromGoogle(sleepPoint("2026-10-05T21:51:00Z", { inPeriod: "" })).efficiency, undefined);
+});
+
+test("pickMainSleep prefers the main sleep over a longer nap, else the longest", () => {
+  const main = sleepPoint("2026-10-05T21:00:00Z", { main: true, inPeriod: "400" });
+  const nap = sleepPoint("2026-10-06T05:00:00Z", { main: false, inPeriod: "500" });
+  assert.equal(pickMainSleep([nap, main]), main);
+  const a = sleepPoint("2026-10-05T21:00:00Z", { main: false, inPeriod: "100" });
+  assert.equal(pickMainSleep([a, nap]), nap);
+  assert.equal(pickMainSleep([]), undefined);
+  assert.equal(pickMainSleep(undefined), undefined);
+});
+
+const rollupDay = (day, countSum) => ({
+  civilStartTime: { date: { year: 2026, month: 10, day }, time: {} },
+  steps: { countSum },
+});
+
+test("stepsRecordFromRollup returns the day's count and the average of the earlier days", () => {
+  const rollup = { rollupDataPoints: [rollupDay(3, "2000"), rollupDay(4, "4000"), rollupDay(5, "3270")] };
+  assert.deepEqual(stepsRecordFromRollup(rollup, "2026-10-05"), { date: "2026-10-05", count: 3270, avg7: 3000 });
+  assert.deepEqual(stepsRecordFromRollup({ rollupDataPoints: [rollupDay(5, "10")] }, "2026-10-05"), {
+    date: "2026-10-05", count: 10, avg7: undefined,
+  });
+  assert.equal(stepsRecordFromRollup(rollup, "2026-10-06"), undefined);
+  assert.equal(stepsRecordFromRollup({}, "2026-10-05"), undefined);
+});
+
+test("discordPayload trims, truncates, and disables mentions", () => {
+  assert.deepEqual(discordPayload("  こんにちは  "), { content: "こんにちは", allowed_mentions: { parse: [] } });
+  assert.equal(discordPayload("   "), undefined);
+  assert.equal(discordPayload(undefined), undefined);
+  const long = discordPayload("あ".repeat(3000));
+  assert.equal(long.content.length, 1900);
+  assert.ok(long.content.endsWith("…"));
+  assert.deepEqual(discordPayload("@everyone やあ").allowed_mentions, { parse: [] });
+});
+
+test("formatSteps states facts and names the date when it is not yesterday", () => {
+  const rec = { date: "2026-10-05", count: 3270, avg7: 3000 };
+  assert.equal(formatSteps(rec, "2026-10-06"), "昨日の歩数は3270歩、その前の1週間の1日平均は3000歩");
+  assert.equal(formatSteps(rec, "2026-10-07"), "10月5日の歩数は3270歩、その前の1週間の1日平均は3000歩");
+  assert.equal(formatSteps({ date: "2026-10-05", count: 3270 }, "2026-10-06"), "昨日の歩数は3270歩");
+  assert.equal(formatSteps(undefined, "2026-10-06"), "");
 });

@@ -128,3 +128,84 @@ export function formatSleep(rec) {
   if (rec.minutes_awake > 0) bits.push(`途中で起きていた時間は${Math.round(rec.minutes_awake)}分`);
   return bits.join("、");
 }
+
+// ---- Google Health API (https://developers.google.com/health/) ----
+// Shapes below follow real responses: numbers arrive as strings ("362"), times are RFC-3339 UTC.
+
+export function addDays(date, n) {
+  return new Date(Date.parse(`${date}T00:00:00Z`) + n * 86400e3).toISOString().slice(0, 10);
+}
+
+// 00:00 JST of `date` (YYYY-MM-DD) as RFC-3339 UTC, for filters like sleep.interval.end_time >= "...".
+export function jstDayStartUtc(date) {
+  return new Date(Date.parse(`${date}T00:00:00Z`) - 9 * 3600e3).toISOString().replace(/\.\d{3}Z$/, "Z");
+}
+
+const toInt = (v) => {
+  if (v === null || v === undefined || v === "") return undefined;
+  const n = Number(v);
+  return Number.isFinite(n) ? n : undefined;
+};
+
+// Prefer the main sleep (not a nap); among several, the longest sleep period.
+export function pickMainSleep(points) {
+  const list = (points ?? []).filter((p) => p?.sleep?.interval?.endTime && p.sleep.summary);
+  if (!list.length) return undefined;
+  const mains = list.filter((p) => p.sleep.metadata?.mainSleep);
+  const pool = mains.length ? mains : list;
+  const len = (p) => toInt(p.sleep.summary.minutesInSleepPeriod) ?? 0;
+  return pool.reduce((a, b) => (len(b) > len(a) ? b : a));
+}
+
+// dataPoint -> the record shape POST /sleep stores. efficiency = asleep / time in bed (matches the Fitbit app).
+export function sleepRecordFromGoogle(point) {
+  const s = point?.sleep;
+  const minutes_asleep = toInt(s?.summary?.minutesAsleep);
+  if (!(minutes_asleep > 0) || !s?.interval?.endTime) return undefined;
+  const inPeriod = toInt(s.summary.minutesInSleepPeriod);
+  const stage = (type) => toInt((s.summary.stagesSummary ?? []).find((x) => x.type === type)?.minutes);
+  return {
+    date: jstDate(Date.parse(s.interval.endTime)),
+    minutes_asleep,
+    minutes_awake: toInt(s.summary.minutesAwake),
+    efficiency: inPeriod > 0 ? Math.round((minutes_asleep / inPeriod) * 100) : undefined,
+    deep: stage("DEEP"),
+    light: stage("LIGHT"),
+    rem: stage("REM"),
+  };
+}
+
+// dailyRollUp response -> { date, count, avg7 }. avg7 is the mean of the earlier days present in the response.
+export function stepsRecordFromRollup(rollup, date) {
+  const byDate = new Map();
+  for (const p of rollup?.rollupDataPoints ?? []) {
+    const d = p?.civilStartTime?.date;
+    const n = toInt(p?.steps?.countSum);
+    if (d && n !== undefined) {
+      byDate.set(`${d.year}-${String(d.month).padStart(2, "0")}-${String(d.day).padStart(2, "0")}`, n);
+    }
+  }
+  const count = byDate.get(date);
+  if (count === undefined) return undefined;
+  const prev = [...byDate].filter(([k]) => k < date).map(([, v]) => v);
+  const avg7 = prev.length ? Math.round(prev.reduce((a, b) => a + b, 0) / prev.length) : undefined;
+  return { date, count, avg7 };
+}
+
+// Facts only; the tone ("よく歩いたね" etc.) is left to the device-side prompt.
+export function formatSteps(rec, today) {
+  if (!rec || !(rec.count >= 0)) return "";
+  const [, m, d] = rec.date.split("-").map(Number);
+  const label = rec.date === addDays(today, -1) ? "昨日" : `${m}月${d}日`;
+  const bits = [`${label}の歩数は${rec.count}歩`];
+  if (rec.avg7 > 0) bits.push(`その前の1週間の1日平均は${rec.avg7}歩`);
+  return bits.join("、");
+}
+
+// Discord webhook body for a spoken line. allowed_mentions.parse=[] makes "@everyone" in LLM text inert.
+export function discordPayload(text, max = 1900) {
+  const t = (text ?? "").toString().trim();
+  if (!t) return undefined;
+  const content = t.length > max ? `${t.slice(0, max - 1)}…` : t;
+  return { content, allowed_mentions: { parse: [] } };
+}

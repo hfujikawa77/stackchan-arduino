@@ -6,3 +6,8 @@ compatibility_date = "2026-10-01"
 [[kv_namespaces]]
 binding = "STATE"
 id = "9dcaa283537e46b596845a32a18ddd21"
+
+# Google Health sync. Cron is UTC: 22:30 / 23:30 / 03:00 = JST 07:30 / 08:30 / 12:00.
+# The later runs retry in case the Fitbit sync was late; they only overwrite the same records.
+[triggers]
+crons = ["30 22 * * *", "30 23 * * *", "0 3 * * *"]

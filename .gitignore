@@ -49,3 +49,4 @@ tools/beatmap/*.m4a
 **/SC_SecConfig.yaml
 .claude/settings.local.json
 examples/HermesLLM/.claude/settings.local.json
+examples/HermesLLM/logs/

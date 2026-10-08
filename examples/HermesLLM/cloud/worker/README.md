@@ -19,7 +19,10 @@ Android(MacroDroid) --POST /location--> Worker(KV) <--GET /digest/<cat>-- ｽﾀ
 | `GET /digest/gourmet` | ホットペッパーグルメ（要 `HOTPEPPER_KEY`）。400m以上移動 or 12時間で再取得、リクエスト毎にランダムで1店 |
 | `GET /digest/trivia` | 現在地の地名 + 近くのWikipedia記事の冒頭（根拠付き）。リクエスト毎にランダムで1件 |
 | `GET /digest/sleep` | `POST /sleep` で預けた直近（今日/昨日）の睡眠 |
-| `POST /sleep` | `{"minutes_asleep":432,"efficiency":91,"deep":70,"rem":95,"minutes_awake":28,"date":"2026-10-05"}`（`minutes_asleep` 必須、`date` 省略時はJST今日） |
+| `POST /sleep` | `{"minutes_asleep":432,"efficiency":91,"deep":70,"rem":95,"minutes_awake":28,"date":"2026-10-05"}`（`minutes_asleep` 必須、`date` 省略時はJST今日）。Google Health 連携（cron）でも同じ形で保存される |
+| `GET /digest/steps` | 昨日の歩数と、その前の1週間の1日平均（cron で Google Health から取得）。言い回し（「よく歩いたね」など）は端末側のプロンプトで付ける |
+| `GET /health/status` | 直近の cron の結果（睡眠・歩数ごとの ok / no_data / error、時刻） |
+| `POST /health/refresh` | cron と同じ取得を今すぐ実行（デプロイ後の動作確認用） |
 
 応答は `{"ok":true,"category":"weather","text":"…","place":"渋谷区渋谷","updated_at":…}`。
 失敗時は `{"ok":false,"error":"…"}`（`no_location` 409 / `gourmet_not_configured` 503 / `no_recent_sleep` 404 など）。
@@ -35,6 +38,9 @@ npx wrangler kv namespace create STATE        # 出力された id を wrangler.
 node -e "console.log(require('crypto').randomBytes(24).toString('hex'))"   # トークン生成
 npx wrangler secret put SHARED_TOKEN          # 上で生成した値
 npx wrangler secret put HOTPEPPER_KEY         # 任意（グルメを使う場合）
+npx wrangler secret put GOOGLE_CLIENT_ID      # 任意（睡眠・歩数の自動取得を使う場合。下の「Google Health 連携」参照）
+npx wrangler secret put GOOGLE_CLIENT_SECRET
+npx wrangler secret put GOOGLE_REFRESH_TOKEN
 npx wrangler deploy
 ```
 
@@ -50,7 +56,7 @@ digest_token: "<SHARED_TOKEN と同じ値>"
 ```
 
 設定すると、デフォルトの撫で項目に天気/グルメ/ご当地/睡眠の4つが追加されます。
-Web UIの撫で項目のプロンプトに `{digest:weather}` `{digest:gourmet}` `{digest:trivia}` `{digest:sleep}` を書けば自由に組み合わせられます
+Web UIの撫で項目のプロンプトに `{digest:weather}` `{digest:gourmet}` `{digest:trivia}` `{digest:sleep}` `{digest:steps}` を書けば自由に組み合わせられます
 （`{news:N}` と同じ仕組みで、取得に失敗した項目はスキップされます）。
 
 ## MacroDroid（Android）の設定
@@ -63,11 +69,25 @@ Web UIの撫で項目のプロンプトに `{digest:weather}` `{digest:gourmet}`
   - ボディ: `{"lat":"<緯度のマジックテキスト>","lon":"<経度のマジックテキスト>"}`
     （マジックテキスト選択画面から緯度・経度を挿入してください。数値を文字列で囲んでも受け付けます）
 
-## 睡眠データについて
+## Google Health 連携（睡眠・歩数）
 
-レガシーのFitbit Web APIは2026-09-30にサポート終了、2026-10-30に停止します。移行先のGoogle Health APIは
-全スコープが制限付きで、新規プロジェクトの受付も限定的です。そのため、取得元を問わず
-`POST /sleep` で受け取る作りにしています（手動、将来のGoogle Health API連携、Health Connect対応アプリなど）。
+毎朝 cron（`wrangler.toml` の `[triggers]`。JST 7:30 / 8:30 / 12:00）で Google Health API から取得し、KV に保存します。
+Fitbit の同期が遅れた日のための再実行で、同じ記録を上書きするだけです。
+
+| 項目 | 取得元 |
+|---|---|
+| 睡眠 | 今日（JST）に終わった睡眠のうち、メインの睡眠（`mainSleep`、なければ最長）。睡眠効率は `実睡眠 ÷ ベッドにいた時間` で算出（Fitbitアプリの表示と一致） |
+| 歩数 | `dailyRollUp` の昨日1日分と、その前の7日分の平均。Fitbitとスマホ（Health Connect）の二重計上は API 側で除かれる |
+
+- 項目ごとに独立して失敗します。データなしや失敗のときは、以前の値を上書きしません。結果は `GET /health/status` で確認できます。
+- ログには状態だけを出し、睡眠・歩数の値は出しません。
+- 認証情報は Secrets（`GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET` / `GOOGLE_REFRESH_TOKEN`）。Refresh Token は Google OAuth 2.0 Playground などで取得します（スコープは `googlehealth.sleep.readonly` と `googlehealth.activity_and_fitness.readonly`）。
+- OAuth 同意画面が「テスト」のままだと Refresh Token が 7 日で失効します。「本番」にする場合は、未確認アプリの警告が出る点に注意してください。
+- ローカル確認: `.dev.vars` に上の3つを足し、`npx wrangler dev --test-scheduled` で起動して `curl "http://localhost:8787/__scheduled"`。
+- 歩数の話し方の例（Web UI の撫で項目）: `次の情報だけを元に、昨日の歩数をねぎらって短く伝えて。医療的な助言はしない。情報にない事実は足さない。情報: {digest:steps}`
+
+取得元を問わず `POST /sleep` で預けることもできます（手動、Health Connect 対応アプリなど）。
+レガシーのFitbit Web APIは2026-09-30にサポート終了、2026-10-30に停止します。
 
 ## 注意
 
