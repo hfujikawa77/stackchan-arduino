@@ -188,3 +188,16 @@ test("formatSteps states facts and names the date when it is not yesterday", () 
   assert.equal(formatSteps({ date: "2026-10-05", count: 3270 }, "2026-10-06"), "昨日の歩数は3270歩");
   assert.equal(formatSteps(undefined, "2026-10-06"), "");
 });
+
+test("parseNewsRss keeps titles, strips the source suffix and drops summaries that only repeat the title", async () => {
+  const { parseNewsRss, formatSearch } = await import("../src/lib.js");
+  const xml = `<rss><channel><item><title><![CDATA[孫が優勝 - スポーツ紙]]></title>` +
+    `<description><![CDATA[<a href="x">孫が優勝</a>&nbsp;&nbsp;決勝で逆転勝ちを収めた。]]></description></item>` +
+    `<item><title>別の話 - 通信社</title><description>別の話</description></item></channel></rss>`;
+  const items = parseNewsRss(xml, 5);
+  assert.equal(items.length, 2);
+  assert.equal(items[0].title, "孫が優勝");
+  assert.match(items[0].summary, /逆転勝ち/);
+  assert.equal(items[1].summary, "");
+  assert.match(formatSearch(items, { title: "X", extract: "説明" }), /・X: 説明/);
+});

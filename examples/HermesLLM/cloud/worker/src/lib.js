@@ -105,6 +105,36 @@ export function trimExtract(text, max = 160) {
   return end > max / 3 ? cut.slice(0, end + 1) : cut;
 }
 
+const decodeEntities = (s) =>
+  s.replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/&nbsp;/g, " ")
+    .replace(/&amp;/g, "&");
+
+// Google News RSS -> [{title, summary}]. The description is HTML that mostly repeats the title, so it is only kept
+// when it adds text beyond the title.
+export function parseNewsRss(xml, max = 5) {
+  const out = [];
+  const tag = (block, name) => {
+    const m = block.match(new RegExp(`<${name}>([\\s\\S]*?)</${name}>`));
+    return m ? m[1].replace(/<!\[CDATA\[|\]\]>/g, "") : "";
+  };
+  for (const m of (xml ?? "").matchAll(/<item>([\s\S]*?)<\/item>/g)) {
+    const title = decodeEntities(tag(m[1], "title")).replace(/\s+-\s+[^-]+$/, "").trim();
+    if (!title) continue;
+    let summary = decodeEntities(decodeEntities(tag(m[1], "description")).replace(/<[^>]*>/g, " "))
+      .replace(/\s+/g, " ").trim();
+    if (summary.startsWith(title)) summary = summary.slice(title.length).trim();
+    out.push({ title, summary: summary.length > 8 ? trimExtract(summary, 120) : "" });
+    if (out.length >= max) break;
+  }
+  return out;
+}
+
+export function formatSearch(news, wiki) {
+  const lines = news.map((n) => `・${n.title}${n.summary ? `（${n.summary}）` : ""}`);
+  if (wiki?.extract) lines.push(`・${wiki.title}: ${trimExtract(wiki.extract, 200)}`);
+  return lines.join("\n");
+}
+
 export function formatTrivia(place, page) {
   const head = place ? `現在地は${place}。` : "";
   if (!page) return head;

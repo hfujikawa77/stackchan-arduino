@@ -18,6 +18,7 @@ Android(MacroDroid) --POST /location--> Worker(KV) <--GET /digest/<cat>-- ｽﾀ
 | `GET /digest/weather` | Open-Meteo の天気。20分キャッシュ、3km以上移動で再取得 |
 | `GET /digest/gourmet` | ホットペッパーグルメ（要 `HOTPEPPER_KEY`）。400m以上移動 or 12時間で再取得、リクエスト毎にランダムで1店 |
 | `GET /digest/trivia` | 現在地の地名 + 近くのWikipedia記事の冒頭（根拠付き）。リクエスト毎にランダムで1件 |
+| `GET /digest/place` | 現在地の地名と、その場所の季節（南半球は反転）。動物の鳴き声など、地域・季節に合わせた話題用 |
 | `GET /digest/sleep` | `POST /sleep` で預けた直近（今日/昨日）の睡眠 |
 | `POST /sleep` | `{"minutes_asleep":432,"efficiency":91,"deep":70,"rem":95,"minutes_awake":28,"date":"2026-10-05"}`（`minutes_asleep` 必須、`date` 省略時はJST今日）。Google Health 連携（cron）でも同じ形で保存される |
 | `GET /digest/steps` | 昨日の歩数と、その前の1週間の1日平均（cron で Google Health から取得）。言い回し（「よく歩いたね」など）は端末側のプロンプトで付ける |
@@ -38,6 +39,9 @@ npx wrangler kv namespace create STATE        # 出力された id を wrangler.
 node -e "console.log(require('crypto').randomBytes(24).toString('hex'))"   # トークン生成
 npx wrangler secret put SHARED_TOKEN          # 上で生成した値
 npx wrangler secret put HOTPEPPER_KEY         # 任意（グルメを使う場合）
+npx wrangler secret put HOME_LAT              # 任意（自宅の緯度。設定すると、離れている間 digest が away:true を返し、端末が現地情報を多めに話す）
+npx wrangler secret put HOME_LON              # 任意（自宅の経度）
+npx wrangler secret put AWAY_KM               # 任意（自宅からこの距離[km]を超えたら away。省略時30）
 npx wrangler secret put GOOGLE_CLIENT_ID      # 任意（睡眠・歩数の自動取得を使う場合。下の「Google Health 連携」参照）
 npx wrangler secret put GOOGLE_CLIENT_SECRET
 npx wrangler secret put GOOGLE_REFRESH_TOKEN

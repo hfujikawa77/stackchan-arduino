@@ -27,6 +27,7 @@ struct WifiCredential;
 bool touchedZone(int zone);
 void show(const String& text);
 void handle_speak_server();
+static bool servo_ws_send_text(const char* text);
 static bool speak_mavlink_notification(const String& text);
 static void mavlink_notification_tick();
 static void mavlink_receive_tick(bool allow_speech);
@@ -37,6 +38,7 @@ static void led_force_clear();
 static void chat_add(bool is_user, const String& text);
 static void speech_scroll_start(const String& text);
 static void speech_scroll_tick();
+static void speech_scroll_set_duration(uint32_t duration_ms);
 static void speech_scroll_run_to_end(uint8_t repeat_count = 3);
 static void speech_scroll_stop();
 static bool play_wav_file(const char* path);
@@ -101,6 +103,29 @@ static int16_t srv_cx = 150, srv_cy = 90;
 static uint32_t servo_idle_next_ms = 0;
 static uint32_t head_pat_cooldown_until_ms = 0;
 static uint32_t head_touch_next_poll_ms = 0;
+// reveal.js bridge: swipes drive the slides while a browser holds /servo-ws (settings: slide_mode)
+static bool slide_mode_enabled = false;
+static uint32_t slide_swipe_next_ms = 0;
+static bool slide_pending = false;
+static int slide_pending_h = 0;
+static int slide_pending_v = 0;
+static String slide_pending_title;
+static int slide_applied_h = -1;
+static int slide_applied_v = -1;
+struct SlideStep { int8_t dx; int8_t dy; uint16_t ms; uint16_t after_ms; };  // move to (cx+dx, cy+dy), next step after_ms later
+static const SlideStep SLIDE_NOD[]   = {{0, -18, 180, 260}, {0, 0, 220, 0}};
+static const SlideStep SLIDE_SHAKE[] = {{22, 0, 150, 190}, {-22, 0, 150, 190}, {0, 0, 150, 0}};
+static bool slide_spinning = false;  // non-blocking spin in progress; idle / head-track servo writes stand off
+static uint32_t slide_spin_end_ms = 0;
+static const SlideStep* slide_steps = nullptr;
+static uint8_t slide_steps_n = 0;
+static uint8_t slide_step_i = 0;
+static uint32_t slide_step_next_ms = 0;
+static bool slide_greeting_request = false;  // double tap in slide mode: intro.wav, then outro.wav on the next one
+static bool slide_greeting_outro = false;
+static String slide_pending_led;  // JSON spec for led_apply_spec(); empty = leave the LED alone
+static String slide_pending_motion;  // "nod" (default) | "shake" | "spin" | "none"
+static uint32_t slide_bubble_clear_ms = 0;
 static uint32_t startup_stable_until_ms = 0;
 static int16_t servo_web_x = 150;
 static int16_t servo_web_y = 90;
@@ -112,7 +137,7 @@ static SemaphoreHandle_t io_mutex = nullptr;
 
 // --- Precache voice queue ---
 #define PRECACHE_QUEUE_MAX 3
-#define PRECACHE_ITEMS_MAX 20
+#define PRECACHE_ITEMS_MAX 24
 struct PrecacheEntry {
     uint8_t* wav = nullptr;  // PSRAM buffer, owned by the queue
     int wav_len = 0;
@@ -135,6 +160,7 @@ static bool inbox_poll_and_queue();
 static float weather_lat = 35.681f;  // Tokyo by default; override with weather_lat/weather_lon in SC_SecConfig.yaml
 static float weather_lon = 139.767f;
 static String digest_url;    // Cloudflare Worker base URL ("{digest:CATEGORY}" facts); SC_SecConfig.yaml digest_url
+static bool digest_away = false;  // last "away" the Worker reported (phone far from home): local items are favoured
 static String digest_token;  // Bearer token for the Worker; SC_SecConfig.yaml digest_token
 static std::array<PrecacheItem, PRECACHE_ITEMS_MAX> precache_items;
 static uint8_t precache_items_count = 0;
@@ -149,6 +175,7 @@ static int setting_wifi_index = 0;
 static bool setting_attitude_servo_enabled = false;
 static bool setting_rc_follow_enabled = false;
 static bool setting_pat_talk_enabled = true;
+static bool setting_slide_mode_enabled = false;
 static bool setting_attitude_yaw_source_roll = false;
 static int setting_attitude_scale = 50;
 static uint8_t setting_page = 0;   // 0=Main, 1=Flight, 2=LLM
@@ -281,8 +308,15 @@ public:
     void update() {
         {
             ScopedLock lock(io_mutex);
-            sensor.read_touch_result();
+            read_ok_ = sensor.read_touch_result();
             sensor.parse_touch_result();
+        }
+        // Diagnostics for "head dead while the LED is lit": raw register and I2C failures, every 2 s.
+        if (read_ok_) reads_ok_++; else reads_fail_++;
+        if (led_effect_active && static_cast<int32_t>(millis() - diag_next_ms_) >= 0) {
+            diag_next_ms_ = millis() + 2000;
+            Serial.printf("Head sensor (LED on): ok=%u fail=%u raw=0x%02X\n", (unsigned)reads_ok_, (unsigned)reads_fail_, (unsigned)sensor.touch_result);
+            reads_ok_ = reads_fail_ = 0;
         }
         swipe_forward = false;
         swipe_backward = false;
@@ -377,6 +411,8 @@ private:
     bool tap_finalized_ = false;
     bool swipe_seen_in_seq_ = false;
     uint32_t last_release_ms_ = 0;
+    bool read_ok_ = true;
+    uint32_t reads_ok_ = 0, reads_fail_ = 0, diag_next_ms_ = 0;
     static constexpr uint32_t TAP_QUIET_MS = 400;
 };
 
@@ -754,7 +790,7 @@ static void led_task(void*) {
                             vTaskDelay(pdMS_TO_TICKS(15 + delay_base * 3));
                             break;
                         case PAT_CHASE: {
-                            ScopedLock lock(io_mutex);
+                            { ScopedLock lock(io_mutex);
                             for (int i = 0; i < LED_NUM; i++) led_io->setLedColor(i, 0, 0, 0);
                             for (int i = 0; i < 3; i++) {
                                 int idx = (chase_pos + i * 4) % LED_NUM;
@@ -762,12 +798,13 @@ static void led_task(void*) {
                                 led_io->setLedColor(idx, (mr * br) / 255, (mg * br) / 255, (mb * br) / 255);
                             }
                             led_io->refreshLeds();
+                            }  // free io_mutex before sleeping, or the head sensor starves
                             chase_pos = (chase_pos + 1) % LED_NUM;
                             vTaskDelay(pdMS_TO_TICKS(30 + delay_base * 6));
                             break;
                         }
                         case PAT_RAINBOW: {
-                            ScopedLock lock(io_mutex);
+                            { ScopedLock lock(io_mutex);
                             for (int i = 0; i < LED_NUM; i++) {
                                 uint8_t hue = (uint8_t)(anim + (i * 255 / LED_NUM));
                                 uint8_t rr, gg, bb;
@@ -784,12 +821,13 @@ static void led_task(void*) {
                                 led_io->setLedColor(i, rr, gg, bb);
                             }
                             led_io->refreshLeds();
+                            }  // free io_mutex before sleeping, or the head sensor starves
                             anim += 3;
                             vTaskDelay(pdMS_TO_TICKS(20 + delay_base * 4));
                             break;
                         }
                         case PAT_WAVE: {
-                            ScopedLock lock(io_mutex);
+                            { ScopedLock lock(io_mutex);
                             for (int i = 0; i < LED_NUM; i++) {
                                 // simple sine-like wave using triangle
                                 int phase = ((int)anim + i * 255 / LED_NUM) & 0xFF;
@@ -797,13 +835,14 @@ static void led_task(void*) {
                                 led_io->setLedColor(i, (mr * br) / 255, (mg * br) / 255, (mb * br) / 255);
                             }
                             led_io->refreshLeds();
+                            }  // free io_mutex before sleeping, or the head sensor starves
                             anim += 4;
                             vTaskDelay(pdMS_TO_TICKS(20 + delay_base * 4));
                             break;
                         }
                         case PAT_SPLIT: {
                             uint8_t mr2 = manual_r2, mg2 = manual_g2, mb2 = manual_b2;
-                            ScopedLock lock(io_mutex);
+                            { ScopedLock lock(io_mutex);
                             int half = LED_NUM / 2;
                             for (int i = 0; i < LED_NUM; i++) {
                                 if (i < half)
@@ -812,12 +851,13 @@ static void led_task(void*) {
                                     led_io->setLedColor(i, mr2, mg2, mb2);
                             }
                             led_io->refreshLeds();
+                            }  // free io_mutex before sleeping, or the head sensor starves
                             vTaskDelay(pdMS_TO_TICKS(100));
                             break;
                         }
                         case PAT_ALTERNATE: {
                             uint8_t mr2 = manual_r2, mg2 = manual_g2, mb2 = manual_b2;
-                            ScopedLock lock(io_mutex);
+                            { ScopedLock lock(io_mutex);
                             for (int i = 0; i < LED_NUM; i++) {
                                 int idx = (i + chase_pos) % LED_NUM;
                                 if (idx % 2 == 0)
@@ -826,6 +866,7 @@ static void led_task(void*) {
                                     led_io->setLedColor(i, mr2, mg2, mb2);
                             }
                             led_io->refreshLeds();
+                            }  // free io_mutex before sleeping, or the head sensor starves
                             chase_pos = (chase_pos + 1) % LED_NUM;
                             vTaskDelay(pdMS_TO_TICKS(50 + delay_base * 8));
                             break;
@@ -833,7 +874,7 @@ static void led_task(void*) {
                         case PAT_SPLIT_BLINK: {
                             uint8_t mr2 = manual_r2, mg2 = manual_g2, mb2 = manual_b2;
                             blink_state = !blink_state;
-                            ScopedLock lock(io_mutex);
+                            { ScopedLock lock(io_mutex);
                             int half = LED_NUM / 2;
                             for (int i = 0; i < LED_NUM; i++) {
                                 if (i < half)
@@ -842,6 +883,7 @@ static void led_task(void*) {
                                     led_io->setLedColor(i, blink_state ? mr2 : 0, blink_state ? mg2 : 0, blink_state ? mb2 : 0);
                             }
                             led_io->refreshLeds();
+                            }  // free io_mutex before sleeping, or the head sensor starves
                             vTaskDelay(pdMS_TO_TICKS(blink_state ? manual_on_ms : manual_off_ms));
                             break;
                         }
@@ -849,7 +891,7 @@ static void led_task(void*) {
                             uint8_t mr2 = manual_r2, mg2 = manual_g2, mb2 = manual_b2;
                             if (anim_dir > 0) { if (anim < 249) anim += 6; else anim_dir = -1; }
                             else              { if (anim > 6)   anim -= 6; else anim_dir =  1; }
-                            ScopedLock lock(io_mutex);
+                            { ScopedLock lock(io_mutex);
                             int half = LED_NUM / 2;
                             for (int i = 0; i < LED_NUM; i++) {
                                 if (i < half)
@@ -858,12 +900,13 @@ static void led_task(void*) {
                                     led_io->setLedColor(i, (mr2 * anim) / 255, (mg2 * anim) / 255, (mb2 * anim) / 255);
                             }
                             led_io->refreshLeds();
+                            }  // free io_mutex before sleeping, or the head sensor starves
                             vTaskDelay(pdMS_TO_TICKS(15 + delay_base * 3));
                             break;
                         }
                         case PAT_SPLIT_WAVE: {
                             uint8_t mr2 = manual_r2, mg2 = manual_g2, mb2 = manual_b2;
-                            ScopedLock lock(io_mutex);
+                            { ScopedLock lock(io_mutex);
                             int half = LED_NUM / 2;
                             for (int i = 0; i < LED_NUM; i++) {
                                 int phase = ((int)anim + i * 255 / LED_NUM) & 0xFF;
@@ -874,13 +917,14 @@ static void led_task(void*) {
                                     led_io->setLedColor(i, (mr2 * br) / 255, (mg2 * br) / 255, (mb2 * br) / 255);
                             }
                             led_io->refreshLeds();
+                            }  // free io_mutex before sleeping, or the head sensor starves
                             anim += 4;
                             vTaskDelay(pdMS_TO_TICKS(20 + delay_base * 4));
                             break;
                         }
                         case PAT_SPLIT_CHASE: {
                             uint8_t mr2 = manual_r2, mg2 = manual_g2, mb2 = manual_b2;
-                            ScopedLock lock(io_mutex);
+                            { ScopedLock lock(io_mutex);
                             int half = LED_NUM / 2;
                             for (int i = 0; i < LED_NUM; i++) led_io->setLedColor(i, 0, 0, 0);
                             for (int j = 0; j < 3; j++) {
@@ -892,6 +936,7 @@ static void led_task(void*) {
                                     led_io->setLedColor(idx, (mr2 * br) / 255, (mg2 * br) / 255, (mb2 * br) / 255);
                             }
                             led_io->refreshLeds();
+                            }  // free io_mutex before sleeping, or the head sensor starves
                             chase_pos = (chase_pos + 1) % LED_NUM;
                             vTaskDelay(pdMS_TO_TICKS(30 + delay_base * 6));
                             break;
@@ -1175,7 +1220,8 @@ __attribute__((noinline)) static String fetch_digest(const String& category) {
     JsonDocument doc;
     if (deserializeJson(doc, resp)) { Serial.println("DIGEST JSON parse error"); return ""; }
     String text = doc["text"] | "";
-    Serial.printf("DIGEST %s %s\n", category.c_str(), text.c_str());
+    if (!doc["away"].isNull()) digest_away = doc["away"] | false;
+    Serial.printf("DIGEST %s away=%d %s\n", category.c_str(), digest_away ? 1 : 0, text.c_str());
     return text;
 }
 
@@ -1297,6 +1343,17 @@ static void precache_generate_next() {
     PrecacheIndicator indicator;
 
     Serial.printf("DEBUG precache_generate_next: index=%d, count=%d\n", precache_item_index, precache_items_count);
+    if (digest_away && random(0, 3) != 0) {
+        // Away from home: two times out of three, jump to the next place-based item (weather/gourmet/trivia).
+        for (int k = 0; k < precache_items_count; k++) {
+            const int idx = (precache_item_index + k) % precache_items_count;
+            const String& p = precache_items[idx].prompt;
+            if (p.indexOf("{digest:weather}") >= 0 || p.indexOf("{digest:gourmet}") >= 0 || p.indexOf("{digest:trivia}") >= 0) {
+                precache_item_index = idx;
+                break;
+            }
+        }
+    }
     PrecacheItem& item = precache_items[precache_item_index];
     Serial.printf("DEBUG item: type=%s, text=%s, prompt=%s\n", item.type.c_str(), item.text.c_str(), item.prompt.c_str());
     const int item_idx = precache_item_index;
@@ -1469,16 +1526,19 @@ static bool llm_reply_failed(const String& t) {
            || t == "Hermes not configured." || t == "WiFi reconnect failed.";
 }
 
-static String build_inbox_prompt(const String& text, JsonObject reply_to) {
+// search: web search results (may be empty); when present they are allowed as facts too.
+static String build_inbox_prompt(const String& text, JsonObject reply_to, const String& search = "") {
     const String quoted = "「" + text + "」";
+    const String search_block = search.isEmpty() ? String("") : "ウェブ検索の結果:\n" + search + "\n";
     if (reply_to.isNull()) {
-        return "ユーザーがDiscordでこう話しかけました: " + quoted +
-               "\nｽﾀｯｸﾁｬﾝとして、口語で2文・60文字以内で答えて。知らないことは「わからないよ」と言って。説明や記号は不要。";
+        return search_block + "ユーザーがDiscordでこう話しかけました: " + quoted +
+               (search.isEmpty() ? "\nｽﾀｯｸﾁｬﾝとして、口語で2文・60文字以内で答えて。知らないことは「わからないよ」と言って。説明や記号は不要。"
+                                 : "\nｽﾀｯｸﾁｬﾝとして、検索結果にあることだけを使って、口語で2文・60文字以内で答えて。検索結果にないことは「わからないよ」と言って。説明や記号は不要。");
     }
     const String said = reply_to["text"] | "";
     const String facts = reply_to["facts"] | "";
     String by = reply_to["by"] | "";
-    String prompt;
+    String prompt = search_block;
     if (by == "stackchan") {
         prompt = "あなたはさっき、こう話しました: 「" + said + "」\n";
         if (!facts.isEmpty()) prompt += "その元になった情報: 「" + facts + "」\n";
@@ -1486,9 +1546,22 @@ static String build_inbox_prompt(const String& text, JsonObject reply_to) {
     } else {
         prompt = "ユーザーが、次のメッセージに返信しました。\n返信先: 「" + said + "」\n返信: " + quoted + "\n";
     }
-    prompt += "返信に、ｽﾀｯｸﾁｬﾝとして答えて。使ってよいのは、話した内容と元の情報にあることだけ。ないことは「わからないよ」と言って。"
-              "口語で2文・60文字以内。説明や記号は不要。";
+    prompt += String("返信に、ｽﾀｯｸﾁｬﾝとして答えて。使ってよいのは、話した内容と元の情報") + (search.isEmpty() ? "" : "と検索結果") +
+              "にあることだけ。ないことは「わからないよ」と言って。口語で2文・60文字以内。説明や記号は不要。";
     return prompt;
+}
+
+// Free keyless web search through the Worker (Google News headlines + Wikipedia intro). "" when nothing is found.
+static String fetch_search(const String& query) {
+    if (query.isEmpty()) return "";
+    String resp;
+    int st = digest_request(false, "/search?q=" + url_encode(query), "", &resp, 12000);
+    if (st != 200) { Serial.printf("SEARCH http=%d\n", st); return ""; }
+    JsonDocument doc;
+    if (deserializeJson(doc, resp)) return "";
+    String text = doc["text"] | "";
+    Serial.printf("SEARCH [%s] %d chars\n", query.c_str(), (int)text.length());
+    return text;
 }
 
 // Handles at most one inbox item. True when an answer was queued (a scheduled item can then be skipped).
@@ -1517,7 +1590,7 @@ static bool inbox_poll_and_queue() {
     const String text = it["text"] | "";
     if (id.isEmpty() || text.isEmpty()) return false;
     JsonObject reply_to = it["reply_to"].as<JsonObject>();
-    const String facts = reply_to.isNull() ? String("") : String(reply_to["facts"] | "");
+    String facts = reply_to.isNull() ? String("") : String(reply_to["facts"] | "");
     Serial.printf("INBOX item %s: %s\n", id.c_str(), text.c_str());
 
     PrecacheIndicator indicator;
@@ -1525,6 +1598,27 @@ static bool inbox_poll_and_queue() {
         "あなたはｽﾀｯｸﾁｬﾝ、小さなおしゃべりロボット。口語の日本語で、2文・60文字以内で答える。わからないことはわからないと言う。";
     String answer = call_hermes_ex(build_inbox_prompt(text, reply_to), kSystem, 160);
     answer.trim();
+    // Could not answer from what it already knows: search the web once and answer again from the results.
+    if (answer.indexOf("わからない") >= 0 && !llm_reply_failed(answer)) {
+        String context = text;
+        if (!reply_to.isNull()) context = String(reply_to["text"] | "") + " / " + text;
+        String query = call_hermes_ex(
+            "次の会話の内容を調べるための、検索キーワードを作って。固有名詞を含め、スペース区切りで3〜5語。キーワードだけを出力。\n会話: " + context,
+            "検索キーワードだけを1行で出力する。説明や記号は不要。", 40);
+        query.trim();
+        query.replace("\n", " ");
+        if (!llm_reply_failed(query) && query.length() <= 120) {
+            const String found = fetch_search(query);
+            if (!found.isEmpty()) {
+                String second = call_hermes_ex(build_inbox_prompt(text, reply_to, found), kSystem, 160);
+                second.trim();
+                if (!llm_reply_failed(second)) {
+                    answer = second;
+                    facts = found.substring(0, 500);  // so a follow-up reply can be grounded in the same results
+                }
+            }
+        }
+    }
     uint8_t* wav = nullptr;
     int wav_len = 0;
     const String spoken = String("お返事だよ。") + answer;
@@ -1573,10 +1667,22 @@ static void inbox_tick() {
 
 static HeadGesture head_pat_detected() {
     head_touch_sensor.update();
-    if (head_touch_sensor.was_swiped_forward() || head_touch_sensor.was_swiped_backward())
+    const bool fwd = head_touch_sensor.was_swiped_forward();
+    const bool back = head_touch_sensor.was_swiped_backward();
+    if ((fwd || back) && slide_mode_enabled && servo_ws_active) {
+        // Slides own the swipe; taps stay as they are. Debounced so one stroke sends one command.
+        if (time_reached(millis(), slide_swipe_next_ms)) {
+            slide_swipe_next_ms = millis() + 500;
+            servo_ws_send_text(fwd ? "{\"type\":\"control\",\"action\":\"next\"}"
+                                   : "{\"type\":\"control\",\"action\":\"prev\"}");
+            Serial.printf("Slide control: %s\n", fwd ? "next" : "prev");
+        }
+    } else if (fwd || back) {
         return GESTURE_PAT;
+    }
     if (head_touch_sensor.tap_ready()) {
         uint8_t n = head_touch_sensor.consume_tap_count();
+        if (n == 2 && slide_mode_enabled) { slide_greeting_request = true; return GESTURE_NONE; }
         if (n == 2) return GESTURE_DOUBLE_TAP;
         if (n >= 3) return GESTURE_TRIPLE_TAP;
     }
@@ -1870,6 +1976,7 @@ static void on_head_track_recv(const uint8_t* mac, const uint8_t* data, int len)
 }
 
 static void head_track_tick() {
+    if (slide_spinning) return;
     const uint32_t now = millis();
 
     // Snapshot and consume the latest received packet under the spinlock.
@@ -1958,6 +2065,91 @@ static void servo_ws_stop() {
     servo_ws_active = false;
 }
 
+static bool servo_ws_send_text(const char* text) {
+    if (!servo_ws_active || !servo_ws_client.connected()) return false;
+    size_t n = strlen(text);
+    if (n > 125) return false;
+    uint8_t hdr[2] = {0x81, (uint8_t)n};  // server frames are unmasked
+    servo_ws_client.write(hdr, 2);
+    servo_ws_client.write(reinterpret_cast<const uint8_t*>(text), n);
+    return true;
+}
+
+// Shared by POST /led and the slide bridge: {"off":true} | {"preset":"ocean"} | {"pattern","color","color2","speed"}.
+static void led_apply_spec(JsonVariantConst spec, String& res_pattern, String& res_color) {
+    if (spec["off"] | false) {
+        led_set(LED_OFF);
+        led_force_clear();
+    } else if (spec["preset"].is<const char*>()) {
+        String preset = spec["preset"].as<String>();
+        if (preset == "warm_white")     { manual_pattern = PAT_SOLID; manual_r = 255; manual_g = 200; manual_b = 120; }
+        else if (preset == "cool_blue") { manual_pattern = PAT_SOLID; manual_r = 0; manual_g = 100; manual_b = 255; }
+        else if (preset == "alert_red") { manual_pattern = PAT_BLINK; manual_r = 255; manual_g = 0; manual_b = 0; manual_on_ms = 300; manual_off_ms = 300; }
+        else if (preset == "calm_breath") { manual_pattern = PAT_BREATH; manual_r = 0; manual_g = 120; manual_b = 200; manual_speed = 5; }
+        else if (preset == "christmas") { manual_pattern = PAT_ALTERNATE; manual_r = 255; manual_g = 0; manual_b = 0; manual_r2 = 0; manual_g2 = 200; manual_b2 = 0; manual_speed = 7; }
+        else if (preset == "ocean")     { manual_pattern = PAT_WAVE; manual_r = 0; manual_g = 80; manual_b = 200; manual_speed = 5; }
+        else if (preset == "rainbow")   { manual_pattern = PAT_RAINBOW; manual_speed = 5; }
+        else if (preset == "party")     { manual_pattern = PAT_CHASE; manual_r = (uint8_t)random(100, 256); manual_g = (uint8_t)random(100, 256); manual_b = (uint8_t)random(100, 256); manual_speed = 9; }
+        led_set(LED_MANUAL);
+        const char* pat_names[] = {"solid","blink","breath","chase","rainbow","wave","split","alternate","split_blink","split_breath","split_wave","split_chase"};
+        res_pattern = pat_names[manual_pattern];
+        char hex[8]; snprintf(hex, sizeof(hex), "#%02X%02X%02X", (int)manual_r, (int)manual_g, (int)manual_b);
+        res_color = hex;
+    } else {
+        String pat = spec["pattern"] | "solid";
+        if (pat == "solid")      manual_pattern = PAT_SOLID;
+        else if (pat == "blink") manual_pattern = PAT_BLINK;
+        else if (pat == "breath") manual_pattern = PAT_BREATH;
+        else if (pat == "chase") manual_pattern = PAT_CHASE;
+        else if (pat == "rainbow") manual_pattern = PAT_RAINBOW;
+        else if (pat == "wave")  manual_pattern = PAT_WAVE;
+        else if (pat == "split") manual_pattern = PAT_SPLIT;
+        else if (pat == "alternate") manual_pattern = PAT_ALTERNATE;
+        else if (pat == "split_blink") manual_pattern = PAT_SPLIT_BLINK;
+        else if (pat == "split_breath") manual_pattern = PAT_SPLIT_BREATH;
+        else if (pat == "split_wave") manual_pattern = PAT_SPLIT_WAVE;
+        else if (pat == "split_chase") manual_pattern = PAT_SPLIT_CHASE;
+        String color_str = spec["color"] | "#FFFFFF";
+        if (color_str.length() == 7 && color_str[0] == '#') {
+            manual_r = (uint8_t)strtol(color_str.substring(1, 3).c_str(), nullptr, 16);
+            manual_g = (uint8_t)strtol(color_str.substring(3, 5).c_str(), nullptr, 16);
+            manual_b = (uint8_t)strtol(color_str.substring(5, 7).c_str(), nullptr, 16);
+        }
+        String color2_str = spec["color2"] | "";
+        if (color2_str.length() == 7 && color2_str[0] == '#') {
+            manual_r2 = (uint8_t)strtol(color2_str.substring(1, 3).c_str(), nullptr, 16);
+            manual_g2 = (uint8_t)strtol(color2_str.substring(3, 5).c_str(), nullptr, 16);
+            manual_b2 = (uint8_t)strtol(color2_str.substring(5, 7).c_str(), nullptr, 16);
+        }
+        manual_speed = spec["speed"] | 5;
+        if (manual_speed < 1) manual_speed = 1;
+        if (manual_speed > 10) manual_speed = 10;
+        led_set(LED_MANUAL);
+        res_pattern = pat;
+        res_color = color_str;
+    }
+}
+
+// {"type":"slide","indexh":3,"indexv":0} from reveal.js. Only noted here; the loop applies it.
+static void slide_ws_handle(const char* json) {
+    JsonDocument doc;
+    if (deserializeJson(doc, json)) return;
+    const char* type = doc["type"] | "";
+    if (strcmp(type, "slide") != 0) return;  // "ping" etc. only keep the socket alive
+    int h = doc["indexh"] | 0;
+    int v = doc["indexv"] | 0;
+    const char* title = doc["title"] | "";
+    Serial.printf("Slide changed: h=%d v=%d mode=%d\n", h, v, slide_mode_enabled ? 1 : 0);
+    if (!slide_mode_enabled) return;
+    slide_pending_h = h;
+    slide_pending_v = v;
+    slide_pending_title = title;
+    slide_pending_motion = doc["motion"] | "nod";
+    slide_pending_led = "";
+    if (doc["led"].is<JsonObject>()) serializeJson(doc["led"], slide_pending_led);
+    slide_pending = true;
+}
+
 static void servo_ws_apply_text(const String& msg) {
     if (!servo_ready || busy) return;
     int first = msg.indexOf(',');
@@ -2012,13 +2204,13 @@ static void servo_ws_tick() {
             servo_ws_stop();
             return;
         }
-        if (!masked || len > 96) {
+        if (!masked || len > 440) {
             servo_ws_stop();
             return;
         }
         uint8_t mask[4];
         if (!servo_ws_read_exact(mask, 4)) return;
-        char payload[97];
+        static char payload[441];  // static: keeps the 440-byte frame off the loop stack
         if (!servo_ws_read_exact(reinterpret_cast<uint8_t*>(payload), len)) return;
         for (uint64_t i = 0; i < len; ++i) payload[i] ^= mask[i & 3];
         payload[len] = '\0';
@@ -2026,19 +2218,125 @@ static void servo_ws_tick() {
             servo_ws_stop();
             return;
         }
+        if (opcode == 0x9) {  // ping -> pong with the same payload
+            uint8_t ph[2] = {0x8A, (uint8_t)len};
+            servo_ws_client.write(ph, 2);
+            servo_ws_client.write(reinterpret_cast<const uint8_t*>(payload), (size_t)len);
+            servo_ws_last_ms = millis();
+        }
         if (opcode == 0x1) {
             servo_ws_last_ms = millis();
-            latest_text = String(payload);
+            if (payload[0] == '{') slide_ws_handle(payload);  // each JSON message counts; servo text coalesces
+            else latest_text = String(payload);
         }
     }
     if (latest_text.length()) servo_ws_apply_text(latest_text);
-    if (servo_ws_last_ms && time_reached(millis(), servo_ws_last_ms + 30000)) {
+    if (servo_ws_last_ms && time_reached(millis(), servo_ws_last_ms + 90000)) {
         servo_ws_stop();
     }
 }
 
+// One step of the current slide motion; runs once per transition and never blocks the loop.
+static void slide_step_run() {
+    if (!servo_ready || busy || slide_step_i >= slide_steps_n) { slide_steps = nullptr; return; }
+    const SlideStep& st = slide_steps[slide_step_i++];
+    sc_servo.moveXY(clamp_servo_axis(AXIS_X, srv_cx + st.dx), clamp_servo_axis(AXIS_Y, srv_cy + st.dy), st.ms);
+    if (slide_step_i >= slide_steps_n) slide_steps = nullptr;
+    else slide_step_next_ms = millis() + st.after_ms;
+}
+
+static void slide_motion_start(const SlideStep* steps, uint8_t n) {
+    slide_steps = steps;
+    slide_steps_n = n;
+    slide_step_i = 0;
+    slide_step_run();
+}
+
+// Spoken greeting from SPIFFS: first call plays intro.wav, the next outro.wav, alternating. Blocks while playing.
+static void slide_greeting_play() {
+    slide_greeting_request = false;
+    if (busy || app_mode != MODE_NORMAL) return;
+    const char* path = slide_greeting_outro ? "/audio/outro.wav" : "/audio/intro.wav";
+    const char* text = slide_greeting_outro ? "Thank you, everyone!" : "Hiii, everyone! I'm Stack-chan!";
+    if (!SPIFFS.exists(path)) {
+        Serial.printf("Greeting audio missing: %s\n", path);
+        return;
+    }
+    busy = true;
+    avatar.setExpression(Expression::Happy);
+    led_set(LED_SPEAKING);
+    speech_scroll_start(text);
+    const bool ok = play_wav_file(path);
+    speech_scroll_stop();
+    avatar.setSpeechText("");
+    avatar.setExpression(Expression::Neutral);
+    led_set(LED_OFF);
+    busy = false;
+    if (ok) slide_greeting_outro = !slide_greeting_outro;
+}
+
+// Per-slide expression, looked up by indexh. Voice/servo hook in here later.
+static void slide_apply_tick() {
+    // Finish the nod and drop the bubble without blocking the loop.
+    uint32_t t = millis();
+    if (slide_steps && time_reached(t, slide_step_next_ms)) slide_step_run();
+    if (slide_spinning && time_reached(t, slide_spin_end_ms)) {
+        slide_spinning = false;
+        sc_servo.turnXEnd();
+        sc_servo.moveXY(srv_cx, srv_cy, 500);
+    }
+    if (slide_greeting_request) slide_greeting_play();
+    if (slide_bubble_clear_ms && time_reached(t, slide_bubble_clear_ms)) {
+        slide_bubble_clear_ms = 0;
+        speech_scroll_stop();
+        if (!busy) avatar.setSpeechText("");
+    }
+    if (slide_bubble_clear_ms && speech_scroll_active && !busy) speech_scroll_tick();  // scrolls titles longer than the bubble
+    if (!slide_pending) return;
+    slide_pending = false;
+    if (busy || app_mode != MODE_NORMAL) {
+        Serial.printf("Slide skipped: busy=%d mode=%d\n", busy ? 1 : 0, (int)app_mode);
+        return;
+    }
+    if (slide_pending_h == slide_applied_h && slide_pending_v == slide_applied_v) return;
+    slide_applied_h = slide_pending_h;
+    slide_applied_v = slide_pending_v;
+    Serial.printf("Slide applied: h=%d servo_ready=%d\n", slide_applied_h, servo_ready ? 1 : 0);
+    // Cycles every 6 slides: page 1 Neutral, then Happy, Doubt, Sad, Angry, Sleepy, and again from page 7.
+    static const Expression table[] = {
+        Expression::Neutral, Expression::Happy, Expression::Doubt,
+        Expression::Sad, Expression::Angry, Expression::Sleepy,
+    };
+    const Expression e = table[(slide_applied_h < 0 ? 0 : slide_applied_h) % 6];
+    avatar.setExpression(e);
+
+    // Acknowledge the slide: bubble with its number and one nod.
+    String bubble = String(slide_applied_h + 1) + ". " + slide_pending_title;
+    if (slide_pending_title.isEmpty()) bubble = String(slide_applied_h + 1) + "ページ目";
+    speech_scroll_start(bubble);
+    speech_scroll_set_duration(4000);
+    slide_bubble_clear_ms = millis() + 4000;
+    if (!slide_pending_led.isEmpty()) {
+        // Held until the next transition replaces it.
+        JsonDocument led_doc;
+        String led_pattern, led_color;
+        if (!deserializeJson(led_doc, slide_pending_led)) led_apply_spec(led_doc, led_pattern, led_color);
+    }
+    if (!servo_ready || slide_spinning || slide_pending_motion == "none") return;
+    if (slide_pending_motion == "shake") {
+        slide_motion_start(SLIDE_SHAKE, sizeof(SLIDE_SHAKE) / sizeof(SLIDE_SHAKE[0]));
+    } else if (slide_pending_motion == "spin") {
+        // Same full X-axis spin as the triple tap, but timed here so the head sensor keeps being read.
+        sc_servo.turnXBegin(500, false);
+        slide_spinning = true;
+        slide_spin_end_ms = millis() + 2000;
+    } else {
+        slide_motion_start(SLIDE_NOD, sizeof(SLIDE_NOD) / sizeof(SLIDE_NOD[0]));
+    }
+}
+
 void servo_idle_tick() {
-    if (!servo_ready || !servo_idle_enabled) return;
+    if (!servo_ready || !servo_idle_enabled || slide_spinning) return;
     uint32_t now = millis();
     if (now < servo_idle_next_ms) return;
     // If we've been blocked for >5 sec (STT/Hermes/TTS), defer idle move
@@ -2189,6 +2487,7 @@ void load_hermes_config(fs::FS& fs) {
     mavlink_attitude_servo_enabled = extractInt("mavlink_attitude_servo", mavlink_attitude_servo_enabled ? 1 : 0) != 0;
     mavlink_rc_follow_enabled = extractInt("mavlink_rc_follow", mavlink_rc_follow_enabled ? 1 : 0) != 0;
     precache_on_pat_enabled = extractInt("precache_on_pat", precache_on_pat_enabled ? 1 : 0) != 0;
+    slide_mode_enabled = extractInt("slide_mode", slide_mode_enabled ? 1 : 0) != 0;
     if (mavlink_rc_follow_enabled) mavlink_attitude_servo_enabled = false;
     mavlink_attitude_yaw_source_roll = extractInt("mavlink_yaw_source_roll", mavlink_attitude_yaw_source_roll ? 1 : 0) != 0;
     mavlink_attitude_scale = constrain(extractInt("mavlink_attitude_scale", mavlink_attitude_scale), 0, 100);
@@ -3729,6 +4028,9 @@ static void handle_config_get(WiFiClient& client) {
     html += F("<label class=check><input type=checkbox name=btn_stt_tap value=1");
     if (btn_stt_tap)       html += F(" checked");
     html += F(">Center tap 窶・Push-to-Talk (STT)</label>");
+    html += F("<label class=check><input type=checkbox name=slide_mode value=1");
+    if (slide_mode_enabled) html += F(" checked");
+    html += F(">Slide mode: head swipe drives reveal.js (via /servo-ws)</label>");
     html += F("<label class=check><input type=checkbox name=btn_servo_tap value=1");
     if (btn_servo_tap)     html += F(" checked");
     html += F(">Right tap 窶・Servo idle toggle</label>");
@@ -4063,6 +4365,7 @@ static void handle_config_post(WiFiClient& client, int content_length) {
     update_yaml_int_value(yaml, "btn_periodic_hold",  form_has_checked(body, "btn_periodic_hold")  ? 1 : 0);
     update_yaml_int_value(yaml, "btn_stt_tap",        form_has_checked(body, "btn_stt_tap")        ? 1 : 0);
     update_yaml_int_value(yaml, "btn_servo_tap",      form_has_checked(body, "btn_servo_tap")      ? 1 : 0);
+    update_yaml_int_value(yaml, "slide_mode",         form_has_checked(body, "slide_mode")         ? 1 : 0);
     update_yaml_int_value(yaml, "btn_bpm_hold",       form_has_checked(body, "btn_bpm_hold")       ? 1 : 0);
 
     bool periodic_en = form_has_checked(body, "periodic_enabled");
@@ -4396,57 +4699,7 @@ void handle_speak_server() {
         }
         String res_pattern = "off";
         String res_color = "#000000";
-        if (doc["off"] | false) {
-            led_set(LED_OFF);
-            led_force_clear();
-        } else if (doc["preset"].is<const char*>()) {
-            String preset = doc["preset"].as<String>();
-            if (preset == "warm_white")     { manual_pattern = PAT_SOLID; manual_r = 255; manual_g = 200; manual_b = 120; }
-            else if (preset == "cool_blue") { manual_pattern = PAT_SOLID; manual_r = 0; manual_g = 100; manual_b = 255; }
-            else if (preset == "alert_red") { manual_pattern = PAT_BLINK; manual_r = 255; manual_g = 0; manual_b = 0; manual_on_ms = 300; manual_off_ms = 300; }
-            else if (preset == "calm_breath") { manual_pattern = PAT_BREATH; manual_r = 0; manual_g = 120; manual_b = 200; manual_speed = 5; }
-            else if (preset == "christmas") { manual_pattern = PAT_ALTERNATE; manual_r = 255; manual_g = 0; manual_b = 0; manual_r2 = 0; manual_g2 = 200; manual_b2 = 0; manual_speed = 7; }
-            else if (preset == "ocean")     { manual_pattern = PAT_WAVE; manual_r = 0; manual_g = 80; manual_b = 200; manual_speed = 5; }
-            else if (preset == "rainbow")   { manual_pattern = PAT_RAINBOW; manual_speed = 5; }
-            else if (preset == "party")     { manual_pattern = PAT_CHASE; manual_r = (uint8_t)random(100, 256); manual_g = (uint8_t)random(100, 256); manual_b = (uint8_t)random(100, 256); manual_speed = 9; }
-            led_set(LED_MANUAL);
-            const char* pat_names[] = {"solid","blink","breath","chase","rainbow","wave","split","alternate","split_blink","split_breath","split_wave","split_chase"};
-            res_pattern = pat_names[manual_pattern];
-            char hex[8]; snprintf(hex, sizeof(hex), "#%02X%02X%02X", (int)manual_r, (int)manual_g, (int)manual_b);
-            res_color = hex;
-        } else {
-            String pat = doc["pattern"] | "solid";
-            if (pat == "solid")      manual_pattern = PAT_SOLID;
-            else if (pat == "blink") manual_pattern = PAT_BLINK;
-            else if (pat == "breath") manual_pattern = PAT_BREATH;
-            else if (pat == "chase") manual_pattern = PAT_CHASE;
-            else if (pat == "rainbow") manual_pattern = PAT_RAINBOW;
-            else if (pat == "wave")  manual_pattern = PAT_WAVE;
-            else if (pat == "split") manual_pattern = PAT_SPLIT;
-            else if (pat == "alternate") manual_pattern = PAT_ALTERNATE;
-            else if (pat == "split_blink") manual_pattern = PAT_SPLIT_BLINK;
-            else if (pat == "split_breath") manual_pattern = PAT_SPLIT_BREATH;
-            else if (pat == "split_wave") manual_pattern = PAT_SPLIT_WAVE;
-            else if (pat == "split_chase") manual_pattern = PAT_SPLIT_CHASE;
-            String color_str = doc["color"] | "#FFFFFF";
-            if (color_str.length() == 7 && color_str[0] == '#') {
-                manual_r = (uint8_t)strtol(color_str.substring(1, 3).c_str(), nullptr, 16);
-                manual_g = (uint8_t)strtol(color_str.substring(3, 5).c_str(), nullptr, 16);
-                manual_b = (uint8_t)strtol(color_str.substring(5, 7).c_str(), nullptr, 16);
-            }
-            String color2_str = doc["color2"] | "";
-            if (color2_str.length() == 7 && color2_str[0] == '#') {
-                manual_r2 = (uint8_t)strtol(color2_str.substring(1, 3).c_str(), nullptr, 16);
-                manual_g2 = (uint8_t)strtol(color2_str.substring(3, 5).c_str(), nullptr, 16);
-                manual_b2 = (uint8_t)strtol(color2_str.substring(5, 7).c_str(), nullptr, 16);
-            }
-            manual_speed = doc["speed"] | 5;
-            if (manual_speed < 1) manual_speed = 1;
-            if (manual_speed > 10) manual_speed = 10;
-            led_set(LED_MANUAL);
-            res_pattern = pat;
-            res_color = color_str;
-        }
+        led_apply_spec(doc, res_pattern, res_color);
         if (res_pattern != "off" && !busy && avatar_ready) {
             avatar.setExpression(Expression::Happy);
             avatar.setMouthOpenRatio(0.4f);
@@ -4691,6 +4944,7 @@ static void save_settings() {
     update_yaml_int_value(yaml, "mavlink_yaw_source_roll", setting_attitude_yaw_source_roll ? 1 : 0);
     update_yaml_int_value(yaml, "mavlink_attitude_scale", setting_attitude_scale);
     update_yaml_int_value(yaml, "precache_on_pat", precache_on_pat_enabled ? 1 : 0);
+    update_yaml_int_value(yaml, "slide_mode", slide_mode_enabled ? 1 : 0);
     if (setting_model_index >= 0 && setting_model_index < (int)llm_model_count) {
         update_yaml_quoted_in_section(yaml, "hermes", "  model: \"", llm_models[setting_model_index].slug);
     }
@@ -4766,6 +5020,16 @@ static void draw_pat_talk_button() {
     M5.Display.setTextColor(TFT_WHITE, bg);
     M5.Display.setCursor(24, 180);
     M5.Display.print(setting_pat_talk_enabled ? "Pat talk: ON" : "Pat talk: OFF");
+}
+
+static void draw_slide_mode_button() {
+    uint16_t bg = setting_slide_mode_enabled ? TFT_DARKGREEN : TFT_DARKGREY;
+    M5.Display.fillRoundRect(164, 170, 148, 28, 5, bg);
+    M5.Display.drawRoundRect(164, 170, 148, 28, 5, TFT_WHITE);
+    M5.Display.setTextSize(1);
+    M5.Display.setTextColor(TFT_WHITE, bg);
+    M5.Display.setCursor(176, 180);
+    M5.Display.print(setting_slide_mode_enabled ? "Slide mode: ON" : "Slide mode: OFF");
 }
 
 static void draw_attitude_settings_row() {
@@ -4863,17 +5127,16 @@ static void draw_settings_ui() {
         draw_slider_row(126, "Brightness", setting_brightness);
         M5.Display.drawLine(0, 168, 320, 168, TFT_DARKGREY);
         draw_pat_talk_button();
-        M5.Display.setTextSize(1);
-        M5.Display.setTextColor(TFT_DARKGREY, TFT_BLACK);
-        M5.Display.setCursor(168, 172);
-        M5.Display.print("ESP-NOW MAC");
-        M5.Display.setTextColor(TFT_CYAN, TFT_BLACK);
-        M5.Display.setCursor(168, 186);
-        M5.Display.print(WiFi.macAddress().c_str());
+        draw_slide_mode_button();
     } else if (setting_page == 1) {
         M5.Display.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
         M5.Display.setCursor(8, 42);
         M5.Display.print("Select IMU or RC follow mode.");
+        M5.Display.setTextColor(TFT_DARKGREY, TFT_BLACK);
+        M5.Display.setCursor(8, 58);
+        M5.Display.print("ESP-NOW MAC ");
+        M5.Display.setTextColor(TFT_CYAN, TFT_BLACK);
+        M5.Display.print(WiFi.macAddress().c_str());
         draw_attitude_settings_row();
     } else {
         draw_llm_model_list();
@@ -4899,6 +5162,7 @@ static void settings_enter() {
     setting_attitude_servo_enabled = mavlink_attitude_servo_enabled;
     setting_rc_follow_enabled = mavlink_rc_follow_enabled;
     setting_pat_talk_enabled = precache_on_pat_enabled;
+    setting_slide_mode_enabled = slide_mode_enabled;
     setting_attitude_yaw_source_roll = mavlink_attitude_yaw_source_roll;
     setting_attitude_scale = mavlink_attitude_scale;
     setting_model_index = -1;
@@ -4917,6 +5181,7 @@ static void settings_exit(bool save) {
         mavlink_attitude_servo_enabled = setting_attitude_servo_enabled;
         mavlink_rc_follow_enabled = setting_rc_follow_enabled;
         precache_on_pat_enabled = setting_pat_talk_enabled;
+        slide_mode_enabled = setting_slide_mode_enabled;
         if (mavlink_rc_follow_enabled) mavlink_attitude_servo_enabled = false;
         mavlink_attitude_filter_ready = false;
         mavlink_attitude_target_ready = false;
@@ -4967,6 +5232,12 @@ static void handle_settings_touch() {
     // Save
     if (touch.wasPressed()) {
         if (tx >= 165 && tx <= 310 && ty >= 204 && ty <= 234) { settings_exit(true); return; }
+    }
+
+    if (setting_page == 0 && touch.wasPressed() && tx >= 163 && tx <= 320 && ty >= 166 && ty <= 200) {
+        setting_slide_mode_enabled = !setting_slide_mode_enabled;
+        draw_slide_mode_button();
+        return;
     }
 
     if (setting_page == 0 && touch.wasPressed() && tx >= 0 && tx <= 162 && ty >= 166 && ty <= 200) {
@@ -5512,6 +5783,7 @@ static void mavlink_receive_tick(bool allow_speech) {
 void setup() {
     auto cfg = M5.config();
     M5.begin(cfg);
+    Serial.printf("Build: %s %s (slide bridge: nod+bubble)\n", __DATE__, __TIME__);
     randomSeed(esp_random());
     head_touch_sensor.begin();
     auto spk_cfg = M5.Speaker.config();
@@ -5575,8 +5847,13 @@ void setup() {
         precache_items[10] = {"riddle_a", "", ""};
         precache_items[11] = {"llm", "", "今日は{date}。この日にちなんだ記念日や豆知識を一つ、短く伝えて。返答に「〇月〇日〇曜日」を含めてください。"};
         precache_items[12] = {"llm", "", "次のニュース見出しの内容だけを元に、親しみやすく短く伝えて。見出しにない事実は足さない。見出し: {news:4}"};
-        precache_items_count = 13;
+        precache_items[13] = {"llm", "", "カナダの首都オタワについて、{pick:リドー運河|国会議事堂|チューリップ祭り|ビーバーテール|冬のスケート|フランス語と英語|カナダの首都になった理由|寒い冬}の話題で、豆知識を一つ短く伝えて。回答は「オタワはね、」で始めてください。"};
+        precache_items[14] = {"llm", "", "ｽﾀｯｸﾁｬﾝがカナダのオタワに行ったつもりで、{pick:見たもの|食べたもの|感じた寒さ|出会った人|おみやげ}を楽しく短く話して。"};
+        precache_items[15] = {"llm", "", "カナダのオタワの{pick:季節の行事|名物グルメ|有名な建物|自然|歴史}について、子どもにもわかるように短く紹介して。"};
+        precache_items_count = 16;
         if (!digest_url.isEmpty() && !digest_token.isEmpty()) {
+            // Animal sounds follow the place and season (needs the Worker's location).
+            precache_items[5] = {"llm", "", "次の場所と季節だけを元に、その地域でよく知られている動物や、この季節に見られる動物を一つ選んで、その鳴き声を、ｽﾀｯｸﾁｬﾝらしく楽しく短く真似して。例: 「北海道だね。エゾシカがピーッて鳴くよ。」情報: {digest:place}"};
             const PrecacheItem digest_items[] = {
                 {"llm", "", "次の天気情報だけを元に、お出かけ中の人に向けて親しみやすく短く伝えて。情報にない事実は足さない。情報: {digest:weather}"},
                 {"llm", "", "次のお店の情報だけを元に、近くのおすすめとして親しみやすく短く紹介して。味や営業時間など情報にない事実は足さない。情報: {digest:gourmet}"},
@@ -5596,6 +5873,29 @@ void setup() {
             }
             while (next_digest < digest_count) precache_items[out++] = digest_items[next_digest++];
             precache_items_count = out;
+        }
+        // Shuffle the order on every boot. A riddle_q stays glued to the riddle_a right after it.
+        {
+            static PrecacheItem shuffled[PRECACHE_ITEMS_MAX];
+            uint8_t unit_start[PRECACHE_ITEMS_MAX];
+            int units = 0;
+            for (int i = 0; i < precache_items_count; i++) {
+                unit_start[units++] = i;
+                if (precache_items[i].type == "riddle_q" && i + 1 < precache_items_count
+                    && precache_items[i + 1].type == "riddle_a") i++;
+            }
+            for (int i = units - 1; i > 0; i--) {
+                const int j = random(0, i + 1);
+                const uint8_t t = unit_start[i]; unit_start[i] = unit_start[j]; unit_start[j] = t;
+            }
+            int out = 0;
+            for (int u = 0; u < units; u++) {
+                const int s = unit_start[u];
+                shuffled[out++] = precache_items[s];
+                if (precache_items[s].type == "riddle_q" && s + 1 < precache_items_count
+                    && precache_items[s + 1].type == "riddle_a") shuffled[out++] = precache_items[s + 1];
+            }
+            for (int i = 0; i < out; i++) precache_items[i] = shuffled[i];
         }
         Serial.printf("DEBUG: Precache items initialized: %d items\n", precache_items_count);
     }
@@ -5842,11 +6142,15 @@ void loop() {
     }
 
     http_beat_tick();
+    slide_apply_tick();
     periodic_tick();
     head_track_tick();
     servo_idle_tick();
     uint32_t now = millis();
-    if (!led_effect_active && time_reached(now, head_touch_next_poll_ms)) {
+    // The head sensor is normally skipped while an LED effect runs. Slide mode keeps polling, connected or not, so a held
+    // slide LED never leaves the head dead; the LED I2C writes and sensor reads are serialised by io_mutex.
+    const bool slide_poll = slide_mode_enabled;
+    if ((!led_effect_active || slide_poll) && time_reached(now, head_touch_next_poll_ms)) {
         head_touch_next_poll_ms = now + 50;
         { HeadGesture g = head_pat_detected(); if (g != GESTURE_NONE) head_pat_reaction(g); }
     }

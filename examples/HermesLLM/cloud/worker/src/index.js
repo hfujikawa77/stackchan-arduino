@@ -1,13 +1,13 @@
 import {
   addDays, compareSnowflake, constantTimeEqual, discordPayload, formatGourmet, formatSleep, formatSteps,
-  formatTrivia, formatWeather, haversineM, isSnowflake, jstDate, parsePlace, pickRandom, toInboxItem, toNumber,
+  formatSearch, formatTrivia, formatWeather, haversineM, isSnowflake, jstDate, parseNewsRss, parsePlace, pickRandom, toInboxItem, toNumber,
   trimExtract, validLatLon,
 } from "./lib.js";
 import { fetchSleepRecord, fetchStepsRecord, getAccessToken } from "./google_health.js";
 import { botConfigured, fetchChannelMessages, postBotMessage, postWebhookMessage } from "./discord.js";
 
 const UA = "stackchan-digest/1.0 (personal hobby project)";
-const CATEGORIES = ["weather", "gourmet", "trivia", "sleep", "steps"];
+const CATEGORIES = ["weather", "gourmet", "trivia", "place", "sleep", "steps"];
 
 // A cached value is reused until it is older than TTL or the phone moved farther than MOVE_M from where it was computed.
 const MOVE_M = { place: 300, weather: 3000, gourmet: 400, trivia: 400 };
@@ -146,6 +146,39 @@ async function digestTrivia(env, loc, now) {
   const text = formatTrivia(place, pickRandom(cache.pages));
   if (!text) throw new HttpError(404, "no_local_info");
   return { text, place, updated_at: cache.at };
+}
+
+// Place name plus the season there (flipped in the southern hemisphere), for region-flavoured small talk.
+async function digestPlace(env, loc, now) {
+  const place = await getPlace(env, loc, now);
+  if (!place) throw new HttpError(404, "no_place");
+  const month = new Date(now).getUTCMonth() + 1;
+  const north = ["冬", "冬", "春", "春", "春", "夏", "夏", "夏", "秋", "秋", "秋", "冬"][month - 1];
+  const flip = { 冬: "夏", 夏: "冬", 春: "秋", 秋: "春" };
+  const season = loc.lat >= 0 ? north : flip[north];
+  return { text: `いまいる場所は${place}。いまの季節は${season}。`, place, updated_at: now };
+}
+
+// Free keyless "web search": recent Google News headlines plus the best-matching Japanese Wikipedia intro.
+// Each source fails on its own; an empty text means nothing was found.
+async function getSearch(url, env) {
+  const q = (url.searchParams.get("q") ?? "").trim().slice(0, 80);
+  if (!q) throw new HttpError(400, "q_required");
+  const [news, wiki] = await Promise.all([
+    fetch(`https://news.google.com/rss/search?q=${encodeURIComponent(q)}&hl=ja&gl=JP&ceid=JP:ja`, {
+      headers: { "user-agent": UA }, signal: AbortSignal.timeout(8000),
+    }).then((r) => (r.ok ? r.text() : "")).then((x) => parseNewsRss(x, 5)).catch(() => []),
+    (async () => {
+      const base = "https://ja.wikipedia.org/w/api.php?action=query&format=json&formatversion=2";
+      const s = await getJson(`${base}&list=search&srlimit=1&srsearch=${encodeURIComponent(q)}`);
+      const id = s.query?.search?.[0]?.pageid;
+      if (!id) return null;
+      const e = await getJson(`${base}&prop=extracts&exintro=1&explaintext=1&exchars=400&pageids=${id}`);
+      const p = e.query?.pages?.[0];
+      return p?.extract ? { title: p.title, extract: p.extract } : null;
+    })().catch(() => null),
+  ]);
+  return json({ ok: true, q, text: formatSearch(news, wiki) });
 }
 
 async function digestSleep(env, now) {
@@ -350,8 +383,17 @@ async function getDigest(category, env, now) {
   if (category === "steps") return json({ ok: true, category, ...(await digestSteps(env, now)) });
   const loc = await readKV(env, "loc");
   if (!loc) throw new HttpError(409, "no_location");
-  const handler = { weather: digestWeather, gourmet: digestGourmet, trivia: digestTrivia }[category];
-  return json({ ok: true, category, ...(await handler(env, loc, now)) });
+  const handler = { weather: digestWeather, gourmet: digestGourmet, trivia: digestTrivia, place: digestPlace }[category];
+  return json({ ok: true, category, away: isAway(env, loc), ...(await handler(env, loc, now)) });
+}
+
+// True when the phone is farther than AWAY_KM (default 30) from HOME_LAT/HOME_LON. Without a home it is never away.
+function isAway(env, loc) {
+  const lat = toNumber(env.HOME_LAT);
+  const lon = toNumber(env.HOME_LON);
+  if (!validLatLon(lat, lon)) return false;
+  const km = toNumber(env.AWAY_KM);
+  return haversineM(lat, lon, loc.lat, loc.lon) > (km > 0 ? km : 30) * 1000;
 }
 
 export default {
@@ -371,6 +413,7 @@ export default {
         const loc = await readKV(env, "loc");
         return loc ? json({ ok: true, ...loc }) : fail(404, "no_location");
       }
+      if (path === "/search" && request.method === "GET") return await getSearch(url, env);
       if (path === "/sleep" && request.method === "POST") return await postSleep(request, env, now);
       if (path === "/log" && request.method === "POST") return await postLog(request, env);
       if (path === "/inbox" && request.method === "GET") return await getInbox(env, now);
