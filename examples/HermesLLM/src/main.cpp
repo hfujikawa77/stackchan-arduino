@@ -124,6 +124,7 @@ static uint32_t slide_step_next_ms = 0;
 static bool slide_greeting_request = false;  // double tap in slide mode: intro.wav, then outro.wav on the next one
 static bool slide_greeting_outro = false;
 static String slide_pending_led;  // JSON spec for led_apply_spec(); empty = leave the LED alone
+static String slide_pending_expr;   // "neutral|happy|sad|angry|doubt|sleepy"; empty = the per-index cycle below
 static String slide_pending_motion;  // "nod" (default) | "shake" | "spin" | "none"
 static uint32_t slide_bubble_clear_ms = 0;
 static uint32_t startup_stable_until_ms = 0;
@@ -2145,6 +2146,7 @@ static void slide_ws_handle(const char* json) {
     slide_pending_v = v;
     slide_pending_title = title;
     slide_pending_motion = doc["motion"] | "nod";
+    slide_pending_expr = doc["expression"] | "";
     slide_pending_led = "";
     if (doc["led"].is<JsonObject>()) serializeJson(doc["led"], slide_pending_led);
     slide_pending = true;
@@ -2307,7 +2309,13 @@ static void slide_apply_tick() {
         Expression::Neutral, Expression::Happy, Expression::Doubt,
         Expression::Sad, Expression::Angry, Expression::Sleepy,
     };
-    const Expression e = table[(slide_applied_h < 0 ? 0 : slide_applied_h) % 6];
+    Expression e = table[(slide_applied_h < 0 ? 0 : slide_applied_h) % 6];
+    if (slide_pending_expr == "neutral") e = Expression::Neutral;
+    else if (slide_pending_expr == "happy") e = Expression::Happy;
+    else if (slide_pending_expr == "sad") e = Expression::Sad;
+    else if (slide_pending_expr == "angry") e = Expression::Angry;
+    else if (slide_pending_expr == "doubt") e = Expression::Doubt;
+    else if (slide_pending_expr == "sleepy") e = Expression::Sleepy;
     avatar.setExpression(e);
 
     // Acknowledge the slide: bubble with its number and one nod.
