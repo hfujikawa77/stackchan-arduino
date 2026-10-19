@@ -26,3 +26,10 @@ Expected file names:
 - `mav_mode_land.wav`
 
 If a file is missing, the firmware falls back to the existing TTS path.
+
+## Presentation greetings (slide mode)
+
+- `intro.wav` - played by the first double tap on the head
+- `outro.wav` - played by the next double tap (then back to `intro.wav`, alternating)
+
+Format: 16-bit PCM, mono, 24 kHz WAV. Only active while Slide mode is ON; otherwise a double tap behaves as before.

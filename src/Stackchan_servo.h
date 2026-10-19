@@ -92,6 +92,9 @@ class StackchanSERVO {
         void moveXY(servo_param_s servo_param_x, servo_param_s servo_param_y);
         void motion(Motion motion_no);
         void turnX(uint32_t speed, bool is_cw, uint32_t millis_for_move);
+        // Non-blocking spin: turnXBegin() starts the continuous rotation, turnXEnd() stops it and returns to positioning mode.
+        void turnXBegin(uint32_t speed, bool is_cw);
+        void turnXEnd();
         bool isMoving() { return _isMoving; }
         m5::PY32IOExpander_Class* getIOExpander() { return _ioexpander; }
 };

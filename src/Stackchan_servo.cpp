@@ -425,7 +425,7 @@ void StackchanSERVO::moveXY(servo_param_s servo_param_x, servo_param_s servo_par
 }
 
 // @uint32_t speed 0〜1000
-void StackchanSERVO::turnX(uint32_t speed, bool is_cw, uint32_t millis_for_move) {
+void StackchanSERVO::turnXBegin(uint32_t speed, bool is_cw) {
     if (!isSCSReady(_sc)) {
       return;
     }
@@ -439,10 +439,20 @@ void StackchanSERVO::turnX(uint32_t speed, bool is_cw, uint32_t millis_for_move)
     _sc.PWMMode(1, true); // 回転モード
     _isMoving = true;
     _sc.WritePWM(1, speed);
-    vTaskDelay(millis_for_move/portTICK_PERIOD_MS);
+}
+
+void StackchanSERVO::turnXEnd() {
+    if (!isSCSReady(_sc)) {
+      return;
+    }
     _isMoving = false;
-    _sc.PWMMode(1, false); // 位置決めモードへ戻す 
-  return;
+    _sc.PWMMode(1, false); // 位置決めモードへ戻す
+}
+
+void StackchanSERVO::turnX(uint32_t speed, bool is_cw, uint32_t millis_for_move) {
+    turnXBegin(speed, is_cw);
+    vTaskDelay(millis_for_move/portTICK_PERIOD_MS);
+    turnXEnd();
 }
 
 void StackchanSERVO::motion(Motion motion_number) {

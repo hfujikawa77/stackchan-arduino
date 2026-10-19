@@ -44,7 +44,7 @@ private:
 public:
     Si12T(uint8_t sens_type, uint8_t sens_level, m5::I2C_Class* i2c = &m5::In_I2C);
     void begin();
-    void read_touch_result();
+    bool read_touch_result();
     void parse_touch_result();
 
     uint8_t sens_type;

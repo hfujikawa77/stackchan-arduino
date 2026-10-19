@@ -67,8 +67,8 @@ void Si12T::enable_channel() {
     write_reg(SI12T_CAL_HOLD2_ADDR, 0x00);
 }
 
-void Si12T::read_touch_result() {
-    readRegister(SI12T_OUTPUT1_ADDR, &touch_result, 1);
+bool Si12T::read_touch_result() {
+    return readRegister(SI12T_OUTPUT1_ADDR, &touch_result, 1);
 }
 
 void Si12T::parse_touch_result() {
