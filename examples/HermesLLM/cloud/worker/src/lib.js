@@ -202,6 +202,44 @@ export function formatSteps(rec, today) {
   return bits.join("、");
 }
 
+// ---- Discord inbox helpers ----
+
+export const isSnowflake = (v) => typeof v === "string" && /^\d{1,20}$/.test(v);
+
+export function compareSnowflake(a, b) {
+  const x = BigInt(a);
+  const y = BigInt(b);
+  return x < y ? -1 : x > y ? 1 : 0;
+}
+
+export function snowflakeTs(id) {
+  return Number((BigInt(id) >> 22n) + 1420070400000n);
+}
+
+const squash = (s, max) => {
+  const t = (s ?? "").toString().replace(/\s+/g, " ").trim();
+  return t.length > max ? t.slice(0, max) : t;
+};
+
+// Reduces a Discord message to what the device needs. undefined = must be ignored: anyone but the one allowed
+// user, bots/webhooks, system messages, and empty text. reply_to is Discord's own referenced message (one level).
+export function toInboxItem(m, userId, maxLen = 300) {
+  if (!m || !isSnowflake(m.id) || !userId || m.author?.id !== userId) return undefined;
+  if (m.author.bot || m.webhook_id) return undefined;
+  if (m.type !== 0 && m.type !== 19) return undefined;
+  const text = squash(m.content, maxLen);
+  if (!text) return undefined;
+  const ref = m.referenced_message;
+  return {
+    id: m.id,
+    text,
+    ts: snowflakeTs(m.id),
+    ref: ref && isSnowflake(ref.id)
+      ? { id: ref.id, text: squash(ref.content, 500), bot: Boolean(ref.author?.bot || ref.webhook_id) }
+      : null,
+  };
+}
+
 // Discord webhook body for a spoken line. allowed_mentions.parse=[] makes "@everyone" in LLM text inert.
 export function discordPayload(text, max = 1900) {
   const t = (text ?? "").toString().trim();

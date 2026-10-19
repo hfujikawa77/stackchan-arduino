@@ -46,6 +46,7 @@ static void play_wav(uint8_t* wav_buf, int read_len);
 static bool ensure_wifi_connected(uint32_t timeout_ms = 15000);
 String url_encode(const String& text);
 static String call_hermes(const String& user_message);
+static String call_hermes_ex(const String& user_message, const String& system_prompt, int max_tokens);
 static String mavlink_notification_audio_path(const String& text);
 static const char B64_TABLE[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 static size_t base64_encode(uint8_t* out, const uint8_t* in, size_t in_len) {
@@ -117,6 +118,8 @@ struct PrecacheEntry {
     int wav_len = 0;
     String text;
     uint32_t created_ms = 0;
+    String facts;            // what the text was built from, kept so a Discord follow-up can be answered from facts
+    bool is_reply = false;   // an answer to a Discord reply: already posted there, so it is not logged again
 };
 struct PrecacheItem {
     String type;  // "fixed" or "llm"
@@ -127,6 +130,8 @@ static std::array<PrecacheEntry, PRECACHE_QUEUE_MAX> precache_queue;
 static uint8_t precache_queue_size = 0;
 static uint32_t precache_next_generate_ms = 0;
 static bool precache_on_pat_enabled = true;
+static int inbox_poll_sec = 30;  // SC_SecConfig.yaml inbox_poll_sec; 0 = no timer, look only when the queue has room
+static bool inbox_poll_and_queue();
 static float weather_lat = 35.681f;  // Tokyo by default; override with weather_lat/weather_lon in SC_SecConfig.yaml
 static float weather_lon = 139.767f;
 static String digest_url;    // Cloudflare Worker base URL ("{digest:CATEGORY}" facts); SC_SecConfig.yaml digest_url
@@ -986,7 +991,8 @@ static void precache_cleanup_files() {
 }
 
 // Caller owns the returned buffer and must heap_caps_free it.
-static bool precache_pop(uint8_t** out_wav, int* out_len, String* out_text) {
+static bool precache_pop(uint8_t** out_wav, int* out_len, String* out_text, String* out_facts = nullptr,
+                         bool* out_is_reply = nullptr) {
     if (precache_queue_size == 0) {
         Serial.println("Precache queue empty");
         return false;
@@ -994,6 +1000,8 @@ static bool precache_pop(uint8_t** out_wav, int* out_len, String* out_text) {
     *out_wav = precache_queue[0].wav;
     *out_len = precache_queue[0].wav_len;
     *out_text = precache_queue[0].text;
+    if (out_facts) *out_facts = precache_queue[0].facts;
+    if (out_is_reply) *out_is_reply = precache_queue[0].is_reply;
     Serial.printf("Precache pop: text=%s, queue_size=%d\n", precache_queue[0].text.c_str(), precache_queue_size);
     for (int i = 0; i < precache_queue_size - 1; i++) {
         precache_queue[i] = precache_queue[i + 1];
@@ -1001,10 +1009,12 @@ static bool precache_pop(uint8_t** out_wav, int* out_len, String* out_text) {
     precache_queue_size--;
     precache_queue[precache_queue_size].wav = nullptr;
     precache_queue[precache_queue_size].wav_len = 0;
+    precache_queue[precache_queue_size].facts = "";
+    precache_queue[precache_queue_size].is_reply = false;
     return true;
 }
 
-static bool precache_push(uint8_t* wav, int wav_len, const String& text) {
+static bool precache_push(uint8_t* wav, int wav_len, const String& text, const String& facts = "") {
     if (precache_queue_size >= PRECACHE_QUEUE_MAX) {
         M5_LOGI("Precache queue full");
         return false;
@@ -1013,9 +1023,35 @@ static bool precache_push(uint8_t* wav, int wav_len, const String& text) {
     precache_queue[precache_queue_size].wav_len = wav_len;
     precache_queue[precache_queue_size].text = text;
     precache_queue[precache_queue_size].created_ms = millis();
+    precache_queue[precache_queue_size].facts = facts;
+    precache_queue[precache_queue_size].is_reply = false;
     precache_queue_size++;
     M5_LOGI("Precache push: %s (queue size: %d)", text.c_str(), precache_queue_size);
     return true;
+}
+
+// An answer to a Discord reply goes first, so the very next pat speaks it. A full queue loses its last entry.
+static void precache_push_front_reply(uint8_t* wav, int wav_len, const String& text, const String& facts) {
+    if (precache_queue_size >= PRECACHE_QUEUE_MAX) {
+        PrecacheEntry& tail = precache_queue[precache_queue_size - 1];
+        if (tail.wav) heap_caps_free(tail.wav);
+        tail.wav = nullptr;
+        tail.wav_len = 0;
+        tail.text = "";
+        tail.facts = "";
+        tail.is_reply = false;
+        precache_queue_size--;
+        Serial.println("Precache queue full: dropped the last entry for a Discord reply");
+    }
+    for (int i = precache_queue_size; i > 0; i--) precache_queue[i] = precache_queue[i - 1];
+    precache_queue[0].wav = wav;
+    precache_queue[0].wav_len = wav_len;
+    precache_queue[0].text = text;
+    precache_queue[0].created_ms = millis();
+    precache_queue[0].facts = facts;
+    precache_queue[0].is_reply = true;
+    precache_queue_size++;
+    M5_LOGI("Precache push front (reply): %s (queue size: %d)", text.c_str(), precache_queue_size);
 }
 
 static const char* weather_code_text(int code) {
@@ -1084,16 +1120,13 @@ static String fetch_weather_summary() {
     return String(buf);
 }
 
-// Forwards a line the device just spoke to the Worker's POST /log (-> Discord). Best effort: failures are dropped.
-static void post_spoken_log(const String& text) {
-    if (digest_url.isEmpty() || digest_token.isEmpty() || text.isEmpty()) return;
-    if (WiFi.status() != WL_CONNECTED) return;
-    JsonDocument doc;
-    doc["text"] = text;
-    String body;
-    serializeJson(doc, body);
-
-    const String url = digest_url + "/log";
+// One call to the Cloudflare Worker. Returns the HTTP status (-1 when not configured or Wi-Fi is down, without
+// trying to reconnect); the response body goes to *out when given.
+__attribute__((noinline)) static int digest_request(bool post, const String& path, const String& body, String* out,
+                                                    uint32_t timeout_ms = 10000) {
+    if (digest_url.isEmpty() || digest_token.isEmpty()) return -1;
+    if (WiFi.status() != WL_CONNECTED) return -1;
+    const String url = digest_url + path;
     HTTPClient http;
     WiFiClientSecure secure_client;
     WiFiClient plain_client;
@@ -1103,12 +1136,26 @@ static void post_spoken_log(const String& text) {
     } else {
         http.begin(plain_client, url);
     }
-    http.setTimeout(4000);
+    http.setTimeout(timeout_ms);
     http.addHeader("Authorization", "Bearer " + digest_token);
-    http.addHeader("Content-Type", "application/json");
-    int st = http.POST(body);
-    if (st != 200) Serial.printf("LOG post http=%d\n", st);
+    if (post) http.addHeader("Content-Type", "application/json");
+    int st = post ? http.POST(body) : http.GET();
+    if (out && st > 0) *out = http.getString();
     http.end();
+    return st;
+}
+
+// Forwards a line the device just spoke, with the facts it was built from, to the Worker's POST /log (-> Discord).
+// Best effort: failures are dropped.
+static void post_spoken_log(const String& text, const String& facts = "") {
+    if (text.isEmpty()) return;
+    JsonDocument doc;
+    doc["text"] = text;
+    if (!facts.isEmpty()) doc["facts"] = facts.substring(0, 600);
+    String body;
+    serializeJson(doc, body);
+    int st = digest_request(true, "/log", body, nullptr, 4000);
+    if (st != 200 && st != -1) Serial.printf("LOG post http=%d\n", st);
 }
 
 // Grounded facts for "{digest:CATEGORY}" (weather|gourmet|trivia|sleep) from the Cloudflare Worker, based on the
@@ -1119,28 +1166,14 @@ __attribute__((noinline)) static String fetch_digest(const String& category) {
     for (int i = 0; i < (int)category.length(); i++) if (category[i] < 'a' || category[i] > 'z') return "";
     if (!ensure_wifi_connected()) return "";
 
-    const String url = digest_url + "/digest/" + category;
-    HTTPClient http;
-    WiFiClientSecure secure_client;
-    WiFiClient plain_client;
-    if (url.startsWith("https://")) {
-        secure_client.setInsecure();
-        http.begin(secure_client, url);
-    } else {
-        http.begin(plain_client, url);
-    }
-    http.setTimeout(10000);
-    http.addHeader("Authorization", "Bearer " + digest_token);
-    int st = http.GET();
+    String resp;
+    int st = digest_request(false, "/digest/" + category, "", &resp);
     if (st != 200) {
         Serial.printf("DIGEST %s http=%d\n", category.c_str(), st);
-        http.end();
         return "";
     }
-    String body = http.getString();
-    http.end();
     JsonDocument doc;
-    if (deserializeJson(doc, body)) { Serial.println("DIGEST JSON parse error"); return ""; }
+    if (deserializeJson(doc, resp)) { Serial.println("DIGEST JSON parse error"); return ""; }
     String text = doc["text"] | "";
     Serial.printf("DIGEST %s %s\n", category.c_str(), text.c_str());
     return text;
@@ -1260,6 +1293,7 @@ static void precache_generate_next() {
         return;
     }
     precache_next_generate_ms = now + 3000;
+    if (inbox_poll_sec == 0 && inbox_poll_and_queue()) return;
     PrecacheIndicator indicator;
 
     Serial.printf("DEBUG precache_generate_next: index=%d, count=%d\n", precache_item_index, precache_items_count);
@@ -1269,6 +1303,11 @@ static void precache_generate_next() {
     precache_item_index = (precache_item_index + 1) % precache_items_count;
 
     String text;
+    String facts_used;  // joined values substituted for {weather}/{digest:}/{news}/{date}, logged with the speech
+    auto add_fact = [&](const String& f) {
+        if (!facts_used.isEmpty()) facts_used += "／";
+        facts_used += f;
+    };
     String new_riddle_answer;
     const bool is_riddle_q = (item.type == "riddle_q");
     if (is_riddle_q) riddle_pending_answer = "";
@@ -1295,6 +1334,7 @@ static void precache_generate_next() {
                 return;
             }
             topic.replace("{weather}", w);
+            add_fact(w);
         }
         for (int guard = 0; guard < 4; guard++) {
             int dg_pos = topic.indexOf("{digest:");
@@ -1307,6 +1347,7 @@ static void precache_generate_next() {
                 return;
             }
             topic = topic.substring(0, dg_pos) + facts + topic.substring(dg_end + 1);
+            add_fact(facts);
         }
         for (int guard = 0; guard < 4; guard++) {
             int pick_pos = topic.indexOf("{pick:");
@@ -1336,6 +1377,7 @@ static void precache_generate_next() {
                     return;
                 }
                 topic = topic.substring(0, news_pos) + h + topic.substring(news_end + 1);
+                add_fact(h);
             }
         }
         if (topic.indexOf("{date}") >= 0) {
@@ -1346,6 +1388,7 @@ static void precache_generate_next() {
             }
             Serial.printf("DATE %s\n", d.c_str());
             topic.replace("{date}", d);
+            add_fact(d);
         }
         String prompt;
         if (is_riddle_q) {
@@ -1399,7 +1442,7 @@ static void precache_generate_next() {
 
     if (tts_ok) {
         Serial.printf("DEBUG: Pushing to queue: %s\n", text.c_str());
-        if (!precache_push(wav, wav_len, text)) {
+        if (!precache_push(wav, wav_len, text, facts_used)) {
             heap_caps_free(wav);
             return;
         }
@@ -1413,6 +1456,119 @@ static void precache_generate_next() {
     } else {
         Serial.println("DEBUG: TTS generation failed");
     }
+}
+
+// ---- Discord replies: poll the Worker's inbox, answer with the LLM, queue the answer ahead of everything else ----
+
+static uint32_t inbox_next_poll_ms = 0;
+static String inbox_fail_id;
+static int inbox_fail_count = 0;
+
+static bool llm_reply_failed(const String& t) {
+    return t.isEmpty() || t.startsWith("Error:") || t == "Parse error" || t == "No content"
+           || t == "Hermes not configured." || t == "WiFi reconnect failed.";
+}
+
+static String build_inbox_prompt(const String& text, JsonObject reply_to) {
+    const String quoted = "「" + text + "」";
+    if (reply_to.isNull()) {
+        return "ユーザーがDiscordでこう話しかけました: " + quoted +
+               "\nｽﾀｯｸﾁｬﾝとして、口語で2文・60文字以内で答えて。知らないことは「わからないよ」と言って。説明や記号は不要。";
+    }
+    const String said = reply_to["text"] | "";
+    const String facts = reply_to["facts"] | "";
+    String by = reply_to["by"] | "";
+    String prompt;
+    if (by == "stackchan") {
+        prompt = "あなたはさっき、こう話しました: 「" + said + "」\n";
+        if (!facts.isEmpty()) prompt += "その元になった情報: 「" + facts + "」\n";
+        prompt += "ユーザーがDiscordで、それに返信しました: " + quoted + "\n";
+    } else {
+        prompt = "ユーザーが、次のメッセージに返信しました。\n返信先: 「" + said + "」\n返信: " + quoted + "\n";
+    }
+    prompt += "返信に、ｽﾀｯｸﾁｬﾝとして答えて。使ってよいのは、話した内容と元の情報にあることだけ。ないことは「わからないよ」と言って。"
+              "口語で2文・60文字以内。説明や記号は不要。";
+    return prompt;
+}
+
+// Handles at most one inbox item. True when an answer was queued (a scheduled item can then be skipped).
+static bool inbox_poll_and_queue() {
+    if (digest_url.isEmpty() || digest_token.isEmpty()) return false;
+    const uint32_t t0 = millis();
+    String resp;
+    int st = digest_request(false, "/inbox", "", &resp, 8000);
+    if (st == -1) return false;  // not configured or Wi-Fi down: stay silent
+    const uint32_t poll_ms = millis() - t0;
+    if (st != 200) {
+        Serial.printf("INBOX http=%d (%lums)\n", st, (unsigned long)poll_ms);
+        // 503 = the Worker has no Discord bot yet: ask again much later instead of every poll
+        if (st == 503) inbox_next_poll_ms = millis() + 10UL * 60000UL;
+        return false;
+    }
+    JsonDocument doc;
+    if (deserializeJson(doc, resp)) { Serial.println("INBOX JSON parse error"); return false; }
+    JsonArray items = doc["items"].as<JsonArray>();
+    Serial.printf("INBOX poll %lums items=%d heap=%u min=%u\n", (unsigned long)poll_ms,
+                  items.isNull() ? 0 : (int)items.size(), (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMinFreeHeap());
+    if (items.isNull() || items.size() == 0) return false;
+
+    JsonObject it = items[0];
+    const String id = it["id"] | "";
+    const String text = it["text"] | "";
+    if (id.isEmpty() || text.isEmpty()) return false;
+    JsonObject reply_to = it["reply_to"].as<JsonObject>();
+    const String facts = reply_to.isNull() ? String("") : String(reply_to["facts"] | "");
+    Serial.printf("INBOX item %s: %s\n", id.c_str(), text.c_str());
+
+    PrecacheIndicator indicator;
+    static const String kSystem =
+        "あなたはｽﾀｯｸﾁｬﾝ、小さなおしゃべりロボット。口語の日本語で、2文・60文字以内で答える。わからないことはわからないと言う。";
+    String answer = call_hermes_ex(build_inbox_prompt(text, reply_to), kSystem, 160);
+    answer.trim();
+    uint8_t* wav = nullptr;
+    int wav_len = 0;
+    const String spoken = String("お返事だよ。") + answer;
+    bool ok = !llm_reply_failed(answer) && call_tts_fetch_wav(spoken, &wav, &wav_len);
+    if (!ok) {
+        if (wav) heap_caps_free(wav);
+        if (inbox_fail_id != id) { inbox_fail_id = id; inbox_fail_count = 0; }
+        inbox_fail_count++;
+        Serial.printf("INBOX answer failed (%d/3): %s\n", inbox_fail_count, answer.c_str());
+        if (inbox_fail_count < 3) return false;  // the cursor stays, so the next poll retries it
+        Serial.println("INBOX giving up on this message");
+    } else {
+        precache_push_front_reply(wav, wav_len, spoken, facts);
+    }
+
+    JsonDocument ack;
+    ack["id"] = id;
+    String ack_body;
+    serializeJson(ack, ack_body);
+    int ack_st = digest_request(true, "/inbox/ack", ack_body, nullptr, 4000);
+    if (ack_st != 200) Serial.printf("INBOX ack http=%d\n", ack_st);
+
+    if (ok) {
+        JsonDocument rep;
+        rep["to"] = id;
+        rep["text"] = answer;
+        if (!facts.isEmpty()) rep["facts"] = facts;
+        String rep_body;
+        serializeJson(rep, rep_body);
+        int rep_st = digest_request(true, "/reply", rep_body, nullptr, 6000);
+        if (rep_st != 200) Serial.printf("INBOX reply http=%d\n", rep_st);
+        Serial.printf("INBOX answered in %lums total\n", (unsigned long)(millis() - t0));
+    }
+    return ok;
+}
+
+// Called every loop. Skips while busy or just after a pat so the poll never lands on top of an interaction.
+static void inbox_tick() {
+    if (inbox_poll_sec <= 0 || !precache_on_pat_enabled || busy || app_mode != MODE_NORMAL) return;
+    const uint32_t now = millis();
+    if (!time_reached(now, inbox_next_poll_ms)) return;
+    if (!time_reached(now, head_pat_cooldown_until_ms + 5000)) return;
+    inbox_next_poll_ms = now + (uint32_t)inbox_poll_sec * 1000UL;
+    inbox_poll_and_queue();
 }
 
 static HeadGesture head_pat_detected() {
@@ -1467,7 +1623,9 @@ static void head_pat_reaction(HeadGesture gesture) {
             uint8_t* voice_wav = nullptr;
             int voice_len = 0;
             String voice_text;
-            if (precache_pop(&voice_wav, &voice_len, &voice_text)) {
+            String voice_facts;
+            bool voice_is_reply = false;
+            if (precache_pop(&voice_wav, &voice_len, &voice_text, &voice_facts, &voice_is_reply)) {
                 const bool led_taken = (led_mode == LED_OFF);
                 if (led_taken) led_set(LED_SPEAKING);
                 speech_scroll_start(voice_text);
@@ -1476,7 +1634,7 @@ static void head_pat_reaction(HeadGesture gesture) {
                 show("");
                 if (led_taken && led_mode == LED_SPEAKING) led_set(LED_OFF);
                 heap_caps_free(voice_wav);
-                post_spoken_log(voice_text);
+                if (!voice_is_reply) post_spoken_log(voice_text, voice_facts);
             } else {
                 Serial.println("No voice file available");
             }
@@ -2013,6 +2171,11 @@ void load_hermes_config(fs::FS& fs) {
     digest_token = extractStr("digest_token");
     while (digest_url.endsWith("/")) digest_url.remove(digest_url.length() - 1);
     if (!digest_url.isEmpty()) M5_LOGI("Digest endpoint: %s", digest_url.c_str());
+    inbox_poll_sec = extractInt("inbox_poll_sec", inbox_poll_sec);
+    if (inbox_poll_sec < 0) inbox_poll_sec = 0;
+    if (inbox_poll_sec > 0 && inbox_poll_sec < 10) inbox_poll_sec = 10;
+    if (inbox_poll_sec > 600) inbox_poll_sec = 600;
+    inbox_next_poll_ms = millis() + 20000;  // let Wi-Fi and the first precache settle after boot
     {
         String lat = extractStr("weather_lat");
         String lon = extractStr("weather_lon");
@@ -2067,6 +2230,10 @@ String url_encode(const String& text) {
 }
 
 String call_hermes(const String& user_message) {
+    return call_hermes_ex(user_message, hermes_system, hermes_max_tokens);
+}
+
+static String call_hermes_ex(const String& user_message, const String& system_prompt, int max_tokens) {
     if (hermes_endpoint.isEmpty()) return "Hermes not configured.";
     if (!ensure_wifi_connected()) return "WiFi reconnect failed.";
 
@@ -2088,13 +2255,13 @@ String call_hermes(const String& user_message) {
     JsonDocument doc;
     doc["model"] = hermes_model;
     JsonArray messages = doc["messages"].to<JsonArray>();
-    if (!hermes_system.isEmpty()) {
+    if (!system_prompt.isEmpty()) {
         JsonObject sys = messages.add<JsonObject>();
-        sys["role"] = "system"; sys["content"] = hermes_system;
+        sys["role"] = "system"; sys["content"] = system_prompt;
     }
     JsonObject msg = messages.add<JsonObject>();
     msg["role"] = "user"; msg["content"] = user_message;
-    doc["max_tokens"] = hermes_max_tokens; doc["stream"] = false;
+    doc["max_tokens"] = max_tokens; doc["stream"] = false;
 
     String body; serializeJson(doc, body);
     int status = http.POST(body);
@@ -5504,6 +5671,7 @@ void loop() {
     current_touch_detail = M5.Touch.getDetail();
     mavlink_notification_tick();
     precache_generate_next();
+    inbox_tick();
 
     if (M5.BtnPWR.wasHold()) {
         bpm_stop_audio();

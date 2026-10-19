@@ -94,3 +94,44 @@ Fitbit の同期が遅れた日のための再実行で、同じ記録を上書�
 - 端末側のTLSは他のAPI呼び出しと同様に証明書検証なし（`setInsecure()`）です。トークンの扱いに注意してください。
 - KV無料枠は書き込み1000回/日。キャッシュ更新のみ書き込むので通常は余裕があります。
 - ホットペッパーグルメAPIの提供状況は公式（webservice.recruit.co.jp）で確認してください。
+
+## Discord 連携
+
+### 発話のログ（一方向）
+撫での発話を、再生後に `POST /log` で Discord へ送る。Webhook URL は Worker のシークレット `DISCORD_WEBHOOK_URL`。
+`{"text":"…","facts":"…"}`。`facts` は発話の元にした情報で、`msg:<DiscordのメッセージID>` として3日間 KV に保存し、追い質問への回答に使う。
+
+### 返信への回答（双方向）
+Discord で返信（または普通に投稿）すると、ｽﾀｯｸﾁｬﾝが答えを作り、次の撫でで話す。
+
+| メソッド/パス | 内容 |
+|---|---|
+| `GET /inbox` | 前回の確認応答以降の、許可ユーザーの投稿を1件（古い順）。Discord API は取得時にだけ呼ぶ（8秒キャッシュ）。初回は現在の最新を起点にして、過去ログは読まない |
+| `POST /inbox/ack` | `{"id":"…"}` 処理済みにする（カーソルは後ろへ戻らない） |
+| `POST /reply` | `{"to":"<返信先ID>","text":"…","facts":"…"}` Bot が Discord の「返信」として投稿 |
+
+`GET /inbox` の応答:
+```json
+{"ok":true,"items":[{"id":"…","text":"どこにあるの？","ts":1791430000000,
+  "reply_to":{"id":"…","text":"ｽﾀｯｸﾁｬﾝが話した文","facts":"元の情報","by":"stackchan"}}]}
+```
+`reply_to` は返信でない投稿では `null`。`by` は `stackchan`（発話を保存済み）/ `bot` / `other`。
+
+### Bot の準備（一度だけ）
+1. https://discord.com/developers/applications で New Application → Bot を作成
+2. Bot の設定で **MESSAGE CONTENT INTENT** を有効にする
+3. OAuth2 → URL Generator で `bot` を選び、権限は「メッセージを見る」「メッセージ履歴を読む」「メッセージを送信」。出てきた URL でサーバーに招待
+4. 対象チャンネル（Webhook を作ったのと同じ）で Bot が見えて書けることを確認
+5. ユーザーID・チャンネルIDは、Discord の設定 → 詳細設定 → 開発者モード をオンにして、右クリック →「IDをコピー」
+6. シークレットを登録（値はチャットに貼らない）:
+```powershell
+npx wrangler secret put DISCORD_BOT_TOKEN
+npx wrangler secret put DISCORD_CHANNEL_ID
+npx wrangler secret put DISCORD_USER_ID      # 答える相手。この人以外の投稿は無視する
+```
+未設定の間、`/inbox` `/inbox/ack` `/reply` は `503 inbox_not_configured`。端末はそれを見て10分間隔まで間引く。
+
+### 端末側の設定（SC_SecConfig.yaml）
+```yaml
+inbox_poll_sec: 30   # 待機中に inbox を見る間隔(秒)。0 にすると、撫でて補充が走るときだけ見る
+```

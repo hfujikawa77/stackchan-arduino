@@ -1,8 +1,10 @@
 import {
-  addDays, constantTimeEqual, discordPayload, formatGourmet, formatSleep, formatSteps, formatTrivia, formatWeather,
-  haversineM, jstDate, parsePlace, pickRandom, toNumber, trimExtract, validLatLon,
+  addDays, compareSnowflake, constantTimeEqual, discordPayload, formatGourmet, formatSleep, formatSteps,
+  formatTrivia, formatWeather, haversineM, isSnowflake, jstDate, parsePlace, pickRandom, toInboxItem, toNumber,
+  trimExtract, validLatLon,
 } from "./lib.js";
 import { fetchSleepRecord, fetchStepsRecord, getAccessToken } from "./google_health.js";
+import { botConfigured, fetchChannelMessages, postBotMessage, postWebhookMessage } from "./discord.js";
 
 const UA = "stackchan-digest/1.0 (personal hobby project)";
 const CATEGORIES = ["weather", "gourmet", "trivia", "sleep", "steps"];
@@ -234,23 +236,112 @@ async function collectHealth(env, now) {
   return status;
 }
 
+// What was said and the facts it was built from, so a later "どこにあるの？" can be answered from facts rather
+// than guessed from the short spoken line. Keyed by the Discord message id that replies will point at.
+const MSG_TTL_S = 3 * 24 * 3600;
+const saveMsg = (env, id, text, facts) =>
+  id
+    ? env.STATE.put(`msg:${id}`, JSON.stringify({ text, facts: (facts ?? "").toString().slice(0, 800) }), {
+        expirationTtl: MSG_TTL_S,
+      })
+    : undefined;
+
 // Forwards a line the device just spoke to Discord. The webhook URL stays a Worker secret, off the device.
 async function postLog(request, env) {
   if (!env.DISCORD_WEBHOOK_URL) throw new HttpError(503, "discord_not_configured");
   const body = await readBody(request);
   const payload = discordPayload(body.text);
   if (!payload) throw new HttpError(400, "text_required");
-  const res = await fetch(env.DISCORD_WEBHOOK_URL, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify(payload),
-    signal: AbortSignal.timeout(8000),
-  });
-  // Never echo Discord's response: it can carry the webhook id/token.
-  if (!res.ok) {
-    console.log("discord webhook responded", res.status);
+  let id;
+  try {
+    id = await postWebhookMessage(env, payload);
+  } catch (e) {
+    console.log(e.message);
     throw new HttpError(502, "discord_error");
   }
+  await saveMsg(env, id, payload.content, body.facts);
+  return json({ ok: true });
+}
+
+// ---- Discord -> device inbox. Reads the channel only when the device asks; nothing runs in the background. ----
+
+const MSG_CACHE_MS = 8000;
+const messageCaches = new WeakMap(); // per env, best effort within one isolate
+
+function requireBot(env) {
+  if (!botConfigured(env)) throw new HttpError(503, "inbox_not_configured");
+}
+
+async function getInbox(env, now) {
+  requireBot(env);
+  const cursor = await readKV(env, "inbox_cursor");
+  if (cursor == null) {
+    // First run: start from "now" so the channel's history is not read out loud.
+    const latest = await fetchChannelMessages(env, { limit: 1 }).catch(discordFail);
+    await writeKV(env, "inbox_cursor", latest[0]?.id ?? "0");
+    return json({ ok: true, items: [] });
+  }
+
+  let cache = messageCaches.get(env);
+  if (!cache || cache.cursor !== cursor || now - cache.at > MSG_CACHE_MS) {
+    cache = { cursor, at: now, messages: await fetchChannelMessages(env, { after: cursor }).catch(discordFail) };
+    messageCaches.set(env, cache);
+  }
+  let messages = cache.messages;
+  messages = [...messages].sort((a, b) => compareSnowflake(a.id, b.id));
+
+  const items = [];
+  let maxSeen = cursor;
+  for (const m of messages) {
+    if (isSnowflake(m.id) && compareSnowflake(m.id, maxSeen) > 0) maxSeen = m.id;
+    const item = toInboxItem(m, env.DISCORD_USER_ID);
+    if (item) items.push(item);
+  }
+  // Only other people's messages arrived: skip past them so they are not re-read every poll.
+  if (!items.length && maxSeen !== cursor) await writeKV(env, "inbox_cursor", maxSeen);
+
+  const out = [];
+  for (const it of items.slice(0, 1)) {
+    let reply_to = null;
+    if (it.ref) {
+      const known = await readKV(env, `msg:${it.ref.id}`);
+      reply_to = known
+        ? { id: it.ref.id, text: known.text, facts: known.facts, by: "stackchan" }
+        : { id: it.ref.id, text: it.ref.text, facts: "", by: it.ref.bot ? "bot" : "other" };
+    }
+    out.push({ id: it.id, text: it.text, ts: it.ts, reply_to });
+  }
+  return json({ ok: true, items: out });
+}
+
+const discordFail = (e) => {
+  console.log(e.message);
+  throw new HttpError(502, "discord_error");
+};
+
+// The device acknowledges only after it has handled an item, so a failure mid-way does not lose it.
+async function postInboxAck(request, env) {
+  requireBot(env);
+  const { id } = await readBody(request);
+  if (!isSnowflake(id)) throw new HttpError(400, "invalid_id");
+  const cursor = await readKV(env, "inbox_cursor");
+  if (cursor == null || compareSnowflake(id, cursor) > 0) await writeKV(env, "inbox_cursor", id);
+  return json({ ok: true });
+}
+
+// Posts the answer as a real Discord reply to the user's message, so the conversation chains.
+async function postReply(request, env) {
+  requireBot(env);
+  const body = await readBody(request);
+  const payload = discordPayload(body.text);
+  if (!payload) throw new HttpError(400, "text_required");
+  if (body.to != null && !isSnowflake(body.to)) throw new HttpError(400, "invalid_to");
+  const msg = await postBotMessage(env, {
+    ...payload,
+    allowed_mentions: { parse: [], replied_user: false },
+    ...(body.to ? { message_reference: { message_id: body.to, fail_if_not_exists: false } } : {}),
+  }).catch(discordFail);
+  await saveMsg(env, msg?.id, payload.content, body.facts);
   return json({ ok: true });
 }
 
@@ -282,6 +373,9 @@ export default {
       }
       if (path === "/sleep" && request.method === "POST") return await postSleep(request, env, now);
       if (path === "/log" && request.method === "POST") return await postLog(request, env);
+      if (path === "/inbox" && request.method === "GET") return await getInbox(env, now);
+      if (path === "/inbox/ack" && request.method === "POST") return await postInboxAck(request, env);
+      if (path === "/reply" && request.method === "POST") return await postReply(request, env);
       if (path === "/health/status" && request.method === "GET") {
         const st = await readKV(env, "health_status");
         return st ? json({ ok: true, ...st }) : fail(404, "no_status");
