@@ -9,7 +9,7 @@ Stack-chan（M5Stack CoreS3）を MAVLink 機体として振る舞わせ、Andro
 |---|---|---|
 | 1 | Wi-Fi UDP、HEARTBEAT 送信、GCS 検知、未対応コマンドへの ACK | **実機で確認済み**（QGC で機体として認識） |
 | 2 | IMU 姿勢（ATTITUDE 20Hz）と HUD 表示 | **実機で確認済み**（ロール・ピッチが HUD に追従） |
-| 3 | ARM / DISARM、HOLD / MANUAL 切替 | 未着手（現在は ACK で UNSUPPORTED を返す） |
+| 3 | ARM / DISARM、HOLD / MANUAL 切替 | **実機で確認済み**（probe 23 項目 PASS、GCS 切断時の自動 DISARM を確認。仕様は下記「Phase 3 の仕様」） |
 | 4 | Virtual Joystick、サーボ出力、フェイルセーフ | 未着手 |
 | 5 | Stack-chan の表情・音声との統合 | 未着手 |
 
@@ -34,6 +34,35 @@ Phase 2 で追加したもの:
 - 起動直後 2 秒間は機体を水平に置いて静止させる（その姿勢を 0 度とする）
 - 軸割り当ては実機の静止データから決定（`AttitudeEstimator.cpp` の `kAxisMap`）
 - ロールの出力符号は、HUD の表示と合うように反転している（内部の推定は変更なし）
+
+## Phase 3 の仕様（ARM / モード）
+
+状態は「モード（HOLD / MANUAL）」と「ARM 状態」の 2 つです。
+
+- 起動直後は **HOLD / DISARMED**。再起動で ARM 状態は引き継ぎません。
+- モード番号は ArduRover の custom_mode に合わせます（MANUAL = 0、HOLD = 4）。対応するのはこの 2 つだけです。
+  値は ArduPilot の Rover モード定義で要確認です。
+
+**ARM（MAV_CMD_COMPONENT_ARM_DISARM, param1 = 1）**
+- 許可する条件: GCS のリンクが生きていること（モードは HOLD でも MANUAL でも可）。
+- 条件を満たさない場合は `MAV_RESULT_DENIED`。強制 ARM（param2 = 21196）は未対応で、無視します。
+- サーボの初期化確認とフェイルセーフ判定は **Phase 4 で追加**します。Phase 3 はアクチュエータが無いため、この条件は省略しています。
+
+**DISARM（param1 = 0）**: いつでも許可します。
+
+**モード変更（MAV_CMD_DO_SET_MODE と MAVLink の SET_MODE）**
+- base_mode に CUSTOM_MODE フラグが必要です。
+- custom_mode が 0（MANUAL）と 4（HOLD）以外は `MAV_RESULT_DENIED`。
+- HOLD に切り替えても ARM 状態は変えません。サーボの中立化は Phase 4 で行います。
+
+**安全側の規則**
+- GCS のリンクが切れたら **自動で DISARM** します。再接続しても、自動では ARM しません。
+
+**HEARTBEAT への反映**
+- ARM 中は base_mode に SAFETY_ARMED を立て、system_status は ACTIVE にします。DISARM 中は STANDBY です。
+- custom_mode には現在のモードを入れます。
+
+**通知**: ARM・DISARM・モード変更は STATUSTEXT で QGC に通知します。
 
 ## ファイル構成
 

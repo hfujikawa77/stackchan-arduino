@@ -4,10 +4,6 @@
 
 namespace {
 
-// ArduRover の custom_mode。HOLD = 4。
-// 実機で QGC の表示と一致するかは未確認（ArduPilot の Rover モード定義で要再確認）。
-constexpr uint32_t kRoverModeHold = 4;
-
 // AUTOPILOT_VERSION の custom_version に入れる識別子（8 バイト固定）。
 constexpr char kCustomVersionTag[8] = {'M', 'A', 'V', 'S', 't', 'k', 0, 0};
 
@@ -52,6 +48,8 @@ void MavlinkVehicle::tick(uint32_t now_ms) {
 
     if (gcs_linked_ && (now_ms - gcs_last_ms_) > config_.gcs_timeout_ms) {
         gcs_linked_ = false;
+        // 安全側: GCS との通信が切れたら DISARM する（再接続しても自動では ARM しない）
+        setArmed(false, "GCS link lost: DISARMED");
     }
 }
 
@@ -117,6 +115,17 @@ void MavlinkVehicle::handleMessage(const mavlink_message_t& msg, uint32_t now_ms
             if (req.target_system != 0 && req.target_system != config_.system_id) return;
             for (size_t i = 0; i < kParamCount; ++i) {
                 sendParamValue(i);
+            }
+            return;
+        }
+
+        case MAVLINK_MSG_ID_SET_MODE: {
+            mavlink_set_mode_t sm;
+            mavlink_msg_set_mode_decode(&msg, &sm);
+            if (sm.target_system != 0 && sm.target_system != config_.system_id) return;
+            // SET_MODE には応答メッセージが無いため、結果は HEARTBEAT と STATUSTEXT で伝える
+            if (!requestMode(sm.base_mode, sm.custom_mode)) {
+                sendStatusText("MODE REJECTED (unsupported)");
             }
             return;
         }
@@ -196,6 +205,55 @@ void MavlinkVehicle::sendMissionAck(uint8_t target_sysid, uint8_t target_compid)
     transmit(msg);
 }
 
+void MavlinkVehicle::handleArmDisarm(const mavlink_message_t& msg, const mavlink_command_long_t& cmd) {
+    const float p1 = cmd.param1;
+    if (p1 != 0.0f && p1 != 1.0f) {  // 0 = DISARM, 1 = ARM のみ受け付ける
+        sendCommandAck(cmd.command, MAV_RESULT_DENIED, msg.sysid, msg.compid);
+        return;
+    }
+
+    if (p1 == 0.0f) {
+        setArmed(false, "DISARMED");
+        sendCommandAck(cmd.command, MAV_RESULT_ACCEPTED, msg.sysid, msg.compid);
+        return;
+    }
+
+    // ARM の条件: GCS のリンクが生きていること。
+    // サーボの初期化確認とフェイルセーフ判定は Phase 4 で追加する（Phase 3 はアクチュエータ無し）。
+    if (!gcs_linked_) {
+        sendCommandAck(cmd.command, MAV_RESULT_DENIED, msg.sysid, msg.compid);
+        return;
+    }
+    setArmed(true, "ARMED");
+    sendCommandAck(cmd.command, MAV_RESULT_ACCEPTED, msg.sysid, msg.compid);
+}
+
+bool MavlinkVehicle::requestMode(uint8_t base_mode, uint32_t custom_mode) {
+    if (!(base_mode & MAV_MODE_FLAG_CUSTOM_MODE_ENABLED)) return false;
+
+    if (custom_mode == static_cast<uint32_t>(VehicleMode::Manual)) {
+        setMode(VehicleMode::Manual);
+        return true;
+    }
+    if (custom_mode == static_cast<uint32_t>(VehicleMode::Hold)) {
+        setMode(VehicleMode::Hold);
+        return true;
+    }
+    return false;  // 対応していないモードは拒否する
+}
+
+void MavlinkVehicle::setArmed(bool armed, const char* reason) {
+    if (armed == armed_) return;
+    armed_ = armed;
+    sendStatusText(reason);
+}
+
+void MavlinkVehicle::setMode(VehicleMode mode) {
+    if (mode == mode_) return;
+    mode_ = mode;
+    sendStatusText(mode_ == VehicleMode::Manual ? "MODE MANUAL" : "MODE HOLD");
+}
+
 void MavlinkVehicle::sendParamValue(size_t index) {
     mavlink_param_value_t pv;
     memset(&pv, 0, sizeof(pv));
@@ -221,6 +279,18 @@ void MavlinkVehicle::handleCommandLong(const mavlink_message_t& msg, const mavli
             }
             return;
 
+        case MAV_CMD_COMPONENT_ARM_DISARM:
+            handleArmDisarm(msg, cmd);
+            return;
+
+        case MAV_CMD_DO_SET_MODE:
+            if (requestMode(static_cast<uint8_t>(cmd.param1), static_cast<uint32_t>(cmd.param2))) {
+                sendCommandAck(cmd.command, MAV_RESULT_ACCEPTED, msg.sysid, msg.compid);
+            } else {
+                sendCommandAck(cmd.command, MAV_RESULT_DENIED, msg.sysid, msg.compid);
+            }
+            return;
+
         case MAV_CMD_REQUEST_MESSAGE:
             if (static_cast<uint32_t>(cmd.param1) == MAVLINK_MSG_ID_AUTOPILOT_VERSION) {
                 sendAutopilotVersion();
@@ -232,7 +302,7 @@ void MavlinkVehicle::handleCommandLong(const mavlink_message_t& msg, const mavli
             return;
 
         default:
-            // ARM/DISARM・DO_SET_MODE・SET_MESSAGE_INTERVAL などは Phase 3 以降
+            // SET_MESSAGE_INTERVAL などは未対応（ストリーム設定は Phase 4 以降で検討）
             ++commands_unsupported_;
             sendCommandAck(cmd.command, MAV_RESULT_UNSUPPORTED, msg.sysid, msg.compid);
             return;
@@ -244,10 +314,11 @@ void MavlinkVehicle::sendHeartbeat() {
     memset(&hb, 0, sizeof(hb));
     hb.type = MAV_TYPE_GROUND_ROVER;
     hb.autopilot = MAV_AUTOPILOT_ARDUPILOTMEGA;
-    // CUSTOM_MODE フラグのみ。SAFETY_ARMED は立てない（起動直後・Phase 1 は常に DISARMED）
-    hb.base_mode = MAV_MODE_FLAG_CUSTOM_MODE_ENABLED;
-    hb.custom_mode = kRoverModeHold;
-    hb.system_status = MAV_STATE_STANDBY;
+    uint8_t base_mode = MAV_MODE_FLAG_CUSTOM_MODE_ENABLED;
+    if (armed_) base_mode |= MAV_MODE_FLAG_SAFETY_ARMED;
+    hb.base_mode = base_mode;
+    hb.custom_mode = static_cast<uint32_t>(mode_);
+    hb.system_status = armed_ ? MAV_STATE_ACTIVE : MAV_STATE_STANDBY;
 
     mavlink_message_t msg;
     mavlink_msg_heartbeat_encode(config_.system_id, config_.component_id, &msg, &hb);

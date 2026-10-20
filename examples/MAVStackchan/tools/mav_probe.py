@@ -12,6 +12,8 @@
 
 注意:
   - UDP 14550 を占有するため、同じ PC で QGroundControl を開いている場合は閉じてから実行する。
+  - 機体は直近に HEARTBEAT を送ってきた GCS へ返信する。スマホの QGC などほかの GCS が
+    接続中だと、応答が別の GCS に届いて probe が ACK を受け取れない。実行前に他の GCS を切断する。
   - 実行には pymavlink が必要（pip install pymavlink）。
 """
 
@@ -28,7 +30,11 @@ MAV_AUTOPILOT_ARDUPILOTMEGA = 3
 MAV_MODE_FLAG_SAFETY_ARMED = 128
 MAV_CMD_COMPONENT_ARM_DISARM = 400
 MAV_CMD_REQUEST_AUTOPILOT_CAPABILITIES = 520
+MAV_CMD_DO_SET_MODE = 176
+MODE_MANUAL = 0  # ArduRover custom_mode
+MODE_HOLD = 4
 MAV_RESULT_ACCEPTED = 0
+MAV_RESULT_DENIED = 2
 MAV_RESULT_UNSUPPORTED = 3
 MAV_MSG_ID_AUTOPILOT_VERSION = 148
 
@@ -61,6 +67,7 @@ class Probe:
         # (msg, source_addr) を受信順に溜める
         self.received = []
         self.results = []
+        self.last_hb = 0.0
 
     def check(self, name, ok, detail=""):
         self.results.append((name, ok, detail))
@@ -70,6 +77,10 @@ class Probe:
     def pump(self, seconds):
         deadline = time.time() + seconds
         while time.time() < deadline:
+            # GCS の HEARTBEAT を 1 秒ごとに送り続ける（途切れると機体は自動で DISARM する）
+            if time.time() - self.last_hb >= 1.0:
+                self.send_gcs_heartbeat()
+                self.last_hb = time.time()
             try:
                 data, addr = self.sock.recvfrom(1024)
             except socket.timeout:
@@ -77,10 +88,10 @@ class Probe:
             for msg in self.mav.parse_buffer(data) or []:
                 self.received.append((msg, addr))
 
-    def wait_for(self, predicate, seconds):
-        """受信済みメッセージと新着を走査し、条件に合うものを返す。"""
+    def wait_for(self, predicate, seconds, since=0):
+        """since 以降に受信したメッセージを走査し、条件に合うものを返す。"""
         deadline = time.time() + seconds
-        seen = 0
+        seen = since
         while time.time() < deadline:
             for msg, addr in self.received[seen:]:
                 if predicate(msg, addr):
@@ -105,6 +116,11 @@ def _text(msg):
 def _text_param(msg):
     name = msg.param_id
     return name.decode(errors="replace").rstrip("\x00") if isinstance(name, bytes) else str(name).rstrip("\x00")
+
+
+def latest_device_hb(probe):
+    hbs = [m for m, a in probe.received if is_device_heartbeat(m, a)]
+    return hbs[-1] if hbs else None
 
 
 def is_device_heartbeat(msg, addr):
@@ -175,16 +191,36 @@ def run(device_ip, port, timeout):
         probe.check("ATTITUDE values in range (rad)", finite,
                     f"roll={a.roll:.3f} pitch={a.pitch:.3f} yaw={a.yaw:.3f}")
 
-    # 4. ARM は Phase 1 では未実装 → UNSUPPORTED を返し、DISARMED のまま
-    probe.send_command(DEVICE_SYSID, MAV_CMD_COMPONENT_ARM_DISARM, 1)
-    ack, _ = probe.wait_for(is_ack(MAV_CMD_COMPONENT_ARM_DISARM), 3)
-    probe.check("ARM rejected as UNSUPPORTED (Phase 1)",
-                ack is not None and ack.result == MAV_RESULT_UNSUPPORTED,
-                "" if ack is None else f"result={ack.result}")
-    probe.pump(1.5)
-    latest = [m for m, a in probe.received if is_device_heartbeat(m, a)][-1:]
-    still_disarmed = bool(latest) and not (latest[0].base_mode & MAV_MODE_FLAG_SAFETY_ARMED)
-    probe.check("still DISARMED after ARM request", still_disarmed)
+    # 4. Phase 3: ARM / DISARM / モード変更（機体は HOLD / DISARMED に戻して終える）
+    def step(name, command, params, expect_result, check_hb=None):
+        start = len(probe.received)
+        if command == "mode":
+            probe.send_command(DEVICE_SYSID, MAV_CMD_DO_SET_MODE, *params)
+        else:
+            probe.send_command(DEVICE_SYSID, command, *params)
+        ack, _ = probe.wait_for(is_ack(MAV_CMD_DO_SET_MODE if command == "mode" else command), 3, since=start)
+        ok = ack is not None and ack.result == expect_result
+        probe.check(name + f" -> result {expect_result}", ok,
+                    "" if ack is None else f"result={ack.result}")
+        if check_hb is not None:
+            probe.pump(1.5)
+            hb = latest_device_hb(probe)
+            probe.check(name + " heartbeat state", hb is not None and check_hb(hb),
+                        "" if hb is None else f"base=0x{hb.base_mode:02x} custom={hb.custom_mode}")
+
+    step("ARM in HOLD", MAV_CMD_COMPONENT_ARM_DISARM, [1], MAV_RESULT_ACCEPTED,
+         lambda hb: bool(hb.base_mode & MAV_MODE_FLAG_SAFETY_ARMED))
+    step("DISARM", MAV_CMD_COMPONENT_ARM_DISARM, [0], MAV_RESULT_ACCEPTED,
+         lambda hb: not (hb.base_mode & MAV_MODE_FLAG_SAFETY_ARMED))
+    step("SET_MODE MANUAL", "mode", [1, MODE_MANUAL], MAV_RESULT_ACCEPTED,
+         lambda hb: hb.custom_mode == MODE_MANUAL)
+    step("ARM in MANUAL", MAV_CMD_COMPONENT_ARM_DISARM, [1], MAV_RESULT_ACCEPTED,
+         lambda hb: bool(hb.base_mode & MAV_MODE_FLAG_SAFETY_ARMED))
+    step("DISARM (from MANUAL)", MAV_CMD_COMPONENT_ARM_DISARM, [0], MAV_RESULT_ACCEPTED,
+         lambda hb: not (hb.base_mode & MAV_MODE_FLAG_SAFETY_ARMED))
+    step("SET_MODE unsupported (5)", "mode", [1, 5], MAV_RESULT_DENIED)
+    step("SET_MODE HOLD", "mode", [1, MODE_HOLD], MAV_RESULT_ACCEPTED,
+         lambda hb: hb.custom_mode == MODE_HOLD)
 
     # 5. 別機体宛ての COMMAND_LONG には応答しない
     before = len([m for m, _ in probe.received if m.get_type() == "COMMAND_ACK"])

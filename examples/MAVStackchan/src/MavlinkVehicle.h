@@ -18,8 +18,19 @@
 //     現状は SYSID_THISMAV（= System ID）の 1 件だけ。ArduPilot の全パラメータは偽装しない。
 //   - ミッション: MISSION_REQUEST_LIST には件数 0、MISSION_CLEAR_ALL には ACK を返す（対応ミッションは無し）。
 //
-// 未実装（Phase 3 以降）: ARM/DISARM、モード変更、MANUAL_CONTROL、サーボ出力、PARAM_SET。
+//   - ARM/DISARM（COMMAND_LONG 400）と、モード変更（DO_SET_MODE 176 / SET_MODE）。
+//     モードは HOLD(4) と MANUAL(0) のみ。仕様は README の「Phase 3 の仕様」を参照。
+//   - GCS のリンクが切れたら自動で DISARM する。
+//
+// 未実装（Phase 4 以降）: MANUAL_CONTROL、サーボ出力、PARAM_SET、強制 ARM。
 // 未実装の機能は ACK で拒否し、対応しているように見せないこと。
+
+// ArduRover の custom_mode 値（モードの対応は ArduPilot の Rover 定義で要確認）
+enum class VehicleMode : uint32_t {
+    Manual = 0,
+    Hold = 4,
+};
+
 class MavlinkVehicle {
 public:
     struct Config {
@@ -51,6 +62,8 @@ public:
     void tick(uint32_t now_ms);
 
     bool gcsLinked() const { return gcs_linked_; }
+    bool armed() const { return armed_; }
+    VehicleMode mode() const { return mode_; }
 
     // GCS の HEARTBEAT を受けたときに true を返し、フラグを消費する。
     // 呼び出し側は送信先アドレスの学習に使う。
@@ -69,6 +82,10 @@ private:
     void handleMessage(const mavlink_message_t& msg, uint32_t now_ms);
     void handleCommandLong(const mavlink_message_t& msg, const mavlink_command_long_t& cmd);
     void handleParamRequestRead(const mavlink_message_t& msg);
+    void handleArmDisarm(const mavlink_message_t& msg, const mavlink_command_long_t& cmd);
+    bool requestMode(uint8_t base_mode, uint32_t custom_mode);
+    void setArmed(bool armed, const char* reason);
+    void setMode(VehicleMode mode);
     void sendParamValue(size_t index);
     void sendMissionCount();
     void sendMissionAck(uint8_t target_sysid, uint8_t target_compid);
@@ -85,6 +102,9 @@ private:
 
     bool gcs_linked_ = false;
     bool gcs_heartbeat_pending_ = false;
+
+    VehicleMode mode_ = VehicleMode::Hold;  // 起動時は HOLD
+    bool armed_ = false;                    // 起動時は DISARMED（再起動で引き継がない）
     uint32_t gcs_last_ms_ = 0;
     uint32_t next_heartbeat_ms_ = 0;
 

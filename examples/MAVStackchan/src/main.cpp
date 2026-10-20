@@ -205,6 +205,8 @@ void drawStatus(uint32_t now_ms) {
         M5.Display.println("WiFi: connecting");
     }
     M5.Display.printf("QGC: %s\n", vehicle->gcsLinked() ? "LINKED" : "waiting");
+    M5.Display.printf("%s / %s\n", vehicle->armed() ? "ARMED" : "DISARMED",
+                      vehicle->mode() == VehicleMode::Manual ? "MANUAL" : "HOLD");
     M5.Display.printf("HB tx: %lu\n", static_cast<unsigned long>(vehicle->heartbeatsSent()));
     M5.Display.printf("ATT tx: %lu\n", static_cast<unsigned long>(vehicle->attitudesSent()));
     if (!imu_ready) {
