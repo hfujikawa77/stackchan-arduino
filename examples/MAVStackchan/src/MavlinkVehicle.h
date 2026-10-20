@@ -140,6 +140,11 @@ private:
     uint8_t level_requester_sysid_ = 0;
     uint8_t level_requester_compid_ = 0;
 
+    bool rc_received_ = false;
+    uint16_t rc_chan1_ = 0;
+    uint16_t rc_chan2_ = 0;
+    uint32_t rc_ms_ = 0;
+
     bool manual_received_ = false;
     int16_t manual_x_ = 0;
     int16_t manual_y_ = 0;

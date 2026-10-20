@@ -17,6 +17,16 @@ constexpr ParamEntry kParams[] = {
 };
 constexpr size_t kParamCount = sizeof(kParams) / sizeof(kParams[0]);
 
+// RC の PWM（1000〜2000 µs、中立 1500）を MANUAL_CONTROL と同じ -1000〜1000 に変換する。
+// 0 や UINT16_MAX は「未使用」なので中立（0）にする。
+int16_t rcToStick(uint16_t pwm) {
+    if (pwm == 0 || pwm == UINT16_MAX) return 0;
+    int value = (static_cast<int>(pwm) - 1500) * 2;
+    if (value < -1000) value = -1000;
+    if (value > 1000) value = 1000;
+    return static_cast<int16_t>(value);
+}
+
 // 受信パーサは 1 チャンネル分のみ使う（MavlinkVehicle は 1 インスタンス想定）。
 mavlink_status_t rx_status;
 
@@ -191,6 +201,18 @@ void MavlinkVehicle::handleMessage(const mavlink_message_t& msg, uint32_t now_ms
             return;
         }
 
+        case MAVLINK_MSG_ID_RC_CHANNELS_OVERRIDE: {
+            // MissionPlanner のジョイスティックはこのメッセージで送る（QGC は MANUAL_CONTROL）
+            mavlink_rc_channels_override_t rc;
+            mavlink_msg_rc_channels_override_decode(&msg, &rc);
+            if (rc.target_system != 0 && rc.target_system != config_.system_id) return;
+            rc_chan1_ = rc.chan1_raw;  // パン（RC1 = ロール）
+            rc_chan2_ = rc.chan2_raw;  // チルト（RC2 = ピッチ）。RC3 はスロットルのため使わない
+            rc_ms_ = now_ms;
+            rc_received_ = true;
+            return;
+        }
+
         case MAVLINK_MSG_ID_MANUAL_CONTROL: {
             mavlink_manual_control_t mc;
             mavlink_msg_manual_control_decode(&msg, &mc);
@@ -340,11 +362,22 @@ void MavlinkVehicle::finishLevelCalibration(bool ok) {
 
 MavlinkVehicle::ManualInput MavlinkVehicle::manualInput(uint32_t now_ms) const {
     ManualInput in;
-    if (!manual_received_ || !armed_ || mode_ != VehicleMode::Manual) return in;
-    if ((now_ms - manual_ms_) > config_.manual_timeout_ms) return in;  // 入力が途絶えた
+    if (!armed_ || mode_ != VehicleMode::Manual) return in;
+
+    const bool mc_fresh = manual_received_ && (now_ms - manual_ms_) <= config_.manual_timeout_ms;
+    const bool rc_fresh = rc_received_ && (now_ms - rc_ms_) <= config_.manual_timeout_ms;
+    if (!mc_fresh && !rc_fresh) return in;  // 入力が途絶えた
+
+    // 両方来ているときは新しい方を使う
+    if (rc_fresh && (!mc_fresh || rc_ms_ >= manual_ms_)) {
+        // RC_CHANNELS_OVERRIDE: PWM 1000〜2000 を -1000〜1000 に変換。未使用（0 / UINT16_MAX）は中立
+        in.x = rcToStick(rc_chan2_);  // RC2（ピッチ）→ チルト
+        in.y = rcToStick(rc_chan1_);  // RC1（ロール）→ パン
+    } else {
+        in.x = manual_x_;
+        in.y = manual_y_;
+    }
     in.active = true;
-    in.x = manual_x_;
-    in.y = manual_y_;
     return in;
 }
 
