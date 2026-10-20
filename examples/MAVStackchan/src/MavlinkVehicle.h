@@ -41,6 +41,7 @@ public:
         uint32_t attitude_interval_ms = 50;  // ATTITUDE 20Hz（指示書 6.2 の 10〜20Hz）
         uint32_t manual_timeout_ms = 500;    // バーチャルスティックの入力がこの間途絶えたら中立（指示書 5.4）
         uint32_t sys_status_interval_ms = 1000;  // SYS_STATUS 1Hz（指示書 6.2）
+        uint32_t position_interval_ms = 1000;    // GLOBAL_POSITION_INT 1Hz
     };
 
     // SYS_STATUS で送る機体の状態。計測できた値だけを入れる（不明は未設定にする）。
@@ -101,6 +102,10 @@ public:
 
     // SYS_STATUS（電池・センサ状態）の入力を更新する。
     void setSystemReport(const SystemReport& report) { system_ = report; }
+
+    // 位置（スマホの最後の位置。Worker 経由）。GLOBAL_POSITION_INT で送る。
+    // 機体の GPS ではない（方針として、便宜上の位置として扱う）。
+    void setPosition(double lat_deg, double lon_deg);
     void clearAttitude() { attitude_valid_ = false; }
 
     uint32_t heartbeatsSent() const { return heartbeats_sent_; }
@@ -124,6 +129,7 @@ private:
     void sendSysStatus();
     void sendRadioStatus();
     void sendBatteryStatus();
+    void sendGlobalPositionInt(uint32_t now_ms);
     void sendAutopilotVersion();
     void sendCommandAck(uint16_t command, uint8_t result, uint8_t target_sysid, uint8_t target_compid);
     void sendStatusText(const char* text);
@@ -161,6 +167,11 @@ private:
 
     SystemReport system_;
     uint32_t next_sys_status_ms_ = 0;
+
+    bool position_valid_ = false;
+    double position_lat_ = 0.0;
+    double position_lon_ = 0.0;
+    uint32_t next_position_ms_ = 0;
 
     uint32_t heartbeats_sent_ = 0;
     uint32_t attitudes_sent_ = 0;

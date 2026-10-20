@@ -56,6 +56,11 @@ void MavlinkVehicle::tick(uint32_t now_ms) {
         next_attitude_ms_ = now_ms + config_.attitude_interval_ms;
     }
 
+    if (position_valid_ && now_ms >= next_position_ms_) {
+        sendGlobalPositionInt(now_ms);
+        next_position_ms_ = now_ms + config_.position_interval_ms;
+    }
+
     if (now_ms >= next_sys_status_ms_) {
         sendSysStatus();
         if (system_.wifi_valid) sendRadioStatus();
@@ -112,6 +117,32 @@ void MavlinkVehicle::sendSysStatus() {
 
     mavlink_message_t msg;
     mavlink_msg_sys_status_encode(config_.system_id, config_.component_id, &msg, &st);
+    transmit(msg);
+}
+
+void MavlinkVehicle::setPosition(double lat_deg, double lon_deg) {
+    position_lat_ = lat_deg;
+    position_lon_ = lon_deg;
+    position_valid_ = true;
+}
+
+void MavlinkVehicle::sendGlobalPositionInt(uint32_t now_ms) {
+    mavlink_global_position_int_t gp;
+    memset(&gp, 0, sizeof(gp));
+    gp.time_boot_ms = now_ms;
+    gp.lat = static_cast<int32_t>(position_lat_ * 1e7);
+    gp.lon = static_cast<int32_t>(position_lon_ * 1e7);
+    // 高度: 気圧センサーは未接続のため、未計測として 0 を入れている（後で相対高度に置き換える）
+    gp.alt = 0;
+    gp.relative_alt = 0;
+    // 速度・方位は未計測のため 0 / 不明（UINT16_MAX）
+    gp.vx = 0;
+    gp.vy = 0;
+    gp.vz = 0;
+    gp.hdg = UINT16_MAX;
+
+    mavlink_message_t msg;
+    mavlink_msg_global_position_int_encode(config_.system_id, config_.component_id, &msg, &gp);
     transmit(msg);
 }
 

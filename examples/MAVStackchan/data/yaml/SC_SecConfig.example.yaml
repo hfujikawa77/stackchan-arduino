@@ -16,6 +16,11 @@ wifi_list:
   # - ssid: "backup-ssid"
   #   password: "backup-password"
 
+# 位置の取得先（Cloudflare Worker）。HermesLLM の SC_SecConfig.yaml と同じ値を書く。
+# 省略すると位置は送らない。
+digest_url: "https://stackchan-digest.<your-subdomain>.workers.dev"
+digest_token: "<SHARED_TOKEN>"
+
 # MAVLink 設定（省略時は system_id 1 / udp_port 14550）
 mav:
   system_id: 1

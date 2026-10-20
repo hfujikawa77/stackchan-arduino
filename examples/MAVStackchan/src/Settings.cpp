@@ -61,6 +61,13 @@ void parseSettingsYaml(const String& yaml, MavSettings& out) {
             splitKeyValue(text, key, value);
             section = key;
             entry = -1;
+            // トップレベルの値（HermesLLM と同じ書式）
+            if (key == "digest_url" && !value.isEmpty()) {
+                while (value.endsWith("/")) value.remove(value.length() - 1);
+                out.digest_url = value;
+            } else if (key == "digest_token" && !value.isEmpty()) {
+                out.digest_token = value;
+            }
             continue;
         }
 

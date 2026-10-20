@@ -19,6 +19,8 @@ struct MavSettings {
     size_t wifi_count = 0;     // wifi_list: の件数（先頭から順に接続を試す）
     uint8_t system_id = 1;     // mav: system_id（指示書 4.1 の既定値 1）
     uint16_t udp_port = 14550; // mav: udp_port（MAVLink 2 の標準 UDP ポート）
+    String digest_url;         // 位置の取得先（Cloudflare Worker）。HermesLLM と同じトップレベルのキー
+    String digest_token;       // Worker の Bearer トークン（SHARED_TOKEN）
 };
 
 // YAML 本文を解析して out に反映する。

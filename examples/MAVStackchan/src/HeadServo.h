@@ -14,6 +14,9 @@ public:
     bool begin();
     bool ready() const { return ready_; }
 
+    // 内蔵 LED の制御用（頭部サーボと同じ IO 拡張）。サーボ未使用なら nullptr。
+    m5::PY32IOExpander_Class* ioExpander() { return ready_ ? servo_.getIOExpander() : nullptr; }
+
     HeadLimits panLimits() const;
     HeadLimits tiltLimits() const;
 

@@ -11,10 +11,14 @@
 #include <WiFi.h>
 #include <WiFiUdp.h>
 
+#include <Avatar.h>
+
 #include "AttitudeEstimator.h"
+#include "FaceStatus.h"
 #include "HeadServo.h"
 #include "ManualControl.h"
 #include "MavlinkVehicle.h"
+#include "PhoneLocation.h"
 #include "Settings.h"
 #include "Stackchan_system_config.h"
 
@@ -25,7 +29,6 @@ namespace {
 
 constexpr char kSettingsPath[] = "/yaml/SC_SecConfig.yaml";
 constexpr uint32_t kWifiRetryMs = 5000;
-constexpr uint32_t kDisplayIntervalMs = 500;
 constexpr uint32_t kImuIntervalMs = 10;          // IMU 読み取り 100Hz
 constexpr uint32_t kCalibrationMs = 2000;        // 起動直後に機体を動かさない時間
 constexpr float kDegToRad = 0.0174532925f;
@@ -37,6 +40,11 @@ bool settings_loaded = false;
 
 HeadServo head_servo;
 bool head_ready = false;
+
+m5avatar::Avatar avatar;                    // 顔（表情・吹き出し）
+m5::PY32IOExpander_Class* led_io = nullptr;  // 内蔵 LED（頭部サーボと同じ IO 拡張）
+constexpr int kLedCount = 12;               // HermesLLM と同じ LED 数
+constexpr uint32_t kFaceIntervalMs = 200;
 
 AttitudeEstimator attitude;
 bool imu_ready = false;
@@ -54,7 +62,6 @@ bool peer_known = false;
 
 size_t wifi_index = 0;  // 次に試す wifi_list の番号（失敗ごとに循環）
 uint32_t next_wifi_try_ms = 0;
-uint32_t next_display_ms = 0;
 bool last_linked = false;
 
 // 送信先: QGC の送信元が分かっていればユニキャスト、なければサブネットのブロードキャスト
@@ -163,6 +170,18 @@ void updateHead(uint32_t now_ms) {
     head_servo.update(now_ms);
 }
 
+// スマホの最後の位置（Worker 経由）を機体の位置として渡す。取得は別タスクで行う。
+void updatePosition(uint32_t now_ms) {
+    static uint32_t next_ms = 0;
+    if (now_ms < next_ms) return;
+    next_ms = now_ms + 1000;
+
+    PhoneLocation loc;
+    if (latestPhoneLocation(loc) && loc.valid) {
+        vehicle->setPosition(loc.lat, loc.lon);
+    }
+}
+
 // 電池と IMU の状態を 1 秒ごとに SYS_STATUS 用に渡す（M5.Power の値。残量は推定値）。
 void updateSystemReport(uint32_t now_ms) {
     static uint32_t next_report_ms = 0;
@@ -247,44 +266,49 @@ void reportLinkChange() {
     if (!linked) peer_known = false;  // 切断後は次の GCS HEARTBEAT まで宛先を固定しない
 }
 
-void drawStatus(uint32_t now_ms) {
-    if (now_ms < next_display_ms) return;
-    next_display_ms = now_ms + kDisplayIntervalMs;
+// 機体の状態を、顔（表情・吹き出し）と LED に反映する。状態が変わったときだけ更新する。
+m5avatar::Expression toAvatarExpression(FaceExpression e) {
+    switch (e) {
+        case FaceExpression::Happy: return m5avatar::Expression::Happy;
+        case FaceExpression::Angry: return m5avatar::Expression::Angry;
+        case FaceExpression::Sad: return m5avatar::Expression::Sad;
+        case FaceExpression::Doubt: return m5avatar::Expression::Doubt;
+        case FaceExpression::Sleepy: return m5avatar::Expression::Sleepy;
+        case FaceExpression::Neutral:
+        default: return m5avatar::Expression::Neutral;
+    }
+}
 
-    M5.Display.fillScreen(TFT_BLACK);
-    M5.Display.setTextColor(TFT_WHITE, TFT_BLACK);
-    M5.Display.setTextSize(2);
-    M5.Display.setCursor(8, 8);
-    M5.Display.println("MAVStackchan");
+void setLeds(const LedColor& c) {
+    if (!led_io) return;
+    for (int i = 0; i < kLedCount; ++i) led_io->setLedColor(i, c.r, c.g, c.b);
+    led_io->refreshLeds();
+}
 
-    if (!settings_loaded) {
-        M5.Display.println("No settings");
-        M5.Display.println("uploadfs needed");
+void updateFace(uint32_t now_ms) {
+    static uint32_t next_ms = 0;
+    static bool has_last = false;
+    static FaceExpression last_expression = FaceExpression::Neutral;
+    static const char* last_speech = nullptr;
+    static LedColor last_led = {0, 0, 0};
+
+    if (now_ms < next_ms) return;
+    next_ms = now_ms + kFaceIntervalMs;
+
+    const StatusView v = statusViewFor(calibration_started, vehicle->gcsLinked(),
+                                       vehicle->armed(), vehicle->mode() == VehicleMode::Manual);
+    if (has_last && v.expression == last_expression && v.speech == last_speech
+        && v.led.r == last_led.r && v.led.g == last_led.g && v.led.b == last_led.b) {
         return;
     }
-    if (settings.wifi_count == 0) {
-        M5.Display.println("No wifi_list");
-        return;
-    }
-    if (WiFi.status() == WL_CONNECTED) {
-        M5.Display.printf("IP: %s\n", WiFi.localIP().toString().c_str());
-    } else {
-        M5.Display.println("WiFi: connecting");
-    }
-    M5.Display.printf("QGC: %s\n", vehicle->gcsLinked() ? "LINKED" : "waiting");
-    M5.Display.printf("%s / %s\n", vehicle->armed() ? "ARMED" : "DISARMED",
-                      vehicle->mode() == VehicleMode::Manual ? "MANUAL" : "HOLD");
-    M5.Display.printf("HB tx: %lu\n", static_cast<unsigned long>(vehicle->heartbeatsSent()));
-    M5.Display.printf("ATT tx: %lu\n", static_cast<unsigned long>(vehicle->attitudesSent()));
-    if (!imu_ready) {
-        M5.Display.println("IMU: not found");
-    } else if (attitude.calibrated()) {
-        const AttitudeEstimator::Sample s = attitude.sample();
-        M5.Display.printf("R:%.0f P:%.0f\n", s.roll * 57.2957795f, s.pitch * 57.2957795f);
-    } else {
-        M5.Display.println("IMU: calibrating");
-    }
-    M5.Display.printf("Unsupp: %lu\n", static_cast<unsigned long>(vehicle->commandsUnsupported()));
+    has_last = true;
+    last_expression = v.expression;
+    last_speech = v.speech;
+    last_led = v.led;
+
+    avatar.setExpression(toAvatarExpression(v.expression));
+    avatar.setSpeechText(settings_loaded ? v.speech : "設定なし");
+    setLeds(v.led);
 }
 
 }  // namespace
@@ -296,6 +320,7 @@ void setup() {
     Serial.println("[MAV] MAVStackchan Phase 1 boot");
 
     settings_loaded = loadSettings();
+    if (settings_loaded) startPhoneLocationTask(settings.digest_url, settings.digest_token);
 
     // 頭部サーボの設定（HermesLLM と同じ SC_BasicConfig.yaml）
     // 基本設定は約 3KB あるため、バッファを 8KB にする（既定の 2KB では解析中に落ちる）。
@@ -305,6 +330,15 @@ void setup() {
                              "/yaml/SC_BasicConfig.yaml", 8192);
     head_ready = head_servo.begin();
     Serial.printf("[MAV] head servo %s\n", head_ready ? "ready" : "not available");
+
+    // 顔と内蔵 LED（LED は頭部サーボの IO 拡張を使うので、サーボが無ければ消灯のまま）
+    avatar.init();
+    avatar.setSpeechFont(&fonts::efontJA_12);
+    led_io = head_servo.ioExpander();
+    if (led_io) {
+        led_io->setLedCount(kLedCount);
+        setLeds(LedColor{0, 0, 0});
+    }
 
     MavlinkVehicle::Config vehicle_cfg;
     vehicle_cfg.system_id = settings.system_id;
@@ -329,12 +363,13 @@ void loop() {
     ensureNetwork(now_ms);
     pumpNetwork(now_ms);
     updateSystemReport(now_ms);
+    updatePosition(now_ms);
     updateLevelCalibration(now_ms);
     updateImu(now_ms);
     updateHead(now_ms);
     vehicle->tick(now_ms);
     reportLinkChange();
-    drawStatus(now_ms);
+    updateFace(now_ms);
 
     delay(1);
 }
