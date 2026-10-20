@@ -163,6 +163,28 @@ void updateHead(uint32_t now_ms) {
     head_servo.update(now_ms);
 }
 
+// 電池と IMU の状態を 1 秒ごとに SYS_STATUS 用に渡す（M5.Power の値。残量は推定値）。
+void updateSystemReport(uint32_t now_ms) {
+    static uint32_t next_report_ms = 0;
+    if (now_ms < next_report_ms) return;
+    next_report_ms = now_ms + 1000;
+
+    MavlinkVehicle::SystemReport report;
+    report.imu_ok = imu_ready;
+    const int16_t mv = M5.Power.getBatteryVoltage();
+    const int32_t pct = M5.Power.getBatteryLevel();
+    report.battery_valid = mv > 0;
+    report.battery_mv = mv > 0 ? static_cast<uint16_t>(mv) : 0;
+    report.battery_pct = (pct >= 0 && pct <= 100) ? static_cast<int8_t>(pct) : -1;
+
+    report.wifi_valid = WiFi.status() == WL_CONNECTED;
+    if (report.wifi_valid) {
+        const int dbm = WiFi.RSSI();
+        report.wifi_rssi_dbm = static_cast<int8_t>(dbm < -128 ? -128 : (dbm > 127 ? 127 : dbm));
+    }
+    vehicle->setSystemReport(report);
+}
+
 // QGC からの水平キャリブレーション要求を受けて、kCalibrationMs の間の姿勢を基準にする。
 void updateLevelCalibration(uint32_t now_ms) {
     if (!vehicle->takeLevelCalibrationRequest()) return;
@@ -306,6 +328,7 @@ void loop() {
 
     ensureNetwork(now_ms);
     pumpNetwork(now_ms);
+    updateSystemReport(now_ms);
     updateLevelCalibration(now_ms);
     updateImu(now_ms);
     updateHead(now_ms);

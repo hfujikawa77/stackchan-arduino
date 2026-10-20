@@ -46,6 +46,14 @@ void MavlinkVehicle::tick(uint32_t now_ms) {
         next_attitude_ms_ = now_ms + config_.attitude_interval_ms;
     }
 
+    if (now_ms >= next_sys_status_ms_) {
+        sendSysStatus();
+        if (system_.wifi_valid) sendRadioStatus();
+        // QGC 4.0 以降は電池を BATTERY_STATUS から読むため、SYS_STATUS と併せて送る
+        if (system_.battery_valid) sendBatteryStatus();
+        next_sys_status_ms_ = now_ms + config_.sys_status_interval_ms;
+    }
+
     if (gcs_linked_ && (now_ms - gcs_last_ms_) > config_.gcs_timeout_ms) {
         gcs_linked_ = false;
         // 安全側: GCS との通信が切れたら DISARM する（再接続しても自動では ARM しない）
@@ -73,6 +81,70 @@ void MavlinkVehicle::sendAttitude(uint32_t now_ms) {
     mavlink_msg_attitude_encode(config_.system_id, config_.component_id, &msg, &att);
     transmit(msg);
     ++attitudes_sent_;
+}
+
+void MavlinkVehicle::sendSysStatus() {
+    mavlink_sys_status_t st;
+    memset(&st, 0, sizeof(st));
+
+    // IMU が使える場合だけ、ジャイロと加速度のセンサとして報告する
+    if (system_.imu_ok) {
+        const uint32_t imu_bits = MAV_SYS_STATUS_SENSOR_3D_GYRO | MAV_SYS_STATUS_SENSOR_3D_ACCEL;
+        st.onboard_control_sensors_present = imu_bits;
+        st.onboard_control_sensors_enabled = imu_bits;
+        st.onboard_control_sensors_health = imu_bits;
+    }
+
+    // 不明な値は「未設定」にする。電流は測っていないので常に不明。
+    st.voltage_battery = system_.battery_valid ? system_.battery_mv : UINT16_MAX;
+    st.current_battery = -1;
+    st.battery_remaining = system_.battery_valid ? system_.battery_pct : -1;
+
+    mavlink_message_t msg;
+    mavlink_msg_sys_status_encode(config_.system_id, config_.component_id, &msg, &st);
+    transmit(msg);
+}
+
+void MavlinkVehicle::sendBatteryStatus() {
+    mavlink_battery_status_t bs;
+    memset(&bs, 0, sizeof(bs));
+    bs.id = 0;                                   // 電池 1 本
+    bs.battery_function = MAV_BATTERY_FUNCTION_ALL;
+    bs.type = MAV_BATTERY_TYPE_UNKNOWN;          // 種類（Li-ion 等）は未確認
+    bs.temperature = INT16_MAX;                  // 温度は測っていない（未知）
+    for (int i = 0; i < 10; ++i) bs.voltages[i] = UINT16_MAX;  // 未使用セル = 未知
+    bs.voltages[0] = system_.battery_mv;         // 電池全体の電圧を 1 つ目に入れる
+    bs.current_battery = -1;                     // 電流は測っていない
+    bs.current_consumed = -1;
+    bs.energy_consumed = -1;
+    bs.battery_remaining = system_.battery_pct;  // 不明なら -1
+    bs.time_remaining = 0;                       // 残り時間は計算していない（未知）
+    bs.charge_state = MAV_BATTERY_CHARGE_STATE_UNDEFINED;
+
+    mavlink_message_t msg;
+    mavlink_msg_battery_status_encode(config_.system_id, config_.component_id, &msg, &bs);
+    transmit(msg);
+}
+
+void MavlinkVehicle::sendRadioStatus() {
+    // RADIO_STATUS の rssi は 0〜100 の目安値。Wi-Fi の dBm から仮に換算する:
+    //   -100 dBm → 0, -50 dBm → 100（範囲外は丸める）。換算式は QGC 側の見え方で要確認。
+    const int dbm = system_.wifi_rssi_dbm;
+    int pct = (dbm + 100) * 2;
+    if (pct < 0) pct = 0;
+    if (pct > 100) pct = 100;
+
+    mavlink_radio_status_t rs;
+    memset(&rs, 0, sizeof(rs));
+    rs.rssi = static_cast<uint8_t>(pct);
+    rs.remrssi = UINT8_MAX;   // 相手側の値は取れない（未知）
+    rs.noise = UINT8_MAX;     // ノイズは測っていない（未知）
+    rs.remnoise = UINT8_MAX;
+    rs.txbuf = 0;             // 送信バッファの使用率は測っていない
+
+    mavlink_message_t msg;
+    mavlink_msg_radio_status_encode(config_.system_id, config_.component_id, &msg, &rs);
+    transmit(msg);
 }
 
 bool MavlinkVehicle::takeGcsHeartbeat() {

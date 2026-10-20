@@ -40,6 +40,17 @@ public:
         uint32_t gcs_timeout_ms = 3000;
         uint32_t attitude_interval_ms = 50;  // ATTITUDE 20Hz（指示書 6.2 の 10〜20Hz）
         uint32_t manual_timeout_ms = 500;    // バーチャルスティックの入力がこの間途絶えたら中立（指示書 5.4）
+        uint32_t sys_status_interval_ms = 1000;  // SYS_STATUS 1Hz（指示書 6.2）
+    };
+
+    // SYS_STATUS で送る機体の状態。計測できた値だけを入れる（不明は未設定にする）。
+    struct SystemReport {
+        bool imu_ok = false;        // IMU が使える（ジャイロ・加速度のセンサとして報告する）
+        bool battery_valid = false; // 電池の値が取れている
+        uint16_t battery_mv = 0;    // 電池電圧 [mV]
+        int8_t battery_pct = -1;    // 残量 [%]。不明は -1
+        bool wifi_valid = false;    // Wi-Fi に接続中で電波強度が取れている
+        int8_t wifi_rssi_dbm = 0;   // 電波強度 [dBm]（例: -60）
     };
 
     // 有効なスティック入力。ARM 中かつ MANUAL モードで、タイムアウト内に届いたものだけ active になる。
@@ -87,6 +98,9 @@ public:
 
     // 最新の姿勢を設定する。valid=false（IMU 未初期化など）の間は ATTITUDE を送らない。
     void setAttitude(const AttitudeReport& attitude);
+
+    // SYS_STATUS（電池・センサ状態）の入力を更新する。
+    void setSystemReport(const SystemReport& report) { system_ = report; }
     void clearAttitude() { attitude_valid_ = false; }
 
     uint32_t heartbeatsSent() const { return heartbeats_sent_; }
@@ -107,6 +121,9 @@ private:
     void sendMissionAck(uint8_t target_sysid, uint8_t target_compid);
     void sendHeartbeat();
     void sendAttitude(uint32_t now_ms);
+    void sendSysStatus();
+    void sendRadioStatus();
+    void sendBatteryStatus();
     void sendAutopilotVersion();
     void sendCommandAck(uint16_t command, uint8_t result, uint8_t target_sysid, uint8_t target_compid);
     void sendStatusText(const char* text);
@@ -136,6 +153,9 @@ private:
     AttitudeReport attitude_;
     bool attitude_valid_ = false;
     uint32_t next_attitude_ms_ = 0;
+
+    SystemReport system_;
+    uint32_t next_sys_status_ms_ = 0;
 
     uint32_t heartbeats_sent_ = 0;
     uint32_t attitudes_sent_ = 0;
