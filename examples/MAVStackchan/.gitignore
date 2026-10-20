@@ -1,0 +1,4 @@
+.pio/
+# Wi-Fi 認証情報を含む設定（ルートの .gitignore でも除外しているが念のため明示）
+data/yaml/SC_SecConfig.yaml
+.images/

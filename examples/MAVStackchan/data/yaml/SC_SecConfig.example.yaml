@@ -1,0 +1,22 @@
+# このファイルを SC_SecConfig.yaml という名前でコピーして編集する。
+#   copy data\yaml\SC_SecConfig.example.yaml data\yaml\SC_SecConfig.yaml
+# SC_SecConfig.yaml は秘密情報を含むため git 管理外（ルートの .gitignore）。
+# 編集後は本体へ書き込む: pio run -e m5stack-cores3 -t uploadfs
+#   （書き込み前にシリアルモニターを閉じること）
+#
+# 書式の注意:
+#   - インデントはスペース（タブ不可）。wifi_list の項目は "  - ssid:" で始める
+#   - 値は " で囲む。値の中の " は使えない
+#   - " の外の # はコメントになる
+
+# Wi-Fi 候補。先頭から順に接続を試し、失敗すると次へ循環する。
+wifi_list:
+  - ssid: "your-ssid"
+    password: "your-password"
+  # - ssid: "backup-ssid"
+  #   password: "backup-password"
+
+# MAVLink 設定（省略時は system_id 1 / udp_port 14550）
+mav:
+  system_id: 1
+  udp_port: 14550
