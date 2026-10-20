@@ -76,6 +76,11 @@ public:
     // 現在有効なスティック入力を返す。ARM かつ MANUAL かつ新しい入力があるときだけ active。
     ManualInput manualInput(uint32_t now_ms) const;
 
+    // QGC からの水平（レベル）キャリブレーション要求を 1 回だけ取り出す。
+    bool takeLevelCalibrationRequest();
+    // 水平キャリブレーションの結果を要求元へ返す（成功 / 失敗）。
+    void finishLevelCalibration(bool ok);
+
     // GCS の HEARTBEAT を受けたときに true を返し、フラグを消費する。
     // 呼び出し側は送信先アドレスの学習に使う。
     bool takeGcsHeartbeat();
@@ -113,6 +118,10 @@ private:
 
     bool gcs_linked_ = false;
     bool gcs_heartbeat_pending_ = false;
+
+    bool level_request_pending_ = false;
+    uint8_t level_requester_sysid_ = 0;
+    uint8_t level_requester_compid_ = 0;
 
     bool manual_received_ = false;
     int16_t manual_x_ = 0;

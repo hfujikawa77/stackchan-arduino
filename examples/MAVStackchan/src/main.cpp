@@ -41,6 +41,7 @@ bool head_ready = false;
 AttitudeEstimator attitude;
 bool imu_ready = false;
 bool calibration_started = false;
+bool qgc_calibration_pending = false;  // QGC からの水平キャリブレーション中（結果を返す必要がある）
 uint32_t calibration_end_ms = 0;
 uint32_t last_imu_ms = 0;
 
@@ -162,6 +163,20 @@ void updateHead(uint32_t now_ms) {
     head_servo.update(now_ms);
 }
 
+// QGC からの水平キャリブレーション要求を受けて、kCalibrationMs の間の姿勢を基準にする。
+void updateLevelCalibration(uint32_t now_ms) {
+    if (!vehicle->takeLevelCalibrationRequest()) return;
+    if (!imu_ready) {
+        vehicle->finishLevelCalibration(false);
+        return;
+    }
+    attitude.beginCalibration();
+    calibration_started = true;
+    calibration_end_ms = now_ms + kCalibrationMs;
+    qgc_calibration_pending = true;
+    Serial.println("[MAV] level calibration requested by QGC: keep still");
+}
+
 // IMU を読んで姿勢を推定する。起動後 kCalibrationMs の間は水平に置いて基準を取る。
 void updateImu(uint32_t now_ms) {
     if (!imu_ready || now_ms - last_imu_ms < kImuIntervalMs) return;
@@ -183,6 +198,10 @@ void updateImu(uint32_t now_ms) {
         const float norm = sqrtf(accel_g[0] * accel_g[0] + accel_g[1] * accel_g[1] + accel_g[2] * accel_g[2]);
         Serial.printf("[MAV] IMU calibration %s (|accel|=%.3fG, expect ~1.0G at rest)\n",
                       ok ? "OK" : "FAILED", norm);
+        if (qgc_calibration_pending) {
+            qgc_calibration_pending = false;
+            vehicle->finishLevelCalibration(ok);
+        }
     }
 
     if (!attitude.calibrated()) return;
@@ -287,6 +306,7 @@ void loop() {
 
     ensureNetwork(now_ms);
     pumpNetwork(now_ms);
+    updateLevelCalibration(now_ms);
     updateImu(now_ms);
     updateHead(now_ms);
     vehicle->tick(now_ms);

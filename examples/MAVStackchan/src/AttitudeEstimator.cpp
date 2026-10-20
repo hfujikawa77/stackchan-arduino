@@ -25,6 +25,10 @@ constexpr float kAccelNormTolerance = 0.3f;
 // キャリブレーションに必要な最小サンプル数
 constexpr uint32_t kMinCalibrationSamples = 50;
 
+// 静止とみなす上限。角速度は約 3 度/秒、加速度の大きさのずれは 0.1G
+constexpr float kCalMaxGyroRadPerSec = 0.05f;
+constexpr float kCalMaxAccelDev = 0.1f;
+
 // 有効な dt の上限（秒）。これを超えると積分を飛ばす（再起動直後などの異常値対策）
 constexpr float kMaxDtSeconds = 0.5f;
 
@@ -54,6 +58,13 @@ void AttitudeEstimator::update(const float accel_g[3], const float gyro_rad[3], 
     if (calibrating_) {
         for (int i = 0; i < 3; ++i) cal_sum_[i] += a[i];
         ++cal_count_;
+
+        // 静止の確認用に、角速度と加速度の大きさのずれの最大値を記録する
+        const float gyro_mag = sqrtf(g[0] * g[0] + g[1] * g[1] + g[2] * g[2]);
+        const float accel_norm = sqrtf(a[0] * a[0] + a[1] * a[1] + a[2] * a[2]);
+        if (gyro_mag > cal_max_gyro_) cal_max_gyro_ = gyro_mag;
+        const float accel_dev = fabsf(accel_norm - 1.0f);
+        if (accel_dev > cal_max_accel_dev_) cal_max_accel_dev_ = accel_dev;
     }
 
     if (dt_s <= 0.0f || dt_s > kMaxDtSeconds) return;
@@ -87,13 +98,17 @@ void AttitudeEstimator::update(const float accel_g[3], const float gyro_rad[3], 
 void AttitudeEstimator::beginCalibration() {
     for (int i = 0; i < 3; ++i) cal_sum_[i] = 0.0f;
     cal_count_ = 0;
+    cal_max_gyro_ = 0.0f;
+    cal_max_accel_dev_ = 0.0f;
     calibrating_ = true;
-    calibrated_ = false;
+    // 再キャリブレーション中も、前の基準で姿勢の出力を続ける（失敗時に前の基準を残すため）
 }
 
 bool AttitudeEstimator::finishCalibration() {
     calibrating_ = false;
     if (cal_count_ < kMinCalibrationSamples) return false;
+    // 動いていた場合は基準にしない（前の基準を保つ）
+    if (cal_max_gyro_ > kCalMaxGyroRadPerSec || cal_max_accel_dev_ > kCalMaxAccelDev) return false;
 
     const float ax = cal_sum_[0] / cal_count_;
     const float ay = cal_sum_[1] / cal_count_;

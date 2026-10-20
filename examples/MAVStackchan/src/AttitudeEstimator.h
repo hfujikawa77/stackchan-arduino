@@ -52,5 +52,7 @@ private:
     // キャリブレーション中の加速度の合計
     float cal_sum_[3] = {0.0f, 0.0f, 0.0f};
     uint32_t cal_count_ = 0;
+    float cal_max_gyro_ = 0.0f;       // 静止確認用: 期間中の角速度の最大値（rad/s）
+    float cal_max_accel_dev_ = 0.0f;  // 静止確認用: 期間中の |加速度| - 1G の最大値
     bool calibrating_ = false;
 };

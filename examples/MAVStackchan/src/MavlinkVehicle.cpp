@@ -253,6 +253,19 @@ bool MavlinkVehicle::requestMode(uint8_t base_mode, uint32_t custom_mode) {
     return false;  // 対応していないモードは拒否する
 }
 
+bool MavlinkVehicle::takeLevelCalibrationRequest() {
+    const bool pending = level_request_pending_;
+    level_request_pending_ = false;
+    return pending;
+}
+
+void MavlinkVehicle::finishLevelCalibration(bool ok) {
+    sendCommandAck(MAV_CMD_PREFLIGHT_CALIBRATION,
+                   ok ? MAV_RESULT_ACCEPTED : MAV_RESULT_FAILED,
+                   level_requester_sysid_, level_requester_compid_);
+    sendStatusText(ok ? "Level calibration done" : "Level calibration failed: keep still and retry");
+}
+
 MavlinkVehicle::ManualInput MavlinkVehicle::manualInput(uint32_t now_ms) const {
     ManualInput in;
     if (!manual_received_ || !armed_ || mode_ != VehicleMode::Manual) return in;
@@ -302,6 +315,26 @@ void MavlinkVehicle::handleCommandLong(const mavlink_message_t& msg, const mavli
 
         case MAV_CMD_COMPONENT_ARM_DISARM:
             handleArmDisarm(msg, cmd);
+            return;
+
+        case MAV_CMD_PREFLIGHT_CALIBRATION:
+            // param5 = 2: 水平（レベル）キャリブレーション。機体を水平に静止させて基準を取る。
+            // ARM 中は実行しない。
+            if (armed_) {
+                sendStatusText("Disarm to allow calibration");
+                sendCommandAck(cmd.command, MAV_RESULT_DENIED, msg.sysid, msg.compid);
+                return;
+            }
+            if (static_cast<int>(cmd.param5) == 2) {
+                level_request_pending_ = true;
+                level_requester_sysid_ = msg.sysid;
+                level_requester_compid_ = msg.compid;
+                sendStatusText("Level calibration: keep the device still and level");
+                sendCommandAck(cmd.command, MAV_RESULT_IN_PROGRESS, msg.sysid, msg.compid);
+                return;
+            }
+            ++commands_unsupported_;
+            sendCommandAck(cmd.command, MAV_RESULT_UNSUPPORTED, msg.sysid, msg.compid);
             return;
 
         case MAV_CMD_DO_SET_MODE:
