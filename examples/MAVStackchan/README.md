@@ -10,7 +10,7 @@ Stack-chan（M5Stack CoreS3）を MAVLink 機体として振る舞わせ、Andro
 | 1 | Wi-Fi UDP、HEARTBEAT 送信、GCS 検知、未対応コマンドへの ACK | **実機で確認済み**（QGC で機体として認識） |
 | 2 | IMU 姿勢（ATTITUDE 20Hz）と HUD 表示 | **実機で確認済み**（ロール・ピッチが HUD に追従） |
 | 3 | ARM / DISARM、HOLD / MANUAL 切替 | **実機で確認済み**（probe 23 項目 PASS、GCS 切断時の自動 DISARM を確認。仕様は下記「Phase 3 の仕様」） |
-| 4 | Virtual Joystick、サーボ出力、フェイルセーフ | 未着手 |
+| 4 | バーチャルスティックで Stack-chan 内蔵の頭部サーボを動かす | **実装済み・実機未確認**（仕様は下記「Phase 4 の仕様」） |
 | 5 | Stack-chan の表情・音声との統合 | 未着手 |
 
 Phase 1 で実装しているもの:
@@ -64,6 +64,26 @@ Phase 2 で追加したもの:
 
 **通知**: ARM・DISARM・モード変更は STATUSTEXT で QGC に通知します。
 
+## Phase 4 の仕様（バーチャルスティックで頭部を動かす）
+
+新しいサーボは追加しません。Stack-chan 内蔵の頭部サーボ（パン・チルト）を、QGC のバーチャルスティックで動かします。
+制御には HermesLLM と同じ `StackchanSERVO` を使い、設定（中立角・可動範囲）は `data/yaml/SC_BasicConfig.yaml` から読みます。
+
+**入力**: `MANUAL_CONTROL` の x / y（-1000〜1000）。
+
+**割り当て（実機で確認済み）**
+- x（前後スティック）→ 頭部の上下（チルト）。符号は反転（前に倒すと頭部も同じ向き）
+- y（左右スティック）→ 頭部の左右（パン）。符号は反転（右に倒すと頭部も同じ向き）
+
+**動かす条件**: ARM 中かつ MANUAL モードで、タイムアウト内（既定 500ms）に入力が届いているとき。
+それ以外（DISARM、HOLD、入力の途絶え、GCS 切断）は、頭部を中立角に戻します。
+
+**可動範囲**: `SC_BasicConfig.yaml` の `lower_limit` / `upper_limit` を超えません。
+内蔵サーボの Y 軸は、中立角 90 に対して可動範囲が 0〜90 のため、片側にしか動きません。
+両側に動かしたい場合は、設定の上限を変えてください。
+
+**不感帯**: スティックの中央付近（±5%）は中立として扱います。
+
 ## ファイル構成
 
 ```
@@ -75,6 +95,8 @@ examples/MAVStackchan/
 │   ├── main.cpp            Wi-Fi / UDP / 表示（Arduino 依存部）
 │   ├── Settings.h/.cpp     YAML 設定の解析（HermesLLM と同じ書式）
 │   ├── AttitudeEstimator.h/.cpp  IMU からロール・ピッチ・ヨーを推定（軸割り当て kAxisMap）
+│   ├── ManualControl.h/.cpp  スティック値 → 頭部の目標角（Arduino 非依存）
+│   ├── HeadServo.h/.cpp    内蔵の頭部サーボ（StackchanSERVO）のラッパー
 │   └── MavlinkVehicle.h/.cpp  MAVLink 機体ロジック（Arduino 非依存）
 └── tools/
     └── mav_probe.py        GCS の代わりに実機へ問い合わせる確認スクリプト

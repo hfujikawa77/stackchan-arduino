@@ -119,6 +119,17 @@ void MavlinkVehicle::handleMessage(const mavlink_message_t& msg, uint32_t now_ms
             return;
         }
 
+        case MAVLINK_MSG_ID_MANUAL_CONTROL: {
+            mavlink_manual_control_t mc;
+            mavlink_msg_manual_control_decode(&msg, &mc);
+            if (mc.target != 0 && mc.target != config_.system_id) return;
+            manual_x_ = mc.x;
+            manual_y_ = mc.y;
+            manual_ms_ = now_ms;
+            manual_received_ = true;
+            return;
+        }
+
         case MAVLINK_MSG_ID_SET_MODE: {
             mavlink_set_mode_t sm;
             mavlink_msg_set_mode_decode(&msg, &sm);
@@ -240,6 +251,16 @@ bool MavlinkVehicle::requestMode(uint8_t base_mode, uint32_t custom_mode) {
         return true;
     }
     return false;  // 対応していないモードは拒否する
+}
+
+MavlinkVehicle::ManualInput MavlinkVehicle::manualInput(uint32_t now_ms) const {
+    ManualInput in;
+    if (!manual_received_ || !armed_ || mode_ != VehicleMode::Manual) return in;
+    if ((now_ms - manual_ms_) > config_.manual_timeout_ms) return in;  // 入力が途絶えた
+    in.active = true;
+    in.x = manual_x_;
+    in.y = manual_y_;
+    return in;
 }
 
 void MavlinkVehicle::setArmed(bool armed, const char* reason) {

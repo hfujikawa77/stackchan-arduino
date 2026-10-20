@@ -39,6 +39,14 @@ public:
         uint32_t heartbeat_interval_ms = 1000;
         uint32_t gcs_timeout_ms = 3000;
         uint32_t attitude_interval_ms = 50;  // ATTITUDE 20Hz（指示書 6.2 の 10〜20Hz）
+        uint32_t manual_timeout_ms = 500;    // バーチャルスティックの入力がこの間途絶えたら中立（指示書 5.4）
+    };
+
+    // 有効なスティック入力。ARM 中かつ MANUAL モードで、タイムアウト内に届いたものだけ active になる。
+    struct ManualInput {
+        bool active = false;
+        int16_t x = 0;
+        int16_t y = 0;
     };
 
     // ATTITUDE で送る姿勢（角度は rad、角速度は rad/s、body 座標系）
@@ -64,6 +72,9 @@ public:
     bool gcsLinked() const { return gcs_linked_; }
     bool armed() const { return armed_; }
     VehicleMode mode() const { return mode_; }
+
+    // 現在有効なスティック入力を返す。ARM かつ MANUAL かつ新しい入力があるときだけ active。
+    ManualInput manualInput(uint32_t now_ms) const;
 
     // GCS の HEARTBEAT を受けたときに true を返し、フラグを消費する。
     // 呼び出し側は送信先アドレスの学習に使う。
@@ -102,6 +113,11 @@ private:
 
     bool gcs_linked_ = false;
     bool gcs_heartbeat_pending_ = false;
+
+    bool manual_received_ = false;
+    int16_t manual_x_ = 0;
+    int16_t manual_y_ = 0;
+    uint32_t manual_ms_ = 0;
 
     VehicleMode mode_ = VehicleMode::Hold;  // 起動時は HOLD
     bool armed_ = false;                    // 起動時は DISARMED（再起動で引き継がない）

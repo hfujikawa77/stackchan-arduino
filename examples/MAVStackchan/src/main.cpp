@@ -12,8 +12,14 @@
 #include <WiFiUdp.h>
 
 #include "AttitudeEstimator.h"
+#include "HeadServo.h"
+#include "ManualControl.h"
 #include "MavlinkVehicle.h"
 #include "Settings.h"
+#include "Stackchan_system_config.h"
+
+// サーボ設定（SC_BasicConfig.yaml）。HeadServo.cpp から extern で参照する。
+StackchanSystemConfig system_config;
 
 namespace {
 
@@ -28,6 +34,9 @@ constexpr size_t kRxBufferSize = 320;  // MAVLink 2 の最大パケット長以�
 MavSettings settings;
 MavlinkVehicle* vehicle = nullptr;
 bool settings_loaded = false;
+
+HeadServo head_servo;
+bool head_ready = false;
 
 AttitudeEstimator attitude;
 bool imu_ready = false;
@@ -136,6 +145,23 @@ void pumpNetwork(uint32_t now_ms) {
     }
 }
 
+// バーチャルスティックで頭部を動かす。ARM かつ MANUAL かつ入力が新しいときだけ追従し、
+// それ以外（DISARM・HOLD・入力途絶え・GCS 切断）は中立に戻す。
+void updateHead(uint32_t now_ms) {
+    if (!head_ready) return;
+
+    const MavlinkVehicle::ManualInput in = vehicle->manualInput(now_ms);
+    if (in.active) {
+        const HeadTarget t = manualControlToHead(in.x, in.y, head_servo.panLimits(), head_servo.tiltLimits());
+        head_servo.setTarget(t.pan, t.tilt);
+    } else {
+        const HeadLimits pan = head_servo.panLimits();
+        const HeadLimits tilt = head_servo.tiltLimits();
+        head_servo.setTarget(pan.center, tilt.center);
+    }
+    head_servo.update(now_ms);
+}
+
 // IMU を読んで姿勢を推定する。起動後 kCalibrationMs の間は水平に置いて基準を取る。
 void updateImu(uint32_t now_ms) {
     if (!imu_ready || now_ms - last_imu_ms < kImuIntervalMs) return;
@@ -230,6 +256,15 @@ void setup() {
 
     settings_loaded = loadSettings();
 
+    // 頭部サーボの設定（HermesLLM と同じ SC_BasicConfig.yaml）
+    // 基本設定は約 3KB あるため、バッファを 8KB にする（既定の 2KB では解析中に落ちる）。
+    // シークレット設定・アプリ用設定はこのアプリでは使わないので読まない（サイズ 0）。
+    system_config.loadConfig(SPIFFS, "/yaml/SC_BasicConfig.yaml", 0,
+                             "/yaml/SC_SecConfig.yaml", 0,
+                             "/yaml/SC_BasicConfig.yaml", 8192);
+    head_ready = head_servo.begin();
+    Serial.printf("[MAV] head servo %s\n", head_ready ? "ready" : "not available");
+
     MavlinkVehicle::Config vehicle_cfg;
     vehicle_cfg.system_id = settings.system_id;
     vehicle = new MavlinkVehicle(vehicle_cfg, sendToNetwork, nullptr);
@@ -253,6 +288,7 @@ void loop() {
     ensureNetwork(now_ms);
     pumpNetwork(now_ms);
     updateImu(now_ms);
+    updateHead(now_ms);
     vehicle->tick(now_ms);
     reportLinkChange();
     drawStatus(now_ms);
