@@ -14,6 +14,7 @@
 #include <Avatar.h>
 
 #include "AttitudeEstimator.h"
+#include "DeviceSettings.h"
 #include "FaceStatus.h"
 #include "Greeting.h"
 #include "HeadServo.h"
@@ -521,6 +522,134 @@ void updateSlides(uint32_t now) {
     }
 }
 
+// --- 本体の設定画面 --------------------------------------------------------
+// 画面の右上隅をタップで開く。項目: スライドモード / 音量 / 明るさ / Wi-Fi 候補。
+// 閉じると /settings.json に保存する。開いている間は顔とスライドを止める。
+
+DeviceSettings dev;
+bool settings_open = false;
+
+constexpr int kSettingsRowY[4] = {44, 84, 124, 164};  // スライド / 音量 / 明るさ / Wi-Fi
+constexpr int kSettingsRowH = 36;
+constexpr int kSettingsCloseY = 206;
+constexpr int kSettingsCloseH = 30;
+
+void drawSettingsScreen() {
+    M5.Display.fillScreen(TFT_BLACK);
+    M5.Display.setTextColor(TFT_WHITE, TFT_BLACK);
+    M5.Display.setFont(&fonts::efontJA_16);
+    M5.Display.setTextSize(1);
+
+    M5.Display.setCursor(8, 12);
+    M5.Display.print("設定");
+
+    char line[64];
+    M5.Display.setCursor(12, kSettingsRowY[0] + 10);
+    M5.Display.print(dev.slide_mode ? "スライドモード: ON" : "スライドモード: OFF");
+
+    M5.Display.setCursor(12, kSettingsRowY[1] + 10);
+    snprintf(line, sizeof(line), "音量: %u", (unsigned)dev.volume);
+    M5.Display.print(line);
+    M5.Display.fillRoundRect(200, kSettingsRowY[1] + 4, 50, kSettingsRowH - 8, 4, TFT_DARKGREY);
+    M5.Display.fillRoundRect(256, kSettingsRowY[1] + 4, 50, kSettingsRowH - 8, 4, TFT_DARKGREY);
+    M5.Display.setCursor(218, kSettingsRowY[1] + 10);
+    M5.Display.print("-");
+    M5.Display.setCursor(274, kSettingsRowY[1] + 10);
+    M5.Display.print("+");
+
+    M5.Display.setCursor(12, kSettingsRowY[2] + 10);
+    snprintf(line, sizeof(line), "明るさ: %u", (unsigned)dev.brightness);
+    M5.Display.print(line);
+    M5.Display.fillRoundRect(200, kSettingsRowY[2] + 4, 50, kSettingsRowH - 8, 4, TFT_DARKGREY);
+    M5.Display.fillRoundRect(256, kSettingsRowY[2] + 4, 50, kSettingsRowH - 8, 4, TFT_DARKGREY);
+    M5.Display.setCursor(218, kSettingsRowY[2] + 10);
+    M5.Display.print("-");
+    M5.Display.setCursor(274, kSettingsRowY[2] + 10);
+    M5.Display.print("+");
+
+    M5.Display.setCursor(12, kSettingsRowY[3] + 10);
+    if (settings.wifi_count > 0 && dev.wifi_index < settings.wifi_count) {
+        snprintf(line, sizeof(line), "Wi-Fi: %s", settings.wifi[dev.wifi_index].ssid.c_str());
+    } else {
+        snprintf(line, sizeof(line), "Wi-Fi: 未設定");
+    }
+    M5.Display.print(line);
+
+    M5.Display.fillRoundRect(8, kSettingsCloseY, 304, kSettingsCloseH, 4, TFT_DARKGREEN);
+    M5.Display.setCursor(120, kSettingsCloseY + 7);
+    M5.Display.print("閉じる（保存）");
+}
+
+void openSettingsScreen() {
+    settings_open = true;
+    avatar.suspend();
+    drawSettingsScreen();
+    Serial.println("[SET] settings opened");
+}
+
+void closeSettingsScreen() {
+    saveDeviceSettings(dev);
+    settings_open = false;
+    avatar.resume();
+    face_refresh_needed = true;
+    M5.Display.setFont(&fonts::Font0);
+    M5.Display.fillScreen(TFT_BLACK);
+    Serial.println("[SET] settings saved and closed");
+}
+
+bool inRect(int x, int y, int rx, int ry, int rw, int rh) {
+    return x >= rx && x < rx + rw && y >= ry && y < ry + rh;
+}
+
+// 設定画面のタッチ処理。設定画面を開いている間は true を返す。
+bool updateSettingsScreen(uint32_t now) {
+    (void)now;
+    auto t = M5.Touch.getDetail(0);
+    if (!t.wasPressed()) return settings_open;
+
+    if (!settings_open) {
+        // 右上隅（画面の幅の右端 60px、上端 60px）で開く
+        if (t.x > M5.Display.width() - 60 && t.y < 60) openSettingsScreen();
+        return settings_open;
+    }
+
+    const int x = t.x;
+    const int y = t.y;
+    if (inRect(x, y, 8, kSettingsCloseY, 304, kSettingsCloseH)) {
+        closeSettingsScreen();
+        return false;
+    }
+    if (inRect(x, y, 0, kSettingsRowY[0], 320, kSettingsRowH)) {
+        dev.slide_mode = !dev.slide_mode;
+        slide_mode_on = dev.slide_mode;
+    } else if (inRect(x, y, 0, kSettingsRowY[1], 320, kSettingsRowH)) {
+        if (inRect(x, y, 200, kSettingsRowY[1], 50, kSettingsRowH)) {
+            dev.volume = dev.volume >= 10 ? dev.volume - 10 : 0;
+        } else if (inRect(x, y, 256, kSettingsRowY[1], 50, kSettingsRowH)) {
+            dev.volume = dev.volume <= 90 ? dev.volume + 10 : 100;
+        }
+        settings.volume = dev.volume;
+        M5.Speaker.setVolume(dev.volume);
+    } else if (inRect(x, y, 0, kSettingsRowY[2], 320, kSettingsRowH)) {
+        if (inRect(x, y, 200, kSettingsRowY[2], 50, kSettingsRowH)) {
+            dev.brightness = dev.brightness >= 50 ? dev.brightness - 25 : 25;
+        } else if (inRect(x, y, 256, kSettingsRowY[2], 50, kSettingsRowH)) {
+            dev.brightness = dev.brightness <= 230 ? dev.brightness + 25 : 255;
+        }
+        M5.Display.setBrightness(dev.brightness);
+    } else if (inRect(x, y, 0, kSettingsRowY[3], 320, kSettingsRowH)) {
+        // 次の候補へ切り替える。接続し直して、新しい候補から接続する
+        if (settings.wifi_count > 0) {
+            dev.wifi_index = (dev.wifi_index + 1) % settings.wifi_count;
+            wifi_index = dev.wifi_index;
+            WiFi.disconnect();
+            next_wifi_try_ms = 0;
+        }
+    }
+    drawSettingsScreen();
+    return true;
+}
+
 void updateFace(uint32_t now_ms) {
     static uint32_t next_ms = 0;
     static bool has_last = false;
@@ -530,6 +659,7 @@ void updateFace(uint32_t now_ms) {
 
     if (now_ms < next_ms) return;
     next_ms = now_ms + kFaceIntervalMs;
+    if (settings_open) return;  // 設定画面の表示中は顔を出さない
     if (slide_active) return;  // スライドの表示中は状態表示を出さない
     if (face_refresh_needed) {
         face_refresh_needed = false;
@@ -561,6 +691,14 @@ void setup() {
     Serial.println("[MAV] MAVStackchan Phase 1 boot");
 
     settings_loaded = loadSettings();
+    // 設定画面の値（/settings.json）。無ければ YAML の既定値のまま
+    dev.slide_mode = settings.slide_mode;
+    dev.volume = settings.volume;
+    loadDeviceSettings(dev);
+    settings.volume = dev.volume;
+    if (dev.wifi_index >= settings.wifi_count) dev.wifi_index = 0;
+    wifi_index = dev.wifi_index;
+    M5.Display.setBrightness(dev.brightness);
     if (settings_loaded) startPhoneLocationTask(settings.digest_url, settings.digest_token);
 
     // 頭部サーボの設定（HermesLLM と同じ SC_BasicConfig.yaml）
@@ -581,7 +719,7 @@ void setup() {
         setLeds(LedColor{0, 0, 0});
     }
 
-    slide_mode_on = settings.slide_mode;
+    slide_mode_on = dev.slide_mode;
     if (slide_mode_on) {
         head_touch.begin();
         Serial.println("[SLIDE] slide mode ON");
@@ -613,7 +751,8 @@ void loop() {
     updatePosition(now_ms);
     updateLevelCalibration(now_ms);
     updateImu(now_ms);
-    updateSlides(now_ms);
+    const bool in_settings = updateSettingsScreen(now_ms);  // 右上隅のタップで設定画面
+    if (!in_settings) updateSlides(now_ms);
     updateHead(now_ms);
     vehicle->tick(now_ms);
     reportLinkChange();
