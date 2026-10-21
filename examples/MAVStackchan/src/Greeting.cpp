@@ -46,19 +46,24 @@ bool Greeting::start(const char* path, uint8_t volume) {
         return false;
     }
 
-    M5.Speaker.setVolume(volume);
+    M5.Speaker.setVolume(static_cast<uint8_t>(volume * 255 / 100));  // 設定は 0〜100、スピーカーは 0〜255
     const size_t samples = (size - data_offset) / 2;
-    if (!M5.Speaker.playRaw(reinterpret_cast<int16_t*>(buf + data_offset), samples, sample_rate, false, 1, 0)) {
+    const bool ok = M5.Speaker.playRaw(reinterpret_cast<int16_t*>(buf + data_offset), samples, sample_rate, false, 1, 0);
+    Serial.printf("[SLIDE] playRaw=%d samples=%u rate=%u\n", ok ? 1 : 0, (unsigned)samples, (unsigned)sample_rate);
+    if (!ok) {
         heap_caps_free(buf);
         return false;
     }
-    buf_ = buf;  // 再生が終わるまで保持する
+    // 音声の長さ + 余裕。isPlaying() が直後は false を返すこともあるため、時間でも保持する
+    duration_ms_ = static_cast<uint32_t>(samples * 1000ULL / sample_rate);
+    done_ms_ = millis() + duration_ms_ + 300;
+    buf_ = buf;
     return true;
 }
 
 void Greeting::tick() {
     if (!buf_) return;
-    if (M5.Speaker.isPlaying()) return;
+    if (millis() < done_ms_ || M5.Speaker.isPlaying()) return;
     heap_caps_free(buf_);
     buf_ = nullptr;
 }

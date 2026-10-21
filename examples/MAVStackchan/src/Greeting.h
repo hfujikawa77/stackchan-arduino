@@ -11,7 +11,10 @@ public:
     // 定期的に呼ぶ。再生が終わったらバッファを解放する。
     void tick();
     bool playing() const { return buf_ != nullptr; }
+    uint32_t durationMs() const { return duration_ms_; }  // 直近に開始した音声の長さ
 
 private:
     uint8_t* buf_ = nullptr;
+    uint32_t duration_ms_ = 0;
+    uint32_t done_ms_ = 0;  // この時刻までは再生中とみなし、バッファを保持する
 };

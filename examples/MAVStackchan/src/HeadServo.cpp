@@ -54,7 +54,7 @@ void HeadServo::moveTo(float pan, float tilt, uint32_t ms) {
     const HeadLimits t = tiltLimits();
     const float x = fminf(fmaxf(pan, p.lower), p.upper);
     const float y = fminf(fmaxf(tilt, t.lower), t.upper);
-    servo_.moveXY(static_cast<int>(x), static_cast<int>(y), ms);
+    servo_.moveXYContinuous(x, y, ms);  // スティックと同じ経路（ループを止めない）
     last_pan_ = x;
     last_tilt_ = y;
     target_pan_ = x;

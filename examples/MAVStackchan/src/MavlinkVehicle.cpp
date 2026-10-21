@@ -188,6 +188,18 @@ void MavlinkVehicle::sendRadioStatus() {
     transmit(msg);
 }
 
+void MavlinkVehicle::resetState() {
+    armed_ = false;
+    mode_ = VehicleMode::Hold;
+    gcs_linked_ = false;
+    gcs_heartbeat_pending_ = false;
+    manual_received_ = false;
+    rc_received_ = false;
+    level_request_pending_ = false;
+    attitude_valid_ = false;
+    position_valid_ = false;
+}
+
 bool MavlinkVehicle::takeGcsHeartbeat() {
     const bool pending = gcs_heartbeat_pending_;
     gcs_heartbeat_pending_ = false;

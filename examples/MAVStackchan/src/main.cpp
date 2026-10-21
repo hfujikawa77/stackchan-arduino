@@ -26,6 +26,10 @@
 #include "SlideBridge.h"
 #include "Stackchan_system_config.h"
 
+// ループのスタックは既定の 8KB では足りない（設定画面・スライドの処理で溢れて再起動する）。
+// HermesLLM と同じ 16KB にする。
+SET_LOOP_TASK_STACK_SIZE(16 * 1024);
+
 // サーボ設定（SC_BasicConfig.yaml）。HeadServo.cpp から extern で参照する。
 StackchanSystemConfig system_config;
 
@@ -66,6 +70,8 @@ bool slide_mode_on = false;     // 設定（既定 OFF）
 bool slide_active = false;      // スライドの表示を適用中（状態表示より優先）
 bool face_refresh_needed = false;
 bool slide_server_started = false;
+bool mav_enabled = true;  // MAVLink（QGC との通信）。設定画面から再起動なしで切り替える
+uint32_t ip_bubble_until_ms = 0;  // 接続直後に IP を吹き出しで出す期限（0 = 出していない）
 bool slideMotionBusy();         // 首の動き（ステップ・回転）中か。updateHead が書き込みを止めるのに使う
 
 bool udp_open = false;
@@ -116,11 +122,19 @@ void ensureNetwork(uint32_t now_ms) {
             slide_ws.begin(80);
             slide_server_started = true;
         }
-        if (!udp_open && udp.begin(settings.udp_port)) {
+        if (!mav_enabled && udp_open) {
+            udp.stop();
+            udp_open = false;
+            peer_known = false;
+        }
+        if (mav_enabled && !udp_open && udp.begin(settings.udp_port)) {
             udp_open = true;
             const uint32_t ip = static_cast<uint32_t>(WiFi.localIP());
             const uint32_t mask = static_cast<uint32_t>(WiFi.subnetMask());
             broadcast_ip = IPAddress(ip | ~mask);
+            // 機体の IP を吹き出しで 15 秒表示する（ブラウザの ?sc=<IP> に使う）
+            ip_bubble_until_ms = millis() + 15000;
+            avatar.setSpeechText(("IP " + WiFi.localIP().toString()).c_str());
             Serial.printf("[MAV] UDP %u open, local=%s broadcast=%s\n",
                           settings.udp_port,
                           WiFi.localIP().toString().c_str(),
@@ -337,12 +351,74 @@ bool slide_greeting_request = false;
 bool slide_greeting_outro = false;
 String slide_bubble_text;  // avatar に渡す文字列（参照が残るので保持する）
 
+// 吹き出しの文字を流す（HermesLLM と同じ: 12 文字ずつ、130ms ごとに 1 文字ずらす）
+struct BubbleScroll {
+    String text;
+    uint32_t started_ms = 0;
+    uint32_t duration_ms = 0;
+    uint32_t last_ms = 0;
+    bool active = false;
+    static constexpr int kVisibleChars = 12;
+    static constexpr uint32_t kStepMs = 130;
+
+    static int nextIndex(const String& t, int index) {
+        if (index >= (int)t.length()) return t.length();
+        const uint8_t c = (uint8_t)t[index];
+        int step = 1;
+        if ((c & 0x80) == 0x00) step = 1;
+        else if ((c & 0xE0) == 0xC0) step = 2;
+        else if ((c & 0xF0) == 0xE0) step = 3;
+        else if ((c & 0xF8) == 0xF0) step = 4;
+        return min((int)t.length(), index + step);
+    }
+    static int charCount(const String& t) {
+        int n = 0;
+        for (int i = 0; i < (int)t.length(); i = nextIndex(t, i)) n++;
+        return n;
+    }
+    static String window(const String& t, int start_char) {
+        int start = 0;
+        for (int i = 0; i < start_char && start < (int)t.length(); ++i) start = nextIndex(t, start);
+        int end = start;
+        for (int i = 0; i < kVisibleChars && end < (int)t.length(); ++i) end = nextIndex(t, end);
+        return t.substring(start, end);
+    }
+    void start(const String& s, uint32_t dur, uint32_t now) {
+        text = s;
+        active = !s.isEmpty();
+        started_ms = now;
+        duration_ms = dur;
+        last_ms = 0;
+        tick(now);
+    }
+    void stop() {
+        active = false;
+        text = "";
+    }
+    void tick(uint32_t now) {
+        if (!active) return;
+        if (last_ms && now - last_ms < kStepMs) return;
+        last_ms = now;
+        const int total = charCount(text);
+        String visible = text;
+        if (total > kVisibleChars) {
+            const int span = total - kVisibleChars + 1;
+            const int start = duration_ms > 0 ? (int)(((now - started_ms) / kStepMs) % span) : 0;
+            visible = window(text, start);
+        }
+        avatar.setSpeechText(visible.c_str());
+    }
+};
+BubbleScroll bubble_scroll;
+
 bool manualDriveActive() {
     return vehicle->armed() && vehicle->mode() == VehicleMode::Manual;
 }
 
+bool speech_active = false;  // 挨拶の音声に合わせて、口と首を動かしている
+
 bool slideMotionBusy() {
-    return motion_steps != nullptr || spinning;
+    return motion_steps != nullptr || spinning || speech_active;
 }
 
 void stopSlideMotion() {
@@ -374,14 +450,63 @@ void startMotion(const MotionStep* steps, uint8_t n, uint32_t now) {
 }
 
 // 挨拶: 1 回目 intro、次 outro、交互。非同期なので、ループは止まらない。
-void playGreeting() {
+void playGreeting(uint32_t now) {
     const char* path = slide_greeting_outro ? "/audio/outro.wav" : "/audio/intro.wav";
+    const char* text = slide_greeting_outro ? "Thank you, everyone!" : "Hiii, everyone! I'm Stack-chan!";
     if (greeting.start(path, settings.volume)) {
         slide_greeting_outro = !slide_greeting_outro;
         Serial.printf("[SLIDE] greeting: %s\n", path);
+        // しゃべる内容を吹き出しに出す。音声が終わるまで表示する
+        bubble_scroll.start(text, greeting.durationMs(), now);
+        slide_bubble_clear_ms = now + greeting.durationMs() + 500;
     } else {
         Serial.printf("[SLIDE] greeting not played: %s\n", path);
     }
+}
+
+// しゃべっている間の動き（HermesLLM の再生中の動きと同じ 7 ステップ）
+// 0〜4: うなずき（上下）と口の開閉 / 5: 左右に振る / 6: 中央へ戻す
+void updateSpeechMotion(uint32_t now) {
+    static uint32_t next_ms = 0;
+    static uint8_t step = 0;
+    static bool up = false;
+
+    if (!greeting.playing()) {
+        if (speech_active) {
+            speech_active = false;
+            avatar.setMouthOpenRatio(0.0f);
+            if (head_ready && !manualDriveActive()) {
+                const HeadLimits pan = head_servo.panLimits();
+                const HeadLimits tilt = head_servo.tiltLimits();
+                head_servo.moveTo(pan.center, tilt.center, 500);
+            }
+        }
+        return;
+    }
+    if (!speech_active) {
+        speech_active = true;
+        step = 0;
+        next_ms = now;
+    }
+    if (now < next_ms) return;
+    next_ms = now + 700;
+
+    const bool may_move = head_ready && !manualDriveActive();
+    const HeadLimits pan = head_servo.panLimits();
+    const HeadLimits tilt = head_servo.tiltLimits();
+    const uint8_t phase = step % 7;
+    Serial.printf("[SLIDE] speech step=%u phase=%u may_move=%d\n", (unsigned)step, (unsigned)phase, may_move ? 1 : 0);
+    if (phase == 5) {
+        const int dir = random(0, 2) == 0 ? -1 : 1;
+        if (may_move) head_servo.moveTo(pan.center + dir * 22, tilt.center - 4, 450);
+    } else if (phase == 6) {
+        if (may_move) head_servo.moveTo(pan.center, tilt.center, 450);
+    } else {
+        up = !up;
+        if (may_move) head_servo.moveTo(pan.center, tilt.center + (up ? -16 : 4), 500);
+        avatar.setMouthOpenRatio(up ? random(30, 65) / 100.0f : 0.05f);
+    }
+    step++;
 }
 
 // reveal.js からの JSON を受ける（SlideBridge のハンドラ）
@@ -401,20 +526,149 @@ void onSlideMessage(const char* json, void* /*ctx*/) {
     slide_pending.pending = true;
 }
 
-// LED 指定（data-stackchan-led）。色だけ反映する（パターンは未対応）
+// LED 指定（data-stackchan-led）。6 種類のパターン（HermesLLM と同じ見た目）:
+//   blink / wave / split_chase / split_breath / split_blink / split_wave
+// それ以外の pattern と solid は、color の単色になる。時間から毎回計算する（状態を持たない）。
+enum class LedPat : uint8_t { Solid, Blink, Wave, SplitChase, SplitBreath, SplitBlink, SplitWave };
+struct LedSpec {
+    LedPat pat = LedPat::Solid;
+    LedColor c1 = {0, 0, 0};
+    LedColor c2 = {0, 0, 0};
+    uint8_t speed = 5;  // 1〜10
+};
+LedSpec slide_led;
+bool slide_led_active = false;
+uint32_t slide_led_next_ms = 0;
+
+LedColor scaleLed(LedColor c, uint8_t br) {
+    return LedColor{static_cast<uint8_t>(c.r * br / 255), static_cast<uint8_t>(c.g * br / 255),
+                    static_cast<uint8_t>(c.b * br / 255)};
+}
+
+// 0〜255 の位相から、三角波の明るさ（0〜254）
+uint8_t triangleBright(uint32_t phase) {
+    phase &= 0xFF;
+    return phase < 128 ? static_cast<uint8_t>(phase * 2) : static_cast<uint8_t>((255 - phase) * 2);
+}
+
+LedColor parseHexColor(const String& text, LedColor fallback) {
+    if (text.length() != 7 || text[0] != '#') return fallback;
+    return LedColor{static_cast<uint8_t>(strtol(text.substring(1, 3).c_str(), nullptr, 16)),
+                    static_cast<uint8_t>(strtol(text.substring(3, 5).c_str(), nullptr, 16)),
+                    static_cast<uint8_t>(strtol(text.substring(5, 7).c_str(), nullptr, 16))};
+}
+
+// 現在時刻のフレーム（kLedCount 個の色）を作る
+void renderSlideLed(const LedSpec& s, uint32_t now, LedColor* out) {
+    const int speed = s.speed < 1 ? 1 : (s.speed > 10 ? 10 : s.speed);
+    const uint32_t delay_base = 11 - speed;
+    const bool split = s.pat == LedPat::SplitChase || s.pat == LedPat::SplitBreath ||
+                       s.pat == LedPat::SplitBlink || s.pat == LedPat::SplitWave;
+    const int half = kLedCount / 2;
+    auto colorAt = [&](int i) { return (split && i >= half) ? s.c2 : s.c1; };
+
+    switch (s.pat) {
+        case LedPat::Blink:
+        case LedPat::SplitBlink: {
+            const uint32_t period = 2 * (60 + delay_base * 40);
+            const bool on = (now % period) < period / 2;
+            for (int i = 0; i < kLedCount; ++i) {
+                const LedColor c = colorAt(i);
+                out[i] = on ? c : LedColor{0, 0, 0};
+            }
+            break;
+        }
+        case LedPat::Wave:
+        case LedPat::SplitWave: {
+            const uint32_t step_ms = 20 + delay_base * 4;
+            const uint32_t step = now / step_ms;
+            for (int i = 0; i < kLedCount; ++i) {
+                const uint32_t phase = step * 4 + static_cast<uint32_t>(i) * 255 / kLedCount;
+                out[i] = scaleLed(colorAt(i), triangleBright(phase));
+            }
+            break;
+        }
+        case LedPat::SplitBreath: {
+            const uint32_t step_ms = 15 + delay_base * 3;
+            const uint32_t p = ((now / step_ms) * 6) % 500;
+            uint8_t anim = static_cast<uint8_t>(p < 250 ? p : 499 - p);
+            if (anim > 249) anim = 249;
+            for (int i = 0; i < kLedCount; ++i) out[i] = scaleLed(colorAt(i), anim);
+            break;
+        }
+        case LedPat::SplitChase: {
+            const uint32_t step_ms = 30 + delay_base * 6;
+            const int pos = static_cast<int>((now / step_ms) % kLedCount);
+            for (int i = 0; i < kLedCount; ++i) out[i] = LedColor{0, 0, 0};
+            for (int j = 0; j < 3; ++j) {
+                const int idx = (pos + j * 4) % kLedCount;
+                out[idx] = scaleLed(colorAt(idx), j == 0 ? 255 : 100);
+            }
+            break;
+        }
+        case LedPat::Solid:
+        default:
+            for (int i = 0; i < kLedCount; ++i) out[i] = s.c1;
+            break;
+    }
+}
+
+// スライドの LED 指定を適用する。空の指定は LED を消す（HermesLLM と同じ）
 void applySlideLed(const String& json) {
+    slide_led_active = false;
+    if (json.isEmpty()) {
+        setLeds(LedColor{0, 0, 0});
+        return;
+    }
     JsonDocument doc;
-    if (deserializeJson(doc, json)) return;
+    if (deserializeJson(doc, json)) {
+        setLeds(LedColor{0, 0, 0});
+        return;
+    }
     if (doc["off"] | false) {
         setLeds(LedColor{0, 0, 0});
         return;
     }
-    const String color = doc["color"] | "";
-    if (color.length() == 7 && color[0] == '#') {
-        const uint8_t r = static_cast<uint8_t>(strtol(color.substring(1, 3).c_str(), nullptr, 16));
-        const uint8_t g = static_cast<uint8_t>(strtol(color.substring(3, 5).c_str(), nullptr, 16));
-        const uint8_t b = static_cast<uint8_t>(strtol(color.substring(5, 7).c_str(), nullptr, 16));
-        setLeds(LedColor{r, g, b});
+
+    LedSpec spec;
+    const String name = doc["pattern"] | "solid";
+    if (name == "blink") spec.pat = LedPat::Blink;
+    else if (name == "wave") spec.pat = LedPat::Wave;
+    else if (name == "split_chase") spec.pat = LedPat::SplitChase;
+    else if (name == "split_breath") spec.pat = LedPat::SplitBreath;
+    else if (name == "split_blink") spec.pat = LedPat::SplitBlink;
+    else if (name == "split_wave") spec.pat = LedPat::SplitWave;
+    else spec.pat = LedPat::Solid;
+
+    spec.c1 = parseHexColor(String(doc["color"] | "#FFFFFF"), LedColor{255, 255, 255});
+    spec.c2 = parseHexColor(String(doc["color2"] | ""), spec.c1);
+    spec.speed = doc["speed"] | 5;
+    Serial.printf("[SLIDE] led pattern=%s speed=%u\n", name.c_str(), (unsigned)spec.speed);
+
+    if (spec.pat == LedPat::Solid) {
+        setLeds(spec.c1);  // 動かない
+        return;
+    }
+    slide_led = spec;
+    slide_led_active = true;
+    slide_led_next_ms = 0;
+}
+
+// パターンのフレームを 30ms ごとに出す（ループ内で呼ぶ）
+void updateSlideLed(uint32_t now) {
+    if (!slide_led_active || now < slide_led_next_ms || !led_io) return;
+    slide_led_next_ms = now + 30;
+    LedColor frame[kLedCount];
+    renderSlideLed(slide_led, now, frame);
+    for (int i = 0; i < kLedCount; ++i) {
+        led_io->setLedColor(i, frame[i].r, frame[i].g, frame[i].b);
+    }
+    led_io->refreshLeds();
+    static uint32_t next_log_ms = 0;
+    if (now >= next_log_ms) {  // デバッグ: 1 秒ごとに送っている色を出す
+        next_log_ms = now + 1000;
+        Serial.printf("[SLIDE] led frame led0=(%u,%u,%u) led6=(%u,%u,%u)\n",
+                      frame[0].r, frame[0].g, frame[0].b, frame[6].r, frame[6].g, frame[6].b);
     }
 }
 
@@ -443,11 +697,10 @@ void applySlide(uint32_t now) {
 
     String bubble = String(slide_applied_h + 1) + ". " + slide_pending.title;
     if (slide_pending.title.isEmpty()) bubble = String(slide_applied_h + 1) + "ページ目";
-    slide_bubble_text = bubble;
-    avatar.setSpeechText(slide_bubble_text.c_str());
+    bubble_scroll.start(bubble, 4000, now);
     slide_bubble_clear_ms = now + 4000;
 
-    if (!slide_pending.led.isEmpty()) applySlideLed(slide_pending.led);
+    applySlideLed(slide_pending.led);  // 空なら LED を消す（HermesLLM と同じ）
 
     // 首の動き: MANUAL で操作中は動かさない
     if (manualDriveActive() || !head_ready) return;
@@ -472,6 +725,7 @@ void updateSlides(uint32_t now) {
     // スライドモードが無効、または reveal.js が切れたら、状態表示に戻す
     const bool want = slide_mode_on && slide_ws.connected();
     if (!want) {
+        slide_led_active = false;
         if (slide_active) {
             slide_active = false;
             stopSlideMotion();
@@ -500,9 +754,10 @@ void updateSlides(uint32_t now) {
 
     if (slide_greeting_request && !greeting.playing()) {
         slide_greeting_request = false;
-        playGreeting();
+        playGreeting(now);
     }
     greeting.tick();
+    updateSpeechMotion(now);
 
     if (slide_pending.pending) {
         slide_pending.pending = false;
@@ -511,10 +766,13 @@ void updateSlides(uint32_t now) {
         }
     }
 
+    bubble_scroll.tick(now);
     if (slide_bubble_clear_ms && now >= slide_bubble_clear_ms) {
         slide_bubble_clear_ms = 0;
+        bubble_scroll.stop();
         avatar.setSpeechText("");
     }
+    updateSlideLed(now);
     if (motion_steps && now >= motion_next_ms) runMotionStep(now);
     if (spinning && now >= spin_end_ms) {
         head_servo.spinEnd();
@@ -523,16 +781,35 @@ void updateSlides(uint32_t now) {
 }
 
 // --- 本体の設定画面 --------------------------------------------------------
-// 画面の右上隅をタップで開く。項目: スライドモード / 音量 / 明るさ / Wi-Fi 候補。
-// 閉じると /settings.json に保存する。開いている間は顔とスライドを止める。
+// 画面の右上隅をタップで開く。項目: スライドモード / MAVLink / 音量（メーター）/ 明るさ（メーター）/ Wi-Fi 候補 / 再キャリブレーション。
+// メーターはバーをタップ、またはドラッグして値を決める。閉じると /settings.json に保存する。
+// 開いている間は顔とスライドを止める。
 
 DeviceSettings dev;
 bool settings_open = false;
 
-constexpr int kSettingsRowY[4] = {44, 84, 124, 164};  // スライド / 音量 / 明るさ / Wi-Fi
-constexpr int kSettingsRowH = 36;
-constexpr int kSettingsCloseY = 206;
-constexpr int kSettingsCloseH = 30;
+constexpr int kSettingsRowY[5] = {36, 68, 100, 132, 164};  // スライド / MAVLink / 音量 / 明るさ / Wi-Fi
+constexpr int kSettingsRowH = 30;
+constexpr int kSettingsCalibY = 200;  // 再キャリブレーションのボタン
+constexpr int kSettingsCalibH = 30;
+constexpr int kMeterX = 120;   // メーターの左端
+constexpr int kMeterW = 188;   // メーターの幅
+constexpr int kMeterH = 16;
+
+// メーターの 1 行を描く（ラベルと値、バー）
+void drawMeter(int row_y, const char* label, int value, int vmin, int vmax) {
+    char text[32];
+    snprintf(text, sizeof(text), "%s %d", label, value);
+    M5.Display.setCursor(12, row_y + 7);
+    M5.Display.print(text);
+
+    M5.Display.fillRect(kMeterX, row_y + 7, kMeterW, kMeterH, TFT_DARKGREY);
+    const int span = vmax - vmin;
+    int fill = span > 0 ? (value - vmin) * kMeterW / span : 0;
+    if (fill < 0) fill = 0;
+    if (fill > kMeterW) fill = kMeterW;
+    M5.Display.fillRect(kMeterX, row_y + 7, fill, kMeterH, TFT_GREEN);
+}
 
 void drawSettingsScreen() {
     M5.Display.fillScreen(TFT_BLACK);
@@ -540,34 +817,26 @@ void drawSettingsScreen() {
     M5.Display.setFont(&fonts::efontJA_16);
     M5.Display.setTextSize(1);
 
-    M5.Display.setCursor(8, 12);
+    M5.Display.setCursor(8, 10);
     M5.Display.print("設定");
+    if (WiFi.status() == WL_CONNECTED) {
+        M5.Display.setCursor(60, 10);
+        char ip_line[32];
+        snprintf(ip_line, sizeof(ip_line), "IP %s", WiFi.localIP().toString().c_str());
+        M5.Display.print(ip_line);
+    }
 
-    char line[64];
-    M5.Display.setCursor(12, kSettingsRowY[0] + 10);
+    M5.Display.setCursor(12, kSettingsRowY[0] + 7);
     M5.Display.print(dev.slide_mode ? "スライドモード: ON" : "スライドモード: OFF");
 
-    M5.Display.setCursor(12, kSettingsRowY[1] + 10);
-    snprintf(line, sizeof(line), "音量: %u", (unsigned)dev.volume);
-    M5.Display.print(line);
-    M5.Display.fillRoundRect(200, kSettingsRowY[1] + 4, 50, kSettingsRowH - 8, 4, TFT_DARKGREY);
-    M5.Display.fillRoundRect(256, kSettingsRowY[1] + 4, 50, kSettingsRowH - 8, 4, TFT_DARKGREY);
-    M5.Display.setCursor(218, kSettingsRowY[1] + 10);
-    M5.Display.print("-");
-    M5.Display.setCursor(274, kSettingsRowY[1] + 10);
-    M5.Display.print("+");
+    M5.Display.setCursor(12, kSettingsRowY[1] + 7);
+    M5.Display.print(dev.mav_enabled ? "MAVLink: ON" : "MAVLink: OFF");
 
-    M5.Display.setCursor(12, kSettingsRowY[2] + 10);
-    snprintf(line, sizeof(line), "明るさ: %u", (unsigned)dev.brightness);
-    M5.Display.print(line);
-    M5.Display.fillRoundRect(200, kSettingsRowY[2] + 4, 50, kSettingsRowH - 8, 4, TFT_DARKGREY);
-    M5.Display.fillRoundRect(256, kSettingsRowY[2] + 4, 50, kSettingsRowH - 8, 4, TFT_DARKGREY);
-    M5.Display.setCursor(218, kSettingsRowY[2] + 10);
-    M5.Display.print("-");
-    M5.Display.setCursor(274, kSettingsRowY[2] + 10);
-    M5.Display.print("+");
+    drawMeter(kSettingsRowY[2], "音量", dev.volume, 0, 100);
+    drawMeter(kSettingsRowY[3], "明るさ", dev.brightness, 25, 255);
 
-    M5.Display.setCursor(12, kSettingsRowY[3] + 10);
+    char line[64];
+    M5.Display.setCursor(12, kSettingsRowY[4] + 7);
     if (settings.wifi_count > 0 && dev.wifi_index < settings.wifi_count) {
         snprintf(line, sizeof(line), "Wi-Fi: %s", settings.wifi[dev.wifi_index].ssid.c_str());
     } else {
@@ -575,9 +844,19 @@ void drawSettingsScreen() {
     }
     M5.Display.print(line);
 
-    M5.Display.fillRoundRect(8, kSettingsCloseY, 304, kSettingsCloseH, 4, TFT_DARKGREEN);
-    M5.Display.setCursor(120, kSettingsCloseY + 7);
-    M5.Display.print("閉じる（保存）");
+    const int back_x = M5.Display.width() - 84;  // 右上隅（入るときと同じ位置）
+    M5.Display.fillRoundRect(back_x, 4, 80, 26, 4, TFT_DARKGREEN);
+    M5.Display.setCursor(back_x + 8, 8);
+    M5.Display.print("戻る >");
+
+    // 再キャリブレーション（水平の基準を取り直す）
+    const char* calib_label = "再キャリブレーション";
+    if (calibration_started) calib_label = "キャリブレーション中...";
+    else if (vehicle->armed()) calib_label = "ARM中は実行できません";
+    else if (!imu_ready) calib_label = "IMU がありません";
+    M5.Display.fillRoundRect(8, kSettingsCalibY, 304, kSettingsCalibH, 4, TFT_DARKGREY);
+    M5.Display.setCursor(20, kSettingsCalibY + 7);
+    M5.Display.print(calib_label);
 }
 
 void openSettingsScreen() {
@@ -590,10 +869,10 @@ void openSettingsScreen() {
 void closeSettingsScreen() {
     saveDeviceSettings(dev);
     settings_open = false;
-    avatar.resume();
-    face_refresh_needed = true;
     M5.Display.setFont(&fonts::Font0);
     M5.Display.fillScreen(TFT_BLACK);
+    avatar.resume();  // HermesLLM と同じ順番（画面を消してから再開する）
+    face_refresh_needed = true;
     Serial.println("[SET] settings saved and closed");
 }
 
@@ -601,43 +880,99 @@ bool inRect(int x, int y, int rx, int ry, int rw, int rh) {
     return x >= rx && x < rx + rw && y >= ry && y < ry + rh;
 }
 
+// バーの x 位置から値を決める（5 刻み）
+int meterValueAt(int x, int vmin, int vmax) {
+    int v = vmin + (x - kMeterX) * (vmax - vmin) / kMeterW;
+    if (v < vmin) v = vmin;
+    if (v > vmax) v = vmax;
+    return (v / 5) * 5 < vmin ? vmin : (v / 5) * 5;
+}
+
+// MAVLink の ON/OFF を切り替える（再起動なし）。
+// OFF: 機体を DISARM・HOLD に戻し、通信を止める。ON: 次の接続で UDP を開き直す（ensureNetwork）。
+void setMavlinkEnabled(bool on) {
+    dev.mav_enabled = on;
+    mav_enabled = on;
+    if (!on) {
+        vehicle->resetState();
+        if (udp_open) {
+            udp.stop();
+            udp_open = false;
+            peer_known = false;
+        }
+    }
+    Serial.printf("[SET] MAVLink %s\n", on ? "ON" : "OFF");
+}
+
 // 設定画面のタッチ処理。設定画面を開いている間は true を返す。
 bool updateSettingsScreen(uint32_t now) {
     (void)now;
     auto t = M5.Touch.getDetail(0);
-    if (!t.wasPressed()) return settings_open;
 
     if (!settings_open) {
         // 右上隅（画面の幅の右端 60px、上端 60px）で開く
-        if (t.x > M5.Display.width() - 60 && t.y < 60) openSettingsScreen();
+        if (t.wasPressed() && t.x > M5.Display.width() - 60 && t.y < 60) openSettingsScreen();
         return settings_open;
     }
 
+    // キャリブレーションの開始・終了に合わせて、ボタンの表示を更新する
+    static bool last_calib_state = false;
+    if (calibration_started != last_calib_state) {
+        last_calib_state = calibration_started;
+        drawSettingsScreen();
+    }
+
+    if (!t.wasPressed() && !t.isPressed()) return true;
+
     const int x = t.x;
     const int y = t.y;
-    if (inRect(x, y, 8, kSettingsCloseY, 304, kSettingsCloseH)) {
+
+    // メーターはタップとドラッグの両方で値を変える
+    const bool on_volume = inRect(x, y, kMeterX - 8, kSettingsRowY[2], kMeterW + 16, kSettingsRowH);
+    const bool on_bright = inRect(x, y, kMeterX - 8, kSettingsRowY[3], kMeterW + 16, kSettingsRowH);
+    if (on_volume) {
+        const int v = meterValueAt(x, 0, 100);
+        if (v != dev.volume) {
+            dev.volume = static_cast<uint8_t>(v);
+            settings.volume = dev.volume;
+            M5.Speaker.setVolume(static_cast<uint8_t>(dev.volume * 255 / 100));  // 設定は 0〜100、スピーカーは 0〜255
+            drawSettingsScreen();
+        }
+        return true;
+    }
+    if (on_bright) {
+        const int v = meterValueAt(x, 25, 255);
+        if (v != dev.brightness) {
+            dev.brightness = static_cast<uint8_t>(v);
+            M5.Display.setBrightness(dev.brightness);
+            drawSettingsScreen();
+        }
+        return true;
+    }
+
+    if (!t.wasPressed()) return true;  // 以下はタップだけ
+
+    if (inRect(x, y, M5.Display.width() - 90, 0, 90, 40)) {  // 右上隅: 通常画面へ戻る（保存する）
         closeSettingsScreen();
         return false;
+    }
+    if (inRect(x, y, 8, kSettingsCalibY, 304, kSettingsCalibH)) {
+        // 水平の基準を取り直す（ARM 中とセンサ無しは実行しない）
+        if (imu_ready && !vehicle->armed() && !calibration_started) {
+            attitude.beginCalibration();
+            calibration_started = true;
+            calibration_end_ms = millis() + kCalibrationMs;
+            Serial.println("[SET] re-calibration started from settings: keep still");
+        }
+        drawSettingsScreen();
+        return true;
     }
     if (inRect(x, y, 0, kSettingsRowY[0], 320, kSettingsRowH)) {
         dev.slide_mode = !dev.slide_mode;
         slide_mode_on = dev.slide_mode;
     } else if (inRect(x, y, 0, kSettingsRowY[1], 320, kSettingsRowH)) {
-        if (inRect(x, y, 200, kSettingsRowY[1], 50, kSettingsRowH)) {
-            dev.volume = dev.volume >= 10 ? dev.volume - 10 : 0;
-        } else if (inRect(x, y, 256, kSettingsRowY[1], 50, kSettingsRowH)) {
-            dev.volume = dev.volume <= 90 ? dev.volume + 10 : 100;
-        }
-        settings.volume = dev.volume;
-        M5.Speaker.setVolume(dev.volume);
-    } else if (inRect(x, y, 0, kSettingsRowY[2], 320, kSettingsRowH)) {
-        if (inRect(x, y, 200, kSettingsRowY[2], 50, kSettingsRowH)) {
-            dev.brightness = dev.brightness >= 50 ? dev.brightness - 25 : 25;
-        } else if (inRect(x, y, 256, kSettingsRowY[2], 50, kSettingsRowH)) {
-            dev.brightness = dev.brightness <= 230 ? dev.brightness + 25 : 255;
-        }
-        M5.Display.setBrightness(dev.brightness);
-    } else if (inRect(x, y, 0, kSettingsRowY[3], 320, kSettingsRowH)) {
+        setMavlinkEnabled(!dev.mav_enabled);
+    } else if (inRect(x, y, 0, kSettingsRowY[4], 320, kSettingsRowH)) {
         // 次の候補へ切り替える。接続し直して、新しい候補から接続する
         if (settings.wifi_count > 0) {
             dev.wifi_index = (dev.wifi_index + 1) % settings.wifi_count;
@@ -688,6 +1023,7 @@ void setup() {
     auto cfg = M5.config();
     M5.begin(cfg);
     Serial.begin(115200);
+    M5.Speaker.begin();  // 挨拶の WAV 再生に必要（HermesLLM の setup と同じ）
     Serial.println("[MAV] MAVStackchan Phase 1 boot");
 
     settings_loaded = loadSettings();
@@ -695,6 +1031,7 @@ void setup() {
     dev.slide_mode = settings.slide_mode;
     dev.volume = settings.volume;
     loadDeviceSettings(dev);
+    mav_enabled = dev.mav_enabled;
     settings.volume = dev.volume;
     if (dev.wifi_index >= settings.wifi_count) dev.wifi_index = 0;
     wifi_index = dev.wifi_index;
@@ -751,10 +1088,14 @@ void loop() {
     updatePosition(now_ms);
     updateLevelCalibration(now_ms);
     updateImu(now_ms);
+    if (ip_bubble_until_ms && now_ms >= ip_bubble_until_ms) {
+        ip_bubble_until_ms = 0;
+        if (!settings_open) avatar.setSpeechText("");  // 設定画面の表示中は顔に触らない
+    }
     const bool in_settings = updateSettingsScreen(now_ms);  // 右上隅のタップで設定画面
     if (!in_settings) updateSlides(now_ms);
     updateHead(now_ms);
-    vehicle->tick(now_ms);
+    if (mav_enabled) vehicle->tick(now_ms);
     reportLinkChange();
     updateFace(now_ms);
 

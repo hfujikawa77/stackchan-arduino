@@ -82,6 +82,8 @@ public:
     void tick(uint32_t now_ms);
 
     bool gcsLinked() const { return gcs_linked_; }
+    // MAVLink を止めるときに呼ぶ。DISARM・HOLD・未接続の初期状態に戻す（再起動なしで使う）。
+    void resetState();
     bool armed() const { return armed_; }
     VehicleMode mode() const { return mode_; }
 
