@@ -16,6 +16,11 @@ wifi_list:
   # - ssid: "backup-ssid"
   #   password: "backup-password"
 
+# プレゼンモード（reveal.js 連携）。1 で ON、0 または省略で OFF。
+slide_mode: 0
+# 挨拶などの音量（0〜100）。省略時 80
+volume: 80
+
 # 位置の取得先（Cloudflare Worker）。HermesLLM の SC_SecConfig.yaml と同じ値を書く。
 # 省略すると位置は送らない。
 digest_url: "https://stackchan-digest.<your-subdomain>.workers.dev"

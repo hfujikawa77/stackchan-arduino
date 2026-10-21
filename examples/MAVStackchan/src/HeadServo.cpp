@@ -48,6 +48,30 @@ void HeadServo::setTarget(float pan, float tilt) {
     target_tilt_ = fminf(fmaxf(tilt, t.lower), t.upper);
 }
 
+void HeadServo::moveTo(float pan, float tilt, uint32_t ms) {
+    if (!ready_) return;
+    const HeadLimits p = panLimits();
+    const HeadLimits t = tiltLimits();
+    const float x = fminf(fmaxf(pan, p.lower), p.upper);
+    const float y = fminf(fmaxf(tilt, t.lower), t.upper);
+    servo_.moveXY(static_cast<int>(x), static_cast<int>(y), ms);
+    last_pan_ = x;
+    last_tilt_ = y;
+    target_pan_ = x;
+    target_tilt_ = y;
+}
+
+void HeadServo::spinBegin() {
+    if (!ready_) return;
+    servo_.turnXBegin(500, false);
+}
+
+void HeadServo::spinEnd() {
+    if (!ready_) return;
+    servo_.turnXEnd();
+    moveTo(panLimits().center, tiltLimits().center, 500);
+}
+
 void HeadServo::update(uint32_t now_ms) {
     if (!ready_ || now_ms < next_send_ms_) return;
 

@@ -26,6 +26,12 @@ public:
     // 定期的に呼ぶ。目標が動いたときだけ、一定の間隔でサーボへ送る。
     void update(uint32_t now_ms);
 
+    // スライドの動き用: 指定の角度へ、指定の時間で 1 回だけ動かす（範囲内に収める）。
+    void moveTo(float pan, float tilt, uint32_t ms);
+    // スライドの回転（スピン）。開始と終了。終了で中立へ戻す。
+    void spinBegin();
+    void spinEnd();
+
 private:
     StackchanSERVO servo_;
     bool ready_ = false;

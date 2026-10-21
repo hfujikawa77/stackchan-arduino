@@ -88,6 +88,35 @@ Phase 2 で追加したもの:
 
 **不感帯**: スティックの中央付近（±5%）は中立として扱います。
 
+## プレゼンモード（reveal.js 連携）
+
+HermesLLM のプレゼンモードを移植しています。既定は OFF です。
+
+**有効にする**: `data/yaml/SC_SecConfig.yaml` に次の 1 行を入れて、`uploadfs` します。
+```yaml
+slide_mode: 1
+```
+
+**ブラウザ側**: reveal.js のプレゼンに、`examples/HermesLLM/revealjs-bridge/stackchan-bridge.js` を読み込みます。
+ページの URL に `?sc=<機体の IP>` を付けて開きます（例: `http://localhost:8000/?sc=192.168.3.4`）。
+- `https` のページからは `ws://` に接続できません。`http://localhost` か `file://` で開いてください。
+
+**操作**:
+- 頭上でスワイプ → スライドの前後（next / prev）
+- 頭上で 2 回タップ → 挨拶の音声（`intro.wav` → `outro.wav` → 交互）
+
+**スライドごとの指定**（HTML の `data-` 属性）:
+- `data-stackchan-title`: 吹き出しの文字（省略時は見出し）
+- `data-stackchan-motion`: `nod`（既定）/ `shake` / `spin` / `none`
+- `data-stackchan-expression`: `neutral` / `happy` / `sad` / `angry` / `doubt` / `sleepy`（省略時は 6 枚ごとの循環）
+- `data-stackchan-led`: LED の色。例: `{"color":"#0078C8"}`。次のスライドで置き換えます。
+
+**注意**:
+- 手動操作（ARM かつ MANUAL）で頭を動かしている間は、スライドの首の動きを行いません。
+- LED のパターン（breath など）は未対応で、色だけ反映します。
+- 挨拶の音声は、HermesLLM の `intro.wav` / `outro.wav` を使っています。内容は後で差し替えます。
+- 紹介文や紹介音声の機能は入れていません（発表者が話します）。
+
 ## 位置と高度の方針（指示書からの変更）
 
 - **位置（緯度・経度）**: 指示書の「GPS は不要」を変更し、Cloudflare Worker（`GET /location`）に保存されたスマホの最後の位置を使います。機体自身の GPS は使いません。

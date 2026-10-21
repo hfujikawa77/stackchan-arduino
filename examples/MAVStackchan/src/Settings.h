@@ -21,6 +21,8 @@ struct MavSettings {
     uint16_t udp_port = 14550; // mav: udp_port（MAVLink 2 の標準 UDP ポート）
     String digest_url;         // 位置の取得先（Cloudflare Worker）。HermesLLM と同じトップレベルのキー
     String digest_token;       // Worker の Bearer トークン（SHARED_TOKEN）
+    bool slide_mode = false;   // スライドモード（reveal.js 連携）。既定は OFF。SC_SecConfig.yaml の slide_mode: 1 で ON
+    uint8_t volume = 80;       // 挨拶などの音量
 };
 
 // YAML 本文を解析して out に反映する。

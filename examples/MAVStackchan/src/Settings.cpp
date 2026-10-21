@@ -67,6 +67,11 @@ void parseSettingsYaml(const String& yaml, MavSettings& out) {
                 out.digest_url = value;
             } else if (key == "digest_token" && !value.isEmpty()) {
                 out.digest_token = value;
+            } else if (key == "slide_mode") {
+                out.slide_mode = (value == "1" || value == "true" || value == "on");
+            } else if (key == "volume") {
+                const int v = value.toInt();
+                if (v >= 0 && v <= 100) out.volume = static_cast<uint8_t>(v);
             }
             continue;
         }

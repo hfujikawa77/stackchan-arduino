@@ -15,11 +15,14 @@
 
 #include "AttitudeEstimator.h"
 #include "FaceStatus.h"
+#include "Greeting.h"
 #include "HeadServo.h"
+#include "HeadTouch.h"
 #include "ManualControl.h"
 #include "MavlinkVehicle.h"
 #include "PhoneLocation.h"
 #include "Settings.h"
+#include "SlideBridge.h"
 #include "Stackchan_system_config.h"
 
 // サーボ設定（SC_BasicConfig.yaml）。HeadServo.cpp から extern で参照する。
@@ -54,6 +57,16 @@ uint32_t calibration_end_ms = 0;
 uint32_t last_imu_ms = 0;
 
 WiFiUDP udp;
+// --- スライドモード（reveal.js 連携）の共有状態 ---
+SlideBridge slide_ws;     // GET /servo-ws
+HeadTouch head_touch;     // 頭上タッチ（スワイプ・2 回タップ）
+Greeting greeting;        // 挨拶の WAV（intro / outro）
+bool slide_mode_on = false;     // 設定（既定 OFF）
+bool slide_active = false;      // スライドの表示を適用中（状態表示より優先）
+bool face_refresh_needed = false;
+bool slide_server_started = false;
+bool slideMotionBusy();         // 首の動き（ステップ・回転）中か。updateHead が書き込みを止めるのに使う
+
 bool udp_open = false;
 IPAddress broadcast_ip;
 IPAddress peer_ip;
@@ -98,6 +111,10 @@ bool loadSettings() {
 
 void ensureNetwork(uint32_t now_ms) {
     if (WiFi.status() == WL_CONNECTED) {
+        if (!slide_server_started) {
+            slide_ws.begin(80);
+            slide_server_started = true;
+        }
         if (!udp_open && udp.begin(settings.udp_port)) {
             udp_open = true;
             const uint32_t ip = static_cast<uint32_t>(WiFi.localIP());
@@ -157,6 +174,7 @@ void pumpNetwork(uint32_t now_ms) {
 // それ以外（DISARM・HOLD・入力途絶え・GCS 切断）は中立に戻す。
 void updateHead(uint32_t now_ms) {
     if (!head_ready) return;
+    if (slideMotionBusy()) return;  // スライドの首の動きが優先（終わるまで手動追従を止める）
 
     const MavlinkVehicle::ManualInput in = vehicle->manualInput(now_ms);
     if (in.active) {
@@ -285,6 +303,224 @@ void setLeds(const LedColor& c) {
     led_io->refreshLeds();
 }
 
+// --- スライドモード ----------------------------------------------------------
+// 頭上のスワイプでスライドを前後させ（{"type":"control"}）、2 回タップで挨拶。
+// reveal.js からの {"type":"slide"} で表情・吹き出し・LED・首の動きを切り替える。
+// 首の動きは、手動（ARM かつ MANUAL）で動かしている間は行わない（安全側）。
+
+struct MotionStep { int8_t dpan; int8_t dtilt; uint16_t ms; uint16_t after_ms; };  // 中立からの相対角
+const MotionStep kSlideNod[] = {{0, -18, 180, 260}, {0, 0, 220, 0}};
+const MotionStep kSlideShake[] = {{22, 0, 150, 190}, {-22, 0, 150, 190}, {0, 0, 150, 0}};
+const MotionStep* motion_steps = nullptr;
+uint8_t motion_n = 0;
+uint8_t motion_i = 0;
+uint32_t motion_next_ms = 0;
+bool spinning = false;
+uint32_t spin_end_ms = 0;
+
+struct SlidePending {
+    bool pending = false;
+    int h = 0;
+    int v = 0;
+    String title;
+    String motion = "nod";
+    String expr;
+    String led;  // 空 = LED は変えない
+};
+SlidePending slide_pending;
+int slide_applied_h = -1;
+int slide_applied_v = -1;
+uint32_t slide_bubble_clear_ms = 0;
+uint32_t slide_next_control_ms = 0;
+bool slide_greeting_request = false;
+bool slide_greeting_outro = false;
+String slide_bubble_text;  // avatar に渡す文字列（参照が残るので保持する）
+
+bool manualDriveActive() {
+    return vehicle->armed() && vehicle->mode() == VehicleMode::Manual;
+}
+
+bool slideMotionBusy() {
+    return motion_steps != nullptr || spinning;
+}
+
+void stopSlideMotion() {
+    motion_steps = nullptr;
+    if (spinning) {
+        head_servo.spinEnd();
+        spinning = false;
+    }
+}
+
+void runMotionStep(uint32_t now) {
+    if (!motion_steps) return;
+    const MotionStep& st = motion_steps[motion_i++];
+    const HeadLimits pan = head_servo.panLimits();
+    const HeadLimits tilt = head_servo.tiltLimits();
+    head_servo.moveTo(pan.center + st.dpan, tilt.center + st.dtilt, st.ms);
+    if (motion_i >= motion_n) {
+        motion_steps = nullptr;
+    } else {
+        motion_next_ms = now + st.after_ms;
+    }
+}
+
+void startMotion(const MotionStep* steps, uint8_t n, uint32_t now) {
+    motion_steps = steps;
+    motion_n = n;
+    motion_i = 0;
+    runMotionStep(now);
+}
+
+// 挨拶: 1 回目 intro、次 outro、交互。非同期なので、ループは止まらない。
+void playGreeting() {
+    const char* path = slide_greeting_outro ? "/audio/outro.wav" : "/audio/intro.wav";
+    if (greeting.start(path, settings.volume)) {
+        slide_greeting_outro = !slide_greeting_outro;
+        Serial.printf("[SLIDE] greeting: %s\n", path);
+    } else {
+        Serial.printf("[SLIDE] greeting not played: %s\n", path);
+    }
+}
+
+// reveal.js からの JSON を受ける（SlideBridge のハンドラ）
+void onSlideMessage(const char* json, void* /*ctx*/) {
+    JsonDocument doc;
+    if (deserializeJson(doc, json)) return;
+    const char* type = doc["type"] | "";
+    if (strcmp(type, "slide") != 0) return;  // ping など
+    if (!slide_mode_on) return;
+    slide_pending.h = doc["indexh"] | 0;
+    slide_pending.v = doc["indexv"] | 0;
+    slide_pending.title = doc["title"] | "";
+    slide_pending.motion = doc["motion"] | "nod";
+    slide_pending.expr = doc["expression"] | "";
+    slide_pending.led = "";
+    if (doc["led"].is<JsonObject>()) serializeJson(doc["led"], slide_pending.led);
+    slide_pending.pending = true;
+}
+
+// LED 指定（data-stackchan-led）。色だけ反映する（パターンは未対応）
+void applySlideLed(const String& json) {
+    JsonDocument doc;
+    if (deserializeJson(doc, json)) return;
+    if (doc["off"] | false) {
+        setLeds(LedColor{0, 0, 0});
+        return;
+    }
+    const String color = doc["color"] | "";
+    if (color.length() == 7 && color[0] == '#') {
+        const uint8_t r = static_cast<uint8_t>(strtol(color.substring(1, 3).c_str(), nullptr, 16));
+        const uint8_t g = static_cast<uint8_t>(strtol(color.substring(3, 5).c_str(), nullptr, 16));
+        const uint8_t b = static_cast<uint8_t>(strtol(color.substring(5, 7).c_str(), nullptr, 16));
+        setLeds(LedColor{r, g, b});
+    }
+}
+
+void applySlideExpression(const String& expr, int h) {
+    static const m5avatar::Expression table[] = {
+        m5avatar::Expression::Neutral, m5avatar::Expression::Happy, m5avatar::Expression::Doubt,
+        m5avatar::Expression::Sad, m5avatar::Expression::Angry, m5avatar::Expression::Sleepy,
+    };
+    m5avatar::Expression e = table[(h < 0 ? 0 : h) % 6];  // 6 枚ごとに循環（HermesLLM と同じ）
+    if (expr == "neutral") e = m5avatar::Expression::Neutral;
+    else if (expr == "happy") e = m5avatar::Expression::Happy;
+    else if (expr == "sad") e = m5avatar::Expression::Sad;
+    else if (expr == "angry") e = m5avatar::Expression::Angry;
+    else if (expr == "doubt") e = m5avatar::Expression::Doubt;
+    else if (expr == "sleepy") e = m5avatar::Expression::Sleepy;
+    avatar.setExpression(e);
+}
+
+// スライドの表示を適用する（表情・吹き出し・LED・首の動き）
+void applySlide(uint32_t now) {
+    slide_applied_h = slide_pending.h;
+    slide_applied_v = slide_pending.v;
+    slide_active = true;
+
+    applySlideExpression(slide_pending.expr, slide_applied_h);
+
+    String bubble = String(slide_applied_h + 1) + ". " + slide_pending.title;
+    if (slide_pending.title.isEmpty()) bubble = String(slide_applied_h + 1) + "ページ目";
+    slide_bubble_text = bubble;
+    avatar.setSpeechText(slide_bubble_text.c_str());
+    slide_bubble_clear_ms = now + 4000;
+
+    if (!slide_pending.led.isEmpty()) applySlideLed(slide_pending.led);
+
+    // 首の動き: MANUAL で操作中は動かさない
+    if (manualDriveActive() || !head_ready) return;
+    if (slide_pending.motion == "none") return;
+    if (slide_pending.motion == "shake") {
+        startMotion(kSlideShake, sizeof(kSlideShake) / sizeof(kSlideShake[0]), now);
+    } else if (slide_pending.motion == "spin") {
+        head_servo.spinBegin();
+        spinning = true;
+        spin_end_ms = now + 2000;
+    } else {
+        startMotion(kSlideNod, sizeof(kSlideNod) / sizeof(kSlideNod[0]), now);
+    }
+}
+
+// 毎ループ呼ぶ。接続・タッチ・挨拶・スライド適用・首の動きを進める。
+void updateSlides(uint32_t now) {
+    static uint32_t next_touch_ms = 0;
+
+    slide_ws.tick(now, onSlideMessage, nullptr);
+
+    // スライドモードが無効、または reveal.js が切れたら、状態表示に戻す
+    const bool want = slide_mode_on && slide_ws.connected();
+    if (!want) {
+        if (slide_active) {
+            slide_active = false;
+            stopSlideMotion();
+            avatar.setSpeechText("");
+            face_refresh_needed = true;
+        }
+        return;
+    }
+
+    // MANUAL で操作中は、スライドの首の動きを止める（安全側）
+    if (manualDriveActive()) stopSlideMotion();
+
+    // 頭上タッチ（20ms ごと）
+    if (now >= next_touch_ms) {
+        next_touch_ms = now + 20;
+        head_touch.poll(now);
+    }
+    const bool fwd = head_touch.takeSwipeForward();
+    const bool back = head_touch.takeSwipeBackward();
+    if ((fwd || back) && now >= slide_next_control_ms) {
+        slide_next_control_ms = now + 500;  // 1 回のスワイプで 1 回だけ送る
+        slide_ws.sendText(fwd ? "{\"type\":\"control\",\"action\":\"next\"}"
+                              : "{\"type\":\"control\",\"action\":\"prev\"}");
+    }
+    if (head_touch.takeDoubleTap()) slide_greeting_request = true;
+
+    if (slide_greeting_request && !greeting.playing()) {
+        slide_greeting_request = false;
+        playGreeting();
+    }
+    greeting.tick();
+
+    if (slide_pending.pending) {
+        slide_pending.pending = false;
+        if (!(slide_pending.h == slide_applied_h && slide_pending.v == slide_applied_v)) {
+            applySlide(now);
+        }
+    }
+
+    if (slide_bubble_clear_ms && now >= slide_bubble_clear_ms) {
+        slide_bubble_clear_ms = 0;
+        avatar.setSpeechText("");
+    }
+    if (motion_steps && now >= motion_next_ms) runMotionStep(now);
+    if (spinning && now >= spin_end_ms) {
+        head_servo.spinEnd();
+        spinning = false;
+    }
+}
+
 void updateFace(uint32_t now_ms) {
     static uint32_t next_ms = 0;
     static bool has_last = false;
@@ -294,6 +530,11 @@ void updateFace(uint32_t now_ms) {
 
     if (now_ms < next_ms) return;
     next_ms = now_ms + kFaceIntervalMs;
+    if (slide_active) return;  // スライドの表示中は状態表示を出さない
+    if (face_refresh_needed) {
+        face_refresh_needed = false;
+        has_last = false;
+    }
 
     const StatusView v = statusViewFor(calibration_started, vehicle->gcsLinked(),
                                        vehicle->armed(), vehicle->mode() == VehicleMode::Manual);
@@ -340,6 +581,12 @@ void setup() {
         setLeds(LedColor{0, 0, 0});
     }
 
+    slide_mode_on = settings.slide_mode;
+    if (slide_mode_on) {
+        head_touch.begin();
+        Serial.println("[SLIDE] slide mode ON");
+    }
+
     MavlinkVehicle::Config vehicle_cfg;
     vehicle_cfg.system_id = settings.system_id;
     vehicle = new MavlinkVehicle(vehicle_cfg, sendToNetwork, nullptr);
@@ -366,6 +613,7 @@ void loop() {
     updatePosition(now_ms);
     updateLevelCalibration(now_ms);
     updateImu(now_ms);
+    updateSlides(now_ms);
     updateHead(now_ms);
     vehicle->tick(now_ms);
     reportLinkChange();
