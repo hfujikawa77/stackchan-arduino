@@ -100,7 +100,7 @@ async function digestGourmet(env, loc, now) {
     const url =
       "https://webservice.recruit.co.jp/hotpepper/gourmet/v1/" +
       `?key=${encodeURIComponent(env.HOTPEPPER_KEY)}&lat=${loc.lat}&lng=${loc.lon}` +
-      "&range=3&count=20&order=4&format=json";
+      "&range=4&count=20&order=4&format=json";
     const j = await getJson(url);
     if (j.results?.error) throw new Error(`hotpepper: ${JSON.stringify(j.results.error)}`);
     const shops = (j.results?.shop ?? []).map((s) => ({
