@@ -50,3 +50,5 @@ tools/beatmap/*.m4a
 .claude/settings.local.json
 examples/HermesLLM/.claude/settings.local.json
 examples/HermesLLM/logs/
+# Work logs (plans, handoffs, notes)
+examples/logs/
