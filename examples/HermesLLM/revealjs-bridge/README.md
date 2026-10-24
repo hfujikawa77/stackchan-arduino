@@ -46,3 +46,5 @@ Bubble title override: `<section data-stackchan-title="Short title">`.
 (`pattern`: solid, blink, breath, chase, rainbow, wave, split, split_blink, split_breath, split_wave, split_chase, alternate; `color`, `color2` as `#RRGGBB`; `speed` 1-10).
 A preset name also works: `data-stackchan-led="ocean"` (warm_white, cool_blue, alert_red, calm_breath, christmas, ocean, rainbow, party).
 The LED stays until the next slide; a slide without the attribute turns a held LED off.
+
+Explicit expression: `data-stackchan-expression="neutral|happy|sad|angry|doubt|sleepy"` (default: a 6-step cycle by slide index).

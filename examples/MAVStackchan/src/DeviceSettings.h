@@ -12,6 +12,8 @@ struct DeviceSettings {
     uint8_t brightness = 200;  // 画面の明るさ（0〜255）
     uint8_t wifi_index = 0;    // 接続に使う wifi_list の番号
     bool mav_enabled = true;   // MAVLink（QGC との通信）。OFF で音声対話などを使える
+    bool cue_beep = false;     // 状態音（接続・ARM など）: false = 状態ごとの音声、true = 一律のビープ
+    bool greeting_on = true;   // 頭上 2 回タップの挨拶（intro / outro）を鳴らすか
 };
 
 // /settings.json を読む。無ければ false（既定値のまま）。

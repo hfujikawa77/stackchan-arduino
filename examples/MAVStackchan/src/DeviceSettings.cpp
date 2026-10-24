@@ -21,6 +21,8 @@ bool loadDeviceSettings(DeviceSettings& out) {
     out.brightness = doc["brightness"] | out.brightness;
     out.wifi_index = doc["wifi_index"] | out.wifi_index;
     out.mav_enabled = doc["mav_enabled"] | out.mav_enabled;
+    out.cue_beep = doc["cue_beep"] | out.cue_beep;
+    out.greeting_on = doc["greeting_on"] | out.greeting_on;
     return true;
 }
 
@@ -31,6 +33,8 @@ bool saveDeviceSettings(const DeviceSettings& in) {
     doc["brightness"] = in.brightness;
     doc["wifi_index"] = in.wifi_index;
     doc["mav_enabled"] = in.mav_enabled;
+    doc["cue_beep"] = in.cue_beep;
+    doc["greeting_on"] = in.greeting_on;
 
     File f = SPIFFS.open(kPath, "w");
     if (!f) return false;

@@ -93,10 +93,10 @@ bool HeadTouch::takeSwipeBackward() {
     return v;
 }
 
-bool HeadTouch::takeDoubleTap() {
-    if (!tap_finalized_) return false;
+uint8_t HeadTouch::takeTapCount() {
+    if (!tap_finalized_) return 0;
     tap_finalized_ = false;
     const uint8_t n = tap_count_result_;
     tap_count_result_ = 0;
-    return n == 2;
+    return n;
 }

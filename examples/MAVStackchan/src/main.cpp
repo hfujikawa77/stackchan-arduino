@@ -70,6 +70,8 @@ bool slide_mode_on = false;     // 設定（既定 OFF）
 bool slide_active = false;      // スライドの表示を適用中（状態表示より優先）
 bool face_refresh_needed = false;
 bool slide_server_started = false;
+DeviceSettings dev;       // 本体の設定画面の値（/settings.json）
+bool settings_open = false;  // 設定画面を開いているか
 bool mav_enabled = true;  // MAVLink（QGC との通信）。設定画面から再起動なしで切り替える
 uint32_t ip_bubble_until_ms = 0;  // 接続直後に IP を吹き出しで出す期限（0 = 出していない）
 bool slideMotionBusy();         // 首の動き（ステップ・回転）中か。updateHead が書き込みを止めるのに使う
@@ -416,6 +418,8 @@ bool manualDriveActive() {
 }
 
 bool speech_active = false;  // 挨拶の音声に合わせて、口と首を動かしている
+bool cue_playing = false;    // いま鳴っているのが状態音（接続・ARM など）。口と首は動かさない
+const char* cue_pending = nullptr;  // 再生待ちの状態音（挨拶が鳴っている間は待つ。新しい要求で上書き）
 
 bool slideMotionBusy() {
     return motion_steps != nullptr || spinning || speech_active;
@@ -454,6 +458,7 @@ void playGreeting(uint32_t now) {
     const char* path = slide_greeting_outro ? "/audio/outro.wav" : "/audio/intro.wav";
     const char* text = slide_greeting_outro ? "Thank you, everyone!" : "Hiii, everyone! I'm Stack-chan!";
     if (greeting.start(path, settings.volume)) {
+        cue_playing = false;
         slide_greeting_outro = !slide_greeting_outro;
         Serial.printf("[SLIDE] greeting: %s\n", path);
         // しゃべる内容を吹き出しに出す。音声が終わるまで表示する
@@ -464,6 +469,74 @@ void playGreeting(uint32_t now) {
     }
 }
 
+// --- 状態音（QGC の接続・ARM・モード変更に合わせて鳴らす）-------------------
+// 挨拶と同じ WAV 再生を使う。挨拶や別の状態音が鳴っている間は待ち、終わってから鳴らす。
+// 音だけ鳴らし、吹き出し・口・首の動きは付けない。
+constexpr const char* kCueConnect = "/audio/connect.wav";
+constexpr const char* kCueDisconnect = "/audio/disconnect.wav";
+constexpr const char* kCueArmed = "/audio/armed.wav";
+constexpr const char* kCueDisarmed = "/audio/disarmed.wav";
+constexpr const char* kCueModeManual = "/audio/mode_manual.wav";
+constexpr const char* kCueModeHold = "/audio/mode_hold.wav";
+constexpr const char* kCueBeep = "/audio/beep.wav";  // 設定「ビープ」のときは全部この音
+
+// 状態が変わったときに 1 回だけ要求を出す。同時に複数変わったときは 接続 → ARM → モード の順で 1 つだけ。
+// （接続が切れると GCS タイムアウトで DISARM もされるため、切断音を優先する）
+void reportCueEvents() {
+    static bool prev_linked = false;
+    static bool prev_armed = false;
+    static VehicleMode prev_mode = VehicleMode::Hold;
+
+    const bool linked = vehicle->gcsLinked();
+    const bool armed = vehicle->armed();
+    const VehicleMode mode = vehicle->mode();
+    if (linked != prev_linked) {
+        cue_pending = linked ? kCueConnect : kCueDisconnect;
+    } else if (armed != prev_armed) {
+        cue_pending = armed ? kCueArmed : kCueDisarmed;
+    } else if (mode != prev_mode) {
+        cue_pending = mode == VehicleMode::Manual ? kCueModeManual : kCueModeHold;
+    }
+    prev_linked = linked;
+    prev_armed = armed;
+    prev_mode = mode;
+}
+
+// 挨拶と状態音の再生を進める（毎ループ）。スライドモードの外でも鳴るように、ここで tick する。
+void updateCues() {
+    greeting.tick();
+    if (!greeting.playing()) cue_playing = false;
+    if (!cue_pending || greeting.playing()) return;
+
+    // 設定が「ビープ」なら、どの状態でも同じ音にする
+    const char* path = dev.cue_beep ? kCueBeep : cue_pending;
+    cue_pending = nullptr;
+    if (greeting.start(path, settings.volume)) {
+        cue_playing = true;
+        Serial.printf("[MAV] cue: %s\n", path);
+    } else {
+        Serial.printf("[MAV] cue not played: %s\n", path);
+    }
+}
+
+// 状態音の再生中は、口だけを開け閉めする（頭は動かさない）。設定画面の表示中は顔に触らない。
+void updateCueMouth(uint32_t now) {
+    static uint32_t next_ms = 0;
+    static bool mouth_open = false;
+
+    if (!cue_playing || settings_open) {
+        if (mouth_open) {
+            avatar.setMouthOpenRatio(0.0f);
+            mouth_open = false;
+        }
+        return;
+    }
+    if (now < next_ms) return;
+    next_ms = now + 120;
+    mouth_open = !mouth_open;
+    avatar.setMouthOpenRatio(mouth_open ? random(30, 65) / 100.0f : 0.05f);
+}
+
 // しゃべっている間の動き（HermesLLM の再生中の動きと同じ 7 ステップ）
 // 0〜4: うなずき（上下）と口の開閉 / 5: 左右に振る / 6: 中央へ戻す
 void updateSpeechMotion(uint32_t now) {
@@ -471,7 +544,7 @@ void updateSpeechMotion(uint32_t now) {
     static uint8_t step = 0;
     static bool up = false;
 
-    if (!greeting.playing()) {
+    if (!greeting.playing() || cue_playing) {
         if (speech_active) {
             speech_active = false;
             avatar.setMouthOpenRatio(0.0f);
@@ -750,13 +823,23 @@ void updateSlides(uint32_t now) {
         slide_ws.sendText(fwd ? "{\"type\":\"control\",\"action\":\"next\"}"
                               : "{\"type\":\"control\",\"action\":\"prev\"}");
     }
-    if (head_touch.takeDoubleTap()) slide_greeting_request = true;
+    // 頭上タップ（HermesLLM と同じ）: 2 回 = 挨拶、3 回 = うなずき、4 回 = 一回転
+    const uint8_t taps = head_touch.takeTapCount();
+    if (taps == 2 && dev.greeting_on) slide_greeting_request = true;  // 挨拶 OFF のときは鳴らさない
+    if ((taps == 3 || taps == 4) && head_ready && !manualDriveActive() && !slideMotionBusy()) {
+        if (taps == 3) {
+            startMotion(kSlideNod, sizeof(kSlideNod) / sizeof(kSlideNod[0]), now);
+        } else {
+            head_servo.spinBegin();
+            spinning = true;
+            spin_end_ms = now + 2000;
+        }
+    }
 
     if (slide_greeting_request && !greeting.playing()) {
         slide_greeting_request = false;
         playGreeting(now);
     }
-    greeting.tick();
     updateSpeechMotion(now);
 
     if (slide_pending.pending) {
@@ -785,11 +868,10 @@ void updateSlides(uint32_t now) {
 // メーターはバーをタップ、またはドラッグして値を決める。閉じると /settings.json に保存する。
 // 開いている間は顔とスライドを止める。
 
-DeviceSettings dev;
-bool settings_open = false;
-
-constexpr int kSettingsRowY[5] = {36, 68, 100, 132, 164};  // スライド / MAVLink / 音量 / 明るさ / Wi-Fi
+constexpr int kSettingsRowY[5] = {36, 68, 100, 132, 164};  // スライド / MAVLink・状態音 / 音量 / 明るさ / Wi-Fi
 constexpr int kSettingsRowH = 30;
+constexpr int kSettingsCueX = 168;  // 2 行目の右半分（状態音）の左端。左半分は MAVLink
+constexpr int kSettingsGreetX = 176;  // 1 行目の右半分（挨拶）の左端。左半分はスライドモード
 constexpr int kSettingsCalibY = 200;  // 再キャリブレーションのボタン
 constexpr int kSettingsCalibH = 30;
 constexpr int kMeterX = 120;   // メーターの左端
@@ -826,11 +908,17 @@ void drawSettingsScreen() {
         M5.Display.print(ip_line);
     }
 
+    // 1 行目は左半分がスライドモード、右半分が挨拶（頭上 2 回タップの intro / outro）
     M5.Display.setCursor(12, kSettingsRowY[0] + 7);
     M5.Display.print(dev.slide_mode ? "スライドモード: ON" : "スライドモード: OFF");
+    M5.Display.setCursor(kSettingsGreetX, kSettingsRowY[0] + 7);
+    M5.Display.print(dev.greeting_on ? "挨拶: ON" : "挨拶: OFF");
 
+    // 2 行目は左半分が MAVLink、右半分が状態音（声 / ビープ）
     M5.Display.setCursor(12, kSettingsRowY[1] + 7);
     M5.Display.print(dev.mav_enabled ? "MAVLink: ON" : "MAVLink: OFF");
+    M5.Display.setCursor(kSettingsCueX, kSettingsRowY[1] + 7);
+    M5.Display.print(dev.cue_beep ? "状態音:ビープ" : "状態音:声");
 
     drawMeter(kSettingsRowY[2], "音量", dev.volume, 0, 100);
     drawMeter(kSettingsRowY[3], "明るさ", dev.brightness, 25, 255);
@@ -967,11 +1055,15 @@ bool updateSettingsScreen(uint32_t now) {
         drawSettingsScreen();
         return true;
     }
-    if (inRect(x, y, 0, kSettingsRowY[0], 320, kSettingsRowH)) {
+    if (inRect(x, y, 0, kSettingsRowY[0], kSettingsGreetX, kSettingsRowH)) {
         dev.slide_mode = !dev.slide_mode;
         slide_mode_on = dev.slide_mode;
-    } else if (inRect(x, y, 0, kSettingsRowY[1], 320, kSettingsRowH)) {
+    } else if (inRect(x, y, kSettingsGreetX, kSettingsRowY[0], 320 - kSettingsGreetX, kSettingsRowH)) {
+        dev.greeting_on = !dev.greeting_on;
+    } else if (inRect(x, y, 0, kSettingsRowY[1], kSettingsCueX, kSettingsRowH)) {
         setMavlinkEnabled(!dev.mav_enabled);
+    } else if (inRect(x, y, kSettingsCueX, kSettingsRowY[1], 320 - kSettingsCueX, kSettingsRowH)) {
+        dev.cue_beep = !dev.cue_beep;
     } else if (inRect(x, y, 0, kSettingsRowY[4], 320, kSettingsRowH)) {
         // 次の候補へ切り替える。接続し直して、新しい候補から接続する
         if (settings.wifi_count > 0) {
@@ -1097,6 +1189,9 @@ void loop() {
     updateHead(now_ms);
     if (mav_enabled) vehicle->tick(now_ms);
     reportLinkChange();
+    reportCueEvents();
+    updateCues();
+    updateCueMouth(now_ms);
     updateFace(now_ms);
 
     delay(1);

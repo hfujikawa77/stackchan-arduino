@@ -1344,12 +1344,13 @@ static void precache_generate_next() {
     PrecacheIndicator indicator;
 
     Serial.printf("DEBUG precache_generate_next: index=%d, count=%d\n", precache_item_index, precache_items_count);
-    if (digest_away && random(0, 3) != 0) {
-        // Away from home: two times out of three, jump to the next place-based item (weather/gourmet/trivia).
+    if (digest_away) {
+        // Away from home (trip): favour place-based items (weather/gourmet/trivia).
         for (int k = 0; k < precache_items_count; k++) {
             const int idx = (precache_item_index + k) % precache_items_count;
             const String& p = precache_items[idx].prompt;
-            if (p.indexOf("{digest:weather}") >= 0 || p.indexOf("{digest:gourmet}") >= 0 || p.indexOf("{digest:trivia}") >= 0) {
+            const bool local = p.indexOf("{digest:weather}") >= 0 || p.indexOf("{digest:gourmet}") >= 0 || p.indexOf("{digest:trivia}") >= 0;
+            if (local || random(0, 3) == 0) {
                 precache_item_index = idx;
                 break;
             }
@@ -2920,20 +2921,41 @@ static bool call_tts_fetch_wav(const String& text, uint8_t** out_buf, int* out_l
     String wav_url = jdoc["wavDownloadUrl"].as<String>();
     if (wav_url.isEmpty()) { Serial.println("TTSDBG empty wavDownloadUrl"); return false; }
     int st2 = 0;
-    for (int i = 0; i < 10; ++i) {
+    for (int i = 0; i < 3; ++i) {
         HTTPClient http2;
         WiFiClientSecure c2; c2.setInsecure();
         http2.begin(c2, wav_url);
         http2.setTimeout(15000);
         st2 = http2.GET();
         if (st2 == 200) {
-            int wav_size = http2.getSize();
-            if (wav_size <= 0) wav_size = 512 * 1024;
+            const int content_len = http2.getSize();
+            int wav_size = content_len > 0 ? content_len : 512 * 1024;
             uint8_t* wav_buf = (uint8_t*)heap_caps_malloc(wav_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
             if (!wav_buf) { Serial.println("TTSDBG malloc failed"); http2.end(); return false; }
-            int read_len = http2.getStream().readBytes(wav_buf, wav_size);
+            // readBytes stops at the default 1s stream timeout; a slow download then comes back cut short (audio
+            // stops mid-sentence). Wait longer, and retry the download when the body is not complete.
+            // Read by hand: keep going while bytes arrive, and stop only when the connection closes or stalls.
+            WiFiClient* body = http2.getStreamPtr();
+            int read_len = 0;
+            uint32_t last_rx_ms = millis();
+            while (read_len < wav_size && millis() - last_rx_ms < 6000) {
+                const int avail = body->available();
+                if (avail > 0) {
+                    const int n = body->read(wav_buf + read_len, min(avail, wav_size - read_len));
+                    if (n > 0) { read_len += n; last_rx_ms = millis(); }
+                } else if (!body->connected()) {
+                    break;
+                } else {
+                    delay(5);
+                }
+            }
             http2.end();
             Serial.printf("TTSDBG wav read_len=%d size=%d try=%d\n", read_len, wav_size, i);
+            if (content_len > 0 && read_len != content_len) {
+                heap_caps_free(wav_buf);
+                delay(500);
+                continue;
+            }
             if (read_len <= 44) { heap_caps_free(wav_buf); return false; }
             *out_buf = wav_buf;
             *out_len = read_len;

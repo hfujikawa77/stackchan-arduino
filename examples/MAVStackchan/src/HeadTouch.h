@@ -14,7 +14,8 @@ public:
     // 取り出し型: 1 回読むと消える
     bool takeSwipeForward();
     bool takeSwipeBackward();
-    bool takeDoubleTap();
+    // 確定したタップ数（0 = なし）。2 回 = 挨拶、3 回 = うなずき、4 回 = 一回転
+    uint8_t takeTapCount();
 
 private:
     Si12T sensor_ = Si12T(SI12T_Type_High, SI12T_Sensitivity_Level_4);
