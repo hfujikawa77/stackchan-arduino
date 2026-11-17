@@ -5877,10 +5877,7 @@ void setup() {
         precache_items[10] = {"riddle_a", "", ""};
         precache_items[11] = {"llm", "", "今日は{date}。この日にちなんだ記念日や豆知識を一つ、短く伝えて。返答に「〇月〇日〇曜日」を含めてください。"};
         precache_items[12] = {"llm", "", "次のニュース見出しの内容だけを元に、親しみやすく短く伝えて。見出しにない事実は足さない。見出し: {news:4}"};
-        precache_items[13] = {"llm", "", "カナダの首都オタワについて、{pick:リドー運河|国会議事堂|チューリップ祭り|ビーバーテール|冬のスケート|フランス語と英語|カナダの首都になった理由|寒い冬}の話題で、豆知識を一つ短く伝えて。回答は「オタワはね、」で始めてください。"};
-        precache_items[14] = {"llm", "", "ｽﾀｯｸﾁｬﾝがカナダのオタワに行ったつもりで、{pick:見たもの|食べたもの|感じた寒さ|出会った人|おみやげ}を楽しく短く話して。"};
-        precache_items[15] = {"llm", "", "カナダのオタワの{pick:季節の行事|名物グルメ|有名な建物|自然|歴史}について、子どもにもわかるように短く紹介して。"};
-        precache_items_count = 16;
+        precache_items_count = 13;
         if (!digest_url.isEmpty() && !digest_token.isEmpty()) {
             // Animal sounds follow the place and season (needs the Worker's location).
             precache_items[5] = {"llm", "", "次の場所と季節だけを元に、その地域でよく知られている動物や、この季節に見られる動物を一つ選んで、その鳴き声を、ｽﾀｯｸﾁｬﾝらしく楽しく短く真似して。例: 「北海道だね。エゾシカがピーッて鳴くよ。」情報: {digest:place}"};
