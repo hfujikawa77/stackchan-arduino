@@ -74,6 +74,7 @@ DeviceSettings dev;       // 本体の設定画面の値（/settings.json）
 bool settings_open = false;  // 設定画面を開いているか
 bool mav_enabled = true;  // MAVLink（QGC との通信）。設定画面から再起動なしで切り替える
 uint32_t ip_bubble_until_ms = 0;  // 接続直後に IP を吹き出しで出す期限（0 = 出していない）
+bool manualDriveActive();
 bool slideMotionBusy();         // 首の動き（ステップ・回転）中か。updateHead が書き込みを止めるのに使う
 
 bool udp_open = false;
@@ -194,6 +195,14 @@ void updateHead(uint32_t now_ms) {
     if (slideMotionBusy()) return;  // スライドの首の動きが優先（終わるまで手動追従を止める）
 
     const MavlinkVehicle::ManualInput in = vehicle->manualInput(now_ms);
+    {
+        // 診断ログ（原因調査用）: ARM・MANUAL の間だけ 500ms ごとに入力値を出す
+        static uint32_t next_log_ms = 0;
+        if (manualDriveActive() && now_ms >= next_log_ms) {
+            next_log_ms = now_ms + 500;
+            Serial.printf("[HEAD] active=%d x=%d y=%d\n", in.active ? 1 : 0, (int)in.x, (int)in.y);
+        }
+    }
     if (in.active) {
         const HeadTarget t = manualControlToHead(in.x, in.y, head_servo.panLimits(), head_servo.tiltLimits());
         head_servo.setTarget(t.pan, t.tilt);
@@ -798,6 +807,11 @@ void updateSlides(uint32_t now) {
     // スライドモードが無効、または reveal.js が切れたら、状態表示に戻す
     const bool want = slide_mode_on && slide_ws.connected();
     if (!want) {
+        // 口パク・首振りのフラグが立ったまま残ると、updateHead が MANUAL の入力を無視し続ける
+        if (speech_active) {
+            speech_active = false;
+            avatar.setMouthOpenRatio(0.0f);
+        }
         slide_led_active = false;
         if (slide_active) {
             slide_active = false;
@@ -1106,7 +1120,9 @@ void updateFace(uint32_t now_ms) {
 
     avatar.setExpression(toAvatarExpression(v.expression));
     avatar.setSpeechText(settings_loaded ? v.speech : "設定なし");
+    Serial.printf("[FACE] setLeds r=%u g=%u b=%u ...\n", (unsigned)v.led.r, (unsigned)v.led.g, (unsigned)v.led.b);
     setLeds(v.led);
+    Serial.println("[FACE] setLeds done");
 }
 
 }  // namespace
@@ -1188,6 +1204,19 @@ void loop() {
     if (!in_settings) updateSlides(now_ms);
     updateHead(now_ms);
     if (mav_enabled) vehicle->tick(now_ms);
+    {
+        // 診断ログ（原因調査用）: 2 秒ごとに送受信の累計を出す
+        static uint32_t next_stat_ms = 0;
+        if (now_ms >= next_stat_ms) {
+            next_stat_ms = now_ms + 2000;
+            Serial.printf("[STAT] wifi=%d udp=%d mav=%d peer=%s:%u hb=%u att=%u rx=%u linked=%d armed=%d\n",
+                          WiFi.status() == WL_CONNECTED ? 1 : 0, udp_open ? 1 : 0, mav_enabled ? 1 : 0,
+                          peer_known ? peer_ip.toString().c_str() : "-", (unsigned)peer_port,
+                          (unsigned)vehicle->heartbeatsSent(), (unsigned)vehicle->attitudesSent(),
+                          (unsigned)vehicle->messagesReceived(), vehicle->gcsLinked() ? 1 : 0,
+                          vehicle->armed() ? 1 : 0);
+        }
+    }
     reportLinkChange();
     reportCueEvents();
     updateCues();
